@@ -6,4 +6,4 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5.8", features = ["derive"] }
-compat_quake = { path = "../compat_quake" }
+compat_quake = { path = "../compat_quake", version = "0.1.0" }

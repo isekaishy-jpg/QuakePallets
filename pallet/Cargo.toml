@@ -5,5 +5,5 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-platform_winit = { path = "../platform_winit" }
-render_wgpu = { path = "../render_wgpu" }
+platform_winit = { path = "../platform_winit", version = "0.1.0" }
+render_wgpu = { path = "../render_wgpu", version = "0.1.0" }
