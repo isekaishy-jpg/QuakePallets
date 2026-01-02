@@ -1,0 +1,26 @@
+[package]
+name = "compat_quake-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.compat_quake]
+path = ".."
+
+[[bin]]
+name = "fuzz_pak"
+path = "fuzz_targets/fuzz_pak.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bsp"
+path = "fuzz_targets/fuzz_bsp.rs"
+test = false
+doc = false

@@ -92,6 +92,10 @@ impl PakFile {
 
 pub fn read_pak(path: &Path) -> Result<PakFile, PakError> {
     let data = fs::read(path)?;
+    parse_pak(data)
+}
+
+pub fn parse_pak(data: Vec<u8>) -> Result<PakFile, PakError> {
     if data.len() < 12 {
         return Err(PakError::InvalidHeader);
     }
