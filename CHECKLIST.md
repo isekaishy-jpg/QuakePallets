@@ -116,7 +116,7 @@ A PR is mergeable only if:
 - [x] `tools pak list` lists contents of user-supplied `id1/pak0.pak`.
 
 **DoD evidence**
-- [ ] `cargo run -p tools -- pak list --quake-dir <path>` prints entries and exits 0.
+- [x] `cargo run -p tools -- pak list --quake-dir <path>` prints entries and exits 0.
 - [x] Fuzz target: PAK header/directory parsing.
 
 ---
