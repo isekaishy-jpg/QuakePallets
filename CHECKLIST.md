@@ -95,29 +95,29 @@ A PR is mergeable only if:
 ---
 
 ## M1 — ECS baseline (full ECS)
-- [ ] `ecs` integrates bevy_ecs standalone.
-- [ ] Core components: `Transform`, `Velocity`, `Camera`, `PlayerTag`.
-- [ ] Schedules:
+- [x] `ecs` integrates bevy_ecs standalone.
+- [x] Core components: `Transform`, `Velocity`, `Camera`, `PlayerTag`.
+- [x] Schedules:
   - `FixedUpdate` (authoritative sim tick)
   - `Update` (presentation, audio decisions)
-- [ ] Determinism harness: record input stream → replay → identical state hash.
+- [x] Determinism harness: record input stream → replay → identical state hash.
 
 **DoD evidence**
-- [ ] A “moving entity” demo where replay yields identical final state hash.
+- [x] A “moving entity” demo where replay yields identical final state hash.
 
 ---
 
 ## M2 — VFS + Quake probing (no assets committed)
-- [ ] `engine_core::vfs`:
+- [x] `engine_core::vfs`:
   - search paths (base + mod dirs)
   - mount points
   - file open/read/list
-- [ ] `compat_quake::pak` parses PAK safely (directory table, offsets).
-- [ ] `tools pak list` lists contents of user-supplied `id1/pak0.pak`.
+- [x] `compat_quake::pak` parses PAK safely (directory table, offsets).
+- [x] `tools pak list` lists contents of user-supplied `id1/pak0.pak`.
 
 **DoD evidence**
 - [ ] `cargo run -p tools -- pak list --quake-dir <path>` prints entries and exits 0.
-- [ ] Fuzz target: PAK header/directory parsing.
+- [x] Fuzz target: PAK header/directory parsing.
 
 ---
 
@@ -233,3 +233,6 @@ See `MODERN_ENGINE_FEATURES.md` for detail. At minimum, plan for:
 - input action mapping + gamepad support
 - replay artifacts in CI
 - shader workflow and (later) hot reload
+
+
+
