@@ -7,3 +7,6 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
+pollster = "0.3"
+wgpu = "0.20"
+winit = "0.29"
