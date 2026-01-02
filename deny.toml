@@ -1,12 +1,9 @@
 # cargo-deny configuration (default)
 
-[graph]
-multiple-versions = "warn"
-
 [advisories]
 db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "warn"
-unmaintained = "warn"
+unmaintained = "workspace"
 unsound = "warn"
 notice = "warn"
 ignore = []
