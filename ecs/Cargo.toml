@@ -8,3 +8,4 @@ license = "MIT OR Apache-2.0"
 path = "src/lib.rs"
 
 [dependencies]
+bevy_ecs = "0.14"
