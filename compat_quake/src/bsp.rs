@@ -194,7 +194,7 @@ fn parse_header(data: &[u8]) -> Result<BspHeader, BspError> {
         offset: 0,
         length: 0,
     }; LUMP_COUNT];
-    for i in 0..LUMP_COUNT {
+    for (i, lump) in lumps.iter_mut().enumerate() {
         let base = lump_start + i * 8;
         let offset = read_u32_le(&data[base..base + 4]);
         let length = read_u32_le(&data[base + 4..base + 8]);
@@ -208,7 +208,7 @@ fn parse_header(data: &[u8]) -> Result<BspHeader, BspError> {
                 lump: LumpType::from_index(i),
             });
         }
-        lumps[i] = Lump { offset, length };
+        *lump = Lump { offset, length };
     }
 
     Ok(BspHeader { version, lumps })
@@ -219,7 +219,7 @@ fn parse_vertices(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[f32; 3
     if lump.length == 0 {
         return Ok(Vec::new());
     }
-    if lump.length % 12 != 0 {
+    if !lump.length.is_multiple_of(12) {
         return Err(BspError::InvalidLumpSize {
             lump: LumpType::Vertices,
             size: lump.length,
@@ -244,7 +244,7 @@ fn parse_edges(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[u16; 2]>,
     if lump.length == 0 {
         return Ok(Vec::new());
     }
-    if lump.length % 4 != 0 {
+    if !lump.length.is_multiple_of(4) {
         return Err(BspError::InvalidLumpSize {
             lump: LumpType::Edges,
             size: lump.length,
@@ -265,7 +265,7 @@ fn parse_surfedges(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<i32>, 
     if lump.length == 0 {
         return Ok(Vec::new());
     }
-    if lump.length % 4 != 0 {
+    if !lump.length.is_multiple_of(4) {
         return Err(BspError::InvalidLumpSize {
             lump: LumpType::SurfEdges,
             size: lump.length,
@@ -286,7 +286,7 @@ fn parse_faces(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Face>, Bsp
     if lump.length == 0 {
         return Ok(Vec::new());
     }
-    if lump.length % 20 != 0 {
+    if !lump.length.is_multiple_of(20) {
         return Err(BspError::InvalidLumpSize {
             lump: LumpType::Faces,
             size: lump.length,
@@ -322,7 +322,7 @@ fn parse_models(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Model>, B
     if lump.length == 0 {
         return Ok(Vec::new());
     }
-    if lump.length % 64 != 0 {
+    if !lump.length.is_multiple_of(64) {
         return Err(BspError::InvalidLumpSize {
             lump: LumpType::Models,
             size: lump.length,
@@ -343,7 +343,7 @@ fn parse_models(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Model>, B
     Ok(models)
 }
 
-fn lump_slice<'a>(data: &'a [u8], lump: Lump) -> &'a [u8] {
+fn lump_slice(data: &[u8], lump: Lump) -> &[u8] {
     let start = lump.offset as usize;
     let end = start + lump.length as usize;
     &data[start..end]
