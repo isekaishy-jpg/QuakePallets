@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use compat_quake::pak::{self, PakFile};
+use engine_core::vfs::Vfs;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_USAGE: i32 = 2;
@@ -176,30 +177,31 @@ fn load_pak_from_quake_dir(quake_dir: &Path) -> Result<(PakFile, PathBuf), i32> 
         eprintln!("quake dir not found: {}", quake_dir.display());
         return Err(EXIT_QUAKE_DIR);
     }
-    let pak_path = match find_pak0(quake_dir) {
-        Some(path) => path,
-        None => {
-            eprintln!("pak0.pak not found under {}", quake_dir.display());
+    let mut vfs = Vfs::new();
+    vfs.add_root(quake_dir);
+
+    let (virtual_path, pak_path) = if vfs.exists("id1/pak0.pak") {
+        ("id1/pak0.pak", quake_dir.join("id1").join("pak0.pak"))
+    } else if vfs.exists("pak0.pak") {
+        ("pak0.pak", quake_dir.join("pak0.pak"))
+    } else {
+        eprintln!("pak0.pak not found under {}", quake_dir.display());
+        return Err(EXIT_PAK);
+    };
+
+    let data = match vfs.read(virtual_path) {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("pak read failed: {}", err);
             return Err(EXIT_PAK);
         }
     };
-    match pak::read_pak(&pak_path) {
+
+    match pak::parse_pak(data) {
         Ok(pak) => Ok((pak, pak_path)),
         Err(err) => {
             eprintln!("pak parse failed: {}", err);
             Err(EXIT_PAK)
         }
     }
-}
-
-fn find_pak0(quake_dir: &Path) -> Option<PathBuf> {
-    let candidate = quake_dir.join("id1").join("pak0.pak");
-    if candidate.is_file() {
-        return Some(candidate);
-    }
-    let fallback = quake_dir.join("pak0.pak");
-    if fallback.is_file() {
-        return Some(fallback);
-    }
-    None
 }

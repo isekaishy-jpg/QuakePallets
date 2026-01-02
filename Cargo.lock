@@ -1829,6 +1829,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "compat_quake",
+ "engine_core",
 ]
 
 [[package]]
