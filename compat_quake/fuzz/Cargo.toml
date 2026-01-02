@@ -24,3 +24,9 @@ name = "fuzz_bsp"
 path = "fuzz_targets/fuzz_bsp.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_lmp"
+path = "fuzz_targets/fuzz_lmp.rs"
+test = false
+doc = false

@@ -1292,6 +1292,8 @@ dependencies = [
 name = "pallet"
 version = "0.1.0"
 dependencies = [
+ "compat_quake",
+ "engine_core",
  "platform_winit",
  "render_wgpu",
 ]

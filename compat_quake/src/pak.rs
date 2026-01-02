@@ -65,6 +65,33 @@ impl PakFile {
         &self.entries
     }
 
+    pub fn entry_by_name(&self, name: &str) -> Option<&PakEntry> {
+        let needle = sanitize_name(name);
+        self.entries.iter().find(|entry| entry.name == needle)
+    }
+
+    pub fn entry_data(&self, name: &str) -> Result<Option<&[u8]>, PakError> {
+        let entry = match self.entry_by_name(name) {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+
+        let offset = entry.offset as usize;
+        let size = entry.size as usize;
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| PakError::EntryOutOfBounds {
+                name: entry.name.clone(),
+            })?;
+        if end > self.data.len() {
+            return Err(PakError::EntryOutOfBounds {
+                name: entry.name.clone(),
+            });
+        }
+
+        Ok(Some(&self.data[offset..end]))
+    }
+
     pub fn extract_all(&self, out_dir: &Path) -> Result<(), PakError> {
         fs::create_dir_all(out_dir)?;
         for entry in &self.entries {

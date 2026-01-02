@@ -121,25 +121,25 @@ A PR is mergeable only if:
 
 ---
 
-## M3 — Minimal decode pipeline: show content on screen
-- [ ] Implement minimum image path (PCX or other Quake-friendly images).
-- [ ] Palette handling if required.
-- [ ] Render decoded image as texture on a quad (wgpu).
+## M3 – Minimal decode pipeline: show content on screen
+- [x] Implement minimum image path (PCX or other Quake-friendly images).
+- [x] Palette handling if required.
+- [x] Render decoded image as texture on a quad (wgpu).
 
 **DoD evidence**
-- [ ] `cargo run -p pallet -- --quake-dir <path> --show-image <asset>` shows it.
+- [x] `cargo run -p pallet -- --quake-dir <path> --show-image <asset>` shows it.
 
 ---
 
-## M4 — BSP (subset) parse + render static world geometry
-- [ ] `compat_quake::bsp` parses:
+## M4 – BSP (subset) parse + render static world geometry
+- [x] `compat_quake::bsp` parses:
   - header + lump table
   - vertices/edges/faces sufficient to triangulate and draw
-- [ ] Build static mesh buffers and render in `render_wgpu`.
-- [ ] Fly camera: WASD + mouse look.
+- [x] Build static mesh buffers and render in `render_wgpu`.
+- [x] Fly camera: WASD + mouse look.
 
 **DoD evidence**
-- [ ] `--map e1m1` (or similar) renders geometry and allows free-fly.
+- [x] `--map e1m1` (or similar) renders geometry and allows free-fly.
 
 ---
 
