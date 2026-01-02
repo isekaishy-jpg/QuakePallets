@@ -17,13 +17,14 @@ allow = [
   "ISC",
   "Zlib",
   "CC0-1.0",
-  "Unicode-DFS-2016",
+  "Unicode-3.0",
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
