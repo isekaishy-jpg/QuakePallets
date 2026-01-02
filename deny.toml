@@ -4,14 +4,9 @@
 db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "warn"
 unmaintained = "workspace"
-unsound = "warn"
-notice = "warn"
 ignore = []
 
 [licenses]
-unlicensed = "deny"
-copyleft = "deny"
-allow-osi-fsf-free = "either"
 confidence-threshold = 0.8
 
 allow = [
