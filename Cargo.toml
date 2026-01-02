@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+  "pallet",
+  "platform_winit",
+  "render_wgpu",
+  "audio",
+  "script_lua",
+  "ecs",
+  "engine_core",
+  "engine_game",
+  "net/net_transport",
+  "net/net_protocol",
+  "net/client",
+  "net/server",
+  "compat_quake",
+  "tools",
+]

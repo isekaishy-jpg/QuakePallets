@@ -1,0 +1,39 @@
+# cargo-deny configuration (default)
+
+[graph]
+multiple-versions = "warn"
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "warn"
+unmaintained = "warn"
+unsound = "warn"
+notice = "warn"
+ignore = []
+
+[licenses]
+unlicensed = "deny"
+copyleft = "deny"
+allow-osi-fsf-free = "either"
+confidence-threshold = 0.8
+
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "CC0-1.0",
+  "Unicode-DFS-2016",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-git = []

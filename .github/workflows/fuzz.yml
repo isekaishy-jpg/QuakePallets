@@ -1,0 +1,33 @@
+name: Fuzz
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Expectation: fuzz targets live under compat_quake/fuzz/
+      - name: Fuzz PAK parser
+        run: |
+          cd compat_quake
+          cargo fuzz run fuzz_pak -- -max_total_time=60
+
+      - name: Fuzz BSP parser
+        run: |
+          cd compat_quake
+          cargo fuzz run fuzz_bsp -- -max_total_time=60

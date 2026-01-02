@@ -1,0 +1,235 @@
+# Pallet (Rust) — Engine/Client/Server Checklist (Quake-as-Testbed)
+
+## Purpose
+Build a clean-room, modern Rust engine/client/server stack using Quake assets as a **compatibility harness** to validate:
+- asset IO + decoding
+- BSP/world rendering
+- player movement/collision
+- audio playback (WAV + OGG/Vorbis)
+- modern networking (authoritative server + replication)
+- full ECS-based data model
+
+This is **not** a perfect Quake recreation. Quake is a dated proving ground.
+
+---
+
+## Non-negotiables (clean-room + legal)
+- No consultation of Quake source code (GPL releases, forks, ports) for implementation details.
+- No decompilation of Quake binaries to derive algorithms.
+- Repository must ship **zero** copyrighted assets.
+- Quake harness loads assets only from a user-supplied, legally acquired installation directory.
+- All asset parsers must be resilient: **no panics on untrusted input** (bounds checks, checked arithmetic, graceful errors).
+
+See also: `CLEAN_ROOM_PROTOCOL.md`.
+
+---
+
+## Locked decisions
+- Pallet integration crate: `pallet/`
+- ECS: full ECS from day one (recommended: `bevy_ecs` standalone).
+- Window/input: winit
+- Rendering: wgpu
+- Audio backend: miniaudio; decode OGG/Vorbis (music) + WAV (SFX)
+- Scripting: Lua via `mlua`
+- Networking: modern authoritative client/server with snapshot replication
+  - Start: UDP with reliability channels (e.g., renet-style)
+  - Later: QUIC adapter optional
+
+---
+
+## Workspace layout (normative)
+- `pallet/` — integration root (only crate allowed to depend on everything)
+- `platform_winit/` — window/event loop/input capture
+- `render_wgpu/` — rendering backend
+- `audio/` — miniaudio + streaming mixer + decode adapters
+- `script_lua/` — Lua VM + sandbox + bindings
+- `ecs/` — ECS integration + schedule conventions
+- `engine_core/` — time, console/cvars, logging, config, VFS, asset registry
+- `engine_game/` — Quake harness gameplay systems (not QuakeC emulation)
+- `net/`
+  - `net_transport/` — UDP adapter (later QUIC adapter)
+  - `net_protocol/` — serialization + snapshots + replication rules
+  - `client/`
+  - `server/`
+- `compat_quake/` — Quake-specific parsing (PAK/BSP/etc.) as an isolated plugin
+- `tools/` — CLI utilities implementing the contract in `tools/README.md`
+
+---
+
+## Operational commands (contract)
+These commands must exist and remain stable once the repo is implemented:
+
+- Quality gates:
+  - `just ci`  (fmt + clippy + test + deny)
+- CI-friendly smoke test (no external assets):
+  - `just smoke`
+- Local Quake harness smoke test:
+  - `just smoke-quake "<QUAKE_DIR>" <MAP>`
+
+These commands are defined in `justfile`.
+
+---
+
+## Global Definition of Done (merge gates)
+A PR is mergeable only if:
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -D warnings`
+- `cargo test --all-features`
+- `cargo deny check`
+- Any parsing/decoding change adds tests and a fuzz/property target.
+- Parsers return `Result` errors; no panics on malformed inputs.
+
+---
+
+# Milestones
+
+## M0 — Workspace scaffold + CI + Pallet window
+- [ ] Workspace builds on Windows + Linux (macOS optional).
+- [ ] CI wired (fmt/clippy/test/deny).
+- [ ] `pallet` boots: creates a window + clears a frame via wgpu.
+- [ ] Structured logging + error conventions.
+
+**DoD evidence**
+- [ ] `cargo run -p pallet` opens a window and renders a clear color, prints timing.
+
+---
+
+## M1 — ECS baseline (full ECS)
+- [ ] `ecs` integrates bevy_ecs standalone.
+- [ ] Core components: `Transform`, `Velocity`, `Camera`, `PlayerTag`.
+- [ ] Schedules:
+  - `FixedUpdate` (authoritative sim tick)
+  - `Update` (presentation, audio decisions)
+- [ ] Determinism harness: record input stream → replay → identical state hash.
+
+**DoD evidence**
+- [ ] A “moving entity” demo where replay yields identical final state hash.
+
+---
+
+## M2 — VFS + Quake probing (no assets committed)
+- [ ] `engine_core::vfs`:
+  - search paths (base + mod dirs)
+  - mount points
+  - file open/read/list
+- [ ] `compat_quake::pak` parses PAK safely (directory table, offsets).
+- [ ] `tools pak list` lists contents of user-supplied `id1/pak0.pak`.
+
+**DoD evidence**
+- [ ] `cargo run -p tools -- pak list --quake-dir <path>` prints entries and exits 0.
+- [ ] Fuzz target: PAK header/directory parsing.
+
+---
+
+## M3 — Minimal decode pipeline: show content on screen
+- [ ] Implement minimum image path (PCX or other Quake-friendly images).
+- [ ] Palette handling if required.
+- [ ] Render decoded image as texture on a quad (wgpu).
+
+**DoD evidence**
+- [ ] `cargo run -p pallet -- --quake-dir <path> --show-image <asset>` shows it.
+
+---
+
+## M4 — BSP (subset) parse + render static world geometry
+- [ ] `compat_quake::bsp` parses:
+  - header + lump table
+  - vertices/edges/faces sufficient to triangulate and draw
+- [ ] Build static mesh buffers and render in `render_wgpu`.
+- [ ] Fly camera: WASD + mouse look.
+
+**DoD evidence**
+- [ ] `--map e1m1` (or similar) renders geometry and allows free-fly.
+
+---
+
+## M5 — Collision + basic player movement
+- [ ] World collision queries (initially simplified).
+- [ ] Player controller system (tunable accel/friction/gravity).
+
+**DoD evidence**
+- [ ] Walk around without falling through floors in typical cases.
+
+---
+
+## M6 — Audio: WAV + OGG/Vorbis streaming
+- [ ] miniaudio device init + mixer.
+- [ ] WAV decode + playback.
+- [ ] OGG/Vorbis decode + streaming (for rerelease music if present).
+- [ ] Restart/stop track.
+
+**DoD evidence**
+- [ ] Keypress plays WAV.
+- [ ] Map start streams an OGG track if present.
+
+---
+
+## M7 — Modern networking baseline (authoritative server + replication)
+Goal: modern replication, not Quake’s protocol.
+
+### Architecture
+- Server is authoritative and runs fixed tick.
+- Client sends input commands with sequence numbers.
+- Server emits snapshots; client interpolates remote entities and predicts local player.
+
+### Implementation
+- [ ] `net_transport`: UDP + reliability channels (renet-style).
+- [ ] `net_protocol`:
+  - snapshot schema for entities + replicated components
+  - baseline/delta mechanism (start simple)
+- [ ] Single-player uses loopback client/server with identical codepaths.
+
+**DoD evidence**
+- [ ] Headless dedicated server accepts one client.
+- [ ] Client connects, receives snapshots, and moves around.
+- [ ] Replay test yields stable authoritative results.
+
+---
+
+## M8 — Lua scripting hooks (game glue, not QuakeC emulation)
+- [ ] Lua VM + sandbox:
+  - no filesystem by default
+  - no OS calls
+  - CPU budget per frame
+- [ ] Expose:
+  - console commands
+  - spawn entity + transform
+  - play sound
+  - callbacks (on_tick, on_key, on_spawn)
+
+**DoD evidence**
+- [ ] Script spawns an entity and binds a key to play sound.
+
+---
+
+## M9 — Theora video (later / optional)
+- [ ] Ogg container parsing for `.ogv`.
+- [ ] Theora decode.
+- [ ] Upload frames to GPU and render.
+
+**DoD evidence**
+- [ ] `--play-movie <file>` renders frames smoothly.
+
+---
+
+# First big test (overall acceptance)
+Given a user path to a legally acquired Quake install:
+- [ ] Mount `id1/pak0.pak` (and additional paks if present)
+- [ ] Load and render a BSP map
+- [ ] Walk/fly with collision
+- [ ] Play WAV SFX and stream OGG music if present
+- [ ] Works in:
+  - single-process loopback client/server
+  - dedicated server + network client
+
+---
+
+# Modern engine add-ons (recommended)
+See `MODERN_ENGINE_FEATURES.md` for detail. At minimum, plan for:
+- asset registry + (later) hot reload
+- debug UI/console + entity inspection
+- profiling/telemetry standardization
+- background job system (non-deterministic work off the sim thread)
+- input action mapping + gamepad support
+- replay artifacts in CI
+- shader workflow and (later) hot reload
