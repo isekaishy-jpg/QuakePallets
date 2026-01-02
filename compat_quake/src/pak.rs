@@ -101,7 +101,7 @@ pub fn read_pak(path: &Path) -> Result<PakFile, PakError> {
 
     let dir_offset = read_u32_le(&data[4..8]) as usize;
     let dir_size = read_u32_le(&data[8..12]) as usize;
-    if dir_size % 64 != 0 {
+    if !dir_size.is_multiple_of(64) {
         return Err(PakError::DirectorySizeNotMultiple);
     }
     let dir_end = dir_offset
@@ -129,9 +129,7 @@ pub fn read_pak(path: &Path) -> Result<PakFile, PakError> {
 
         let end = (offset as usize)
             .checked_add(size as usize)
-            .ok_or_else(|| PakError::EntryOutOfBounds {
-                name: name.clone(),
-            })?;
+            .ok_or_else(|| PakError::EntryOutOfBounds { name: name.clone() })?;
         if end > data.len() {
             return Err(PakError::EntryOutOfBounds { name });
         }

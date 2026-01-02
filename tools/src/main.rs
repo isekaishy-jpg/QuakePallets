@@ -87,7 +87,10 @@ fn smoke_no_assets(ticks: u32) -> i32 {
     for tick in 0..ticks {
         checksum = checksum.wrapping_add(u64::from(tick));
     }
-    println!("smoke no-assets ok (ticks={}, checksum={})", ticks, checksum);
+    println!(
+        "smoke no-assets ok (ticks={}, checksum={})",
+        ticks, checksum
+    );
     EXIT_SUCCESS
 }
 
@@ -160,7 +163,11 @@ fn pak_extract(quake_dir: &Path, out_dir: &Path) -> i32 {
         return EXIT_PAK;
     }
 
-    println!("extracted {} entries to {}", pak.entries().len(), out_dir.display());
+    println!(
+        "extracted {} entries to {}",
+        pak.entries().len(),
+        out_dir.display()
+    );
     EXIT_SUCCESS
 }
 
