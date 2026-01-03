@@ -16,3 +16,6 @@ members = [
   "compat_quake",
   "tools",
 ]
+
+[patch.crates-io]
+bindgen = { path = "third_party/bindgen" }
