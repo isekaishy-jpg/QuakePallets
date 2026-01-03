@@ -3,7 +3,10 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use miniaudio::{DecoderConfig, Device, DeviceConfig, DeviceType, Format, FramesMut, SyncDecoder};
+use miniaudio::{
+    DecoderConfig, Device, DeviceConfig, DeviceType, DitherMode, Format, Frames, FramesMut,
+    SyncDecoder,
+};
 
 const OUTPUT_FORMAT: Format = Format::F32;
 const OUTPUT_CHANNELS: u32 = 2;
@@ -19,6 +22,7 @@ struct AudioState {
     sfx: Vec<ActiveSound>,
     music: Option<ActiveSound>,
     scratch: Vec<f32>,
+    mix_buffer: Vec<f32>,
 }
 
 struct ActiveSound {
@@ -103,21 +107,62 @@ impl AudioState {
             sfx: Vec::new(),
             music: None,
             scratch: Vec::new(),
+            mix_buffer: Vec::new(),
         }
     }
 
-    fn mix_into(&mut self, output: &mut [f32], channels: usize) {
+    fn mix_into_output(&mut self, output: &mut FramesMut) {
+        let format = output.format();
+        if format == Format::Unknown {
+            output.as_bytes_mut().fill(0);
+            return;
+        }
+
+        let channels = output.channels() as usize;
+        let frame_count = output.frame_count();
+        let sample_count = frame_count * channels;
+        let AudioState {
+            music,
+            sfx,
+            scratch,
+            mix_buffer,
+        } = self;
+
+        if format == OUTPUT_FORMAT {
+            let samples = output.as_samples_mut::<f32>();
+            Self::mix_into_samples(music, sfx, scratch, samples, channels);
+            return;
+        }
+
+        if sample_count == 0 {
+            output.as_bytes_mut().fill(0);
+            return;
+        }
+
+        if mix_buffer.len() < sample_count {
+            mix_buffer.resize(sample_count, 0.0);
+        }
+        let mix_samples = &mut mix_buffer[..sample_count];
+        Self::mix_into_samples(music, sfx, scratch, mix_samples, channels);
+
+        let frames = Frames::wrap::<f32>(mix_samples, OUTPUT_FORMAT, channels as u32);
+        frames.convert(output, DitherMode::None);
+    }
+
+    fn mix_into_samples(
+        music: &mut Option<ActiveSound>,
+        sfx: &mut Vec<ActiveSound>,
+        scratch: &mut Vec<f32>,
+        output: &mut [f32],
+        channels: usize,
+    ) {
         output.fill(0.0);
         if output.is_empty() {
             return;
         }
 
-        self.ensure_scratch(output.len());
-        let AudioState {
-            music,
-            sfx,
-            scratch,
-        } = self;
+        Self::ensure_scratch(scratch, output.len());
+        let scratch = &mut scratch[..output.len()];
         if let Some(sound) = music.as_mut() {
             Self::mix_sound(sound, output, channels, scratch);
             if sound.finished {
@@ -160,9 +205,9 @@ impl AudioState {
         }
     }
 
-    fn ensure_scratch(&mut self, len: usize) {
-        if self.scratch.len() < len {
-            self.scratch.resize(len, 0.0);
+    fn ensure_scratch(scratch: &mut Vec<f32>, len: usize) {
+        if scratch.len() < len {
+            scratch.resize(len, 0.0);
         }
     }
 }
@@ -179,10 +224,8 @@ impl ActiveSound {
 }
 
 fn mix_callback(state: &Arc<Mutex<AudioState>>, output: &mut FramesMut) {
-    let channels = output.channels() as usize;
-    let samples = output.as_samples_mut::<f32>();
     match state.try_lock() {
-        Ok(mut state) => state.mix_into(samples, channels),
-        Err(_) => samples.fill(0.0),
+        Ok(mut state) => state.mix_into_output(output),
+        Err(_) => output.as_bytes_mut().fill(0),
     }
 }
