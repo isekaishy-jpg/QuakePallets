@@ -125,7 +125,7 @@ impl LoopbackNet {
                 buttons,
             })
             .map_err(|err| err.to_string())?;
-        self.server.tick().map_err(|err| err.to_string())?;
+        let _ = self.server.tick().map_err(|err| err.to_string())?;
         self.client.poll().map_err(|err| err.to_string())?;
         if !self.saw_snapshot && self.client.last_snapshot().is_some() {
             println!("loopback snapshot received");

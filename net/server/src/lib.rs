@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::collections::hash_map::Entry;
 
 use net_protocol::{InputCommand, ProtocolError, ProtocolMessage, Snapshot, SnapshotEntity};
 use net_transport::{TransportConfig, TransportError, TransportEvent, UdpTransport};
@@ -40,6 +41,11 @@ pub struct Server {
     tick: u32,
     snapshot_stride: u32,
     clients: HashMap<SocketAddr, ClientState>,
+}
+
+pub struct TickReport {
+    pub new_clients: usize,
+    pub snapshots_sent: usize,
 }
 
 #[derive(Debug)]
@@ -90,7 +96,15 @@ impl Server {
         Ok(self.transport.local_addr()?)
     }
 
-    pub fn tick(&mut self) -> Result<(), ServerError> {
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    pub fn tick(&mut self) -> Result<TickReport, ServerError> {
+        let mut report = TickReport {
+            new_clients: 0,
+            snapshots_sent: 0,
+        };
         let events = self.transport.poll()?;
         for event in events {
             let TransportEvent::Message {
@@ -103,11 +117,17 @@ impl Server {
             }
             match ProtocolMessage::decode(&payload) {
                 Ok(ProtocolMessage::Input(cmd)) => {
-                    let client = self.clients.entry(from).or_insert_with(|| ClientState {
-                        entity: EntityState::default(),
-                        last_input: None,
-                        last_seq: 0,
-                    });
+                    let client = match self.clients.entry(from) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            report.new_clients += 1;
+                            entry.insert(ClientState {
+                                entity: EntityState::default(),
+                                last_input: None,
+                                last_seq: 0,
+                            })
+                        }
+                    };
                     if cmd.client_seq >= client.last_seq {
                         client.last_seq = cmd.client_seq;
                         client.last_input = Some(cmd);
@@ -150,10 +170,11 @@ impl Server {
                 self.transport.send(*addr, SNAPSHOT_CHANNEL, payload)?;
             }
             self.transport.flush()?;
+            report.snapshots_sent = self.clients.len();
         }
 
         self.tick = self.tick.wrapping_add(1);
-        Ok(())
+        Ok(report)
     }
 }
 
