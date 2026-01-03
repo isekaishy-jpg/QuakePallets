@@ -29,13 +29,16 @@ pub fn main() {
 
     emit_supported_features();
 
-    if cfg!(feature = "bindgen") {
+    #[cfg(feature = "bindgen")]
+    {
         if std::env::var("MINIAUDIO_SYS_USE_BINDGEN").is_ok() {
             generate_bindings();
         } else {
             check_pregenerated_bindings();
         }
-    } else {
+    }
+    #[cfg(not(feature = "bindgen"))]
+    {
         check_pregenerated_bindings();
     }
 
