@@ -9,6 +9,8 @@ jobs:
   build-test:
     name: fmt / clippy / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      MINIAUDIO_SYS_USE_BINDGEN: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -21,6 +23,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm --no-progress
+          echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> $env:GITHUB_ENV
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

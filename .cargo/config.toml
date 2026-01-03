@@ -1,0 +1,2 @@
+[env]
+MINIAUDIO_SYS_USE_BINDGEN = "1"
