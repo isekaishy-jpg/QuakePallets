@@ -7,6 +7,7 @@ pub enum BspError {
     InvalidHeader,
     Truncated,
     UnsupportedVersion(u32),
+    InvalidEntities,
     LumpOutOfBounds {
         lump: LumpType,
     },
@@ -25,6 +26,7 @@ impl fmt::Display for BspError {
             BspError::UnsupportedVersion(version) => {
                 write!(f, "unsupported bsp version {}", version)
             }
+            BspError::InvalidEntities => write!(f, "invalid bsp entity data"),
             BspError::LumpOutOfBounds { lump } => {
                 write!(f, "bsp lump out of bounds: {}", lump.name())
             }
@@ -127,7 +129,21 @@ pub struct Face {
 }
 
 #[derive(Debug, Clone)]
+pub struct Plane {
+    pub normal: [f32; 3],
+    pub dist: f32,
+    pub plane_type: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClipNode {
+    pub plane_id: i32,
+    pub children: [i32; 2],
+}
+
+#[derive(Debug, Clone)]
 pub struct Model {
+    pub headnode: [i32; 4],
     pub first_face: i32,
     pub num_faces: i32,
 }
@@ -135,11 +151,19 @@ pub struct Model {
 #[derive(Debug, Clone)]
 pub struct Bsp {
     pub header: BspHeader,
+    pub planes: Vec<Plane>,
     pub vertices: Vec<[f32; 3]>,
     pub edges: Vec<[u16; 2]>,
     pub surfedges: Vec<i32>,
     pub faces: Vec<Face>,
+    pub clipnodes: Vec<ClipNode>,
     pub models: Vec<Model>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnPoint {
+    pub origin: [f32; 3],
+    pub angle: Option<f32>,
 }
 
 impl Bsp {
@@ -154,20 +178,59 @@ impl Bsp {
 pub fn parse_bsp(data: &[u8]) -> Result<Bsp, BspError> {
     let header = parse_header(data)?;
 
+    let planes = parse_planes(data, &header.lumps)?;
     let vertices = parse_vertices(data, &header.lumps)?;
     let edges = parse_edges(data, &header.lumps)?;
     let surfedges = parse_surfedges(data, &header.lumps)?;
     let faces = parse_faces(data, &header.lumps)?;
+    let clipnodes = parse_clipnodes(data, &header.lumps)?;
     let models = parse_models(data, &header.lumps)?;
 
     Ok(Bsp {
         header,
+        planes,
         vertices,
         edges,
         surfedges,
         faces,
+        clipnodes,
         models,
     })
+}
+
+pub fn parse_spawn(data: &[u8], header: &BspHeader) -> Result<Option<SpawnPoint>, BspError> {
+    let lump = header.lumps[LumpType::Entities as usize];
+    if lump.length == 0 {
+        return Ok(None);
+    }
+    let slice = lump_slice(data, lump);
+    let text = std::str::from_utf8(slice).map_err(|_| BspError::InvalidEntities)?;
+    let entities = parse_entities(text);
+
+    let mut fallback = None;
+    for entity in &entities {
+        let classname = entity_value(entity, "classname");
+        let origin = entity_value(entity, "origin").and_then(parse_origin);
+        if origin.is_none() {
+            continue;
+        }
+        let angle = entity_value(entity, "angle").and_then(|value| value.parse().ok());
+        let spawn = SpawnPoint {
+            origin: origin.unwrap(),
+            angle,
+        };
+        match classname {
+            Some("info_player_start") => return Ok(Some(spawn)),
+            Some("info_player_deathmatch") => {
+                if fallback.is_none() {
+                    fallback = Some(spawn);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(fallback)
 }
 
 fn parse_header(data: &[u8]) -> Result<BspHeader, BspError> {
@@ -212,6 +275,35 @@ fn parse_header(data: &[u8]) -> Result<BspHeader, BspError> {
     }
 
     Ok(BspHeader { version, lumps })
+}
+
+fn parse_planes(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Plane>, BspError> {
+    let lump = lumps[LumpType::Planes as usize];
+    if lump.length == 0 {
+        return Ok(Vec::new());
+    }
+    if !lump.length.is_multiple_of(20) {
+        return Err(BspError::InvalidLumpSize {
+            lump: LumpType::Planes,
+            size: lump.length,
+            stride: 20,
+        });
+    }
+
+    let slice = lump_slice(data, lump);
+    let mut planes = Vec::with_capacity(slice.len() / 20);
+    for chunk in slice.chunks_exact(20) {
+        planes.push(Plane {
+            normal: [
+                read_f32_le(&chunk[0..4]),
+                read_f32_le(&chunk[4..8]),
+                read_f32_le(&chunk[8..12]),
+            ],
+            dist: read_f32_le(&chunk[12..16]),
+            plane_type: read_i32_le(&chunk[16..20]),
+        });
+    }
+    Ok(planes)
 }
 
 fn parse_vertices(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[f32; 3]>, BspError> {
@@ -317,6 +409,33 @@ fn parse_faces(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Face>, Bsp
     Ok(faces)
 }
 
+fn parse_clipnodes(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<ClipNode>, BspError> {
+    let lump = lumps[LumpType::ClipNodes as usize];
+    if lump.length == 0 {
+        return Ok(Vec::new());
+    }
+    if !lump.length.is_multiple_of(8) {
+        return Err(BspError::InvalidLumpSize {
+            lump: LumpType::ClipNodes,
+            size: lump.length,
+            stride: 8,
+        });
+    }
+
+    let slice = lump_slice(data, lump);
+    let mut nodes = Vec::with_capacity(slice.len() / 8);
+    for chunk in slice.chunks_exact(8) {
+        let plane_id = read_i32_le(&chunk[0..4]);
+        let child0 = read_i16_le(&chunk[4..6]) as i32;
+        let child1 = read_i16_le(&chunk[6..8]) as i32;
+        nodes.push(ClipNode {
+            plane_id,
+            children: [child0, child1],
+        });
+    }
+    Ok(nodes)
+}
+
 fn parse_models(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Model>, BspError> {
     let lump = lumps[LumpType::Models as usize];
     if lump.length == 0 {
@@ -333,9 +452,16 @@ fn parse_models(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Model>, B
     let slice = lump_slice(data, lump);
     let mut models = Vec::with_capacity(slice.len() / 64);
     for chunk in slice.chunks_exact(64) {
+        let headnode = [
+            read_i32_le(&chunk[36..40]),
+            read_i32_le(&chunk[40..44]),
+            read_i32_le(&chunk[44..48]),
+            read_i32_le(&chunk[48..52]),
+        ];
         let first_face = read_i32_le(&chunk[56..60]);
         let num_faces = read_i32_le(&chunk[60..64]);
         models.push(Model {
+            headnode,
             first_face,
             num_faces,
         });
@@ -349,6 +475,66 @@ fn lump_slice(data: &[u8], lump: Lump) -> &[u8] {
     &data[start..end]
 }
 
+fn parse_entities(text: &str) -> Vec<Vec<(String, String)>> {
+    let mut entities = Vec::new();
+    let mut current: Vec<(String, String)> = Vec::new();
+    let mut key: Option<String> = None;
+    let mut in_entity = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                in_entity = true;
+                current = Vec::new();
+                key = None;
+            }
+            '}' => {
+                if in_entity && !current.is_empty() {
+                    entities.push(std::mem::take(&mut current));
+                }
+                in_entity = false;
+                key = None;
+            }
+            '"' => {
+                let mut token = String::new();
+                for c in chars.by_ref() {
+                    if c == '"' {
+                        break;
+                    }
+                    token.push(c);
+                }
+                if in_entity {
+                    if let Some(pending) = key.take() {
+                        current.push((pending, token));
+                    } else {
+                        key = Some(token);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_entity && !current.is_empty() {
+        entities.push(current);
+    }
+    entities
+}
+
+fn entity_value<'a>(entity: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    entity
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn parse_origin(value: &str) -> Option<[f32; 3]> {
+    let mut parts = value.split_whitespace();
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    let z = parts.next()?.parse().ok()?;
+    Some([x, y, z])
+}
+
 fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
@@ -359,6 +545,10 @@ fn read_i32_le(bytes: &[u8]) -> i32 {
 
 fn read_u16_le(bytes: &[u8]) -> u16 {
     u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn read_i16_le(bytes: &[u8]) -> i16 {
+    i16::from_le_bytes([bytes[0], bytes[1]])
 }
 
 fn read_f32_le(bytes: &[u8]) -> f32 {

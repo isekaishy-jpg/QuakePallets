@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use compat_quake::bsp;
-use compat_quake::bsp::Bsp;
+use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
 use compat_quake::pak::{self, PakFile};
 use engine_core::vfs::Vfs;
@@ -21,8 +20,20 @@ const EXIT_SCENE: i32 = 14;
 
 const CAMERA_UP: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 const CAMERA_FOV_Y: f32 = 70.0f32.to_radians();
-const CAMERA_NEAR: f32 = 1.0;
+const CAMERA_NEAR: f32 = 0.25;
 const CAMERA_FAR: f32 = 8192.0;
+const PLAYER_SPEED: f32 = 320.0;
+const PLAYER_ACCEL: f32 = 12.0;
+const PLAYER_FRICTION: f32 = 14.0;
+const PLAYER_STOP_SPEED: f32 = 100.0;
+const PLAYER_GRAVITY: f32 = 800.0;
+const PLAYER_JUMP_SPEED: f32 = 270.0;
+const PLAYER_EYE_HEIGHT: f32 = 22.0;
+const PLAYER_STEP_HEIGHT: f32 = 18.0;
+const PLAYER_MAX_DROP: f32 = 256.0;
+const FLOOR_NORMAL_MIN: f32 = 0.7;
+const DIST_EPSILON: f32 = 0.03125;
+const CONTENTS_SOLID: i32 = -2;
 const OPENGL_TO_WGPU: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -61,7 +72,7 @@ struct InputState {
     back: bool,
     left: bool,
     right: bool,
-    up: bool,
+    jump: bool,
     down: bool,
 }
 
@@ -69,25 +80,46 @@ struct CameraState {
     position: Vec3,
     yaw: f32,
     pitch: f32,
+    velocity: Vec3,
+    vertical_velocity: f32,
+    on_ground: bool,
     speed: f32,
+    accel: f32,
+    friction: f32,
+    gravity: f32,
+    jump_speed: f32,
+    eye_height: f32,
+    step_height: f32,
+    max_drop: f32,
     sensitivity: f32,
 }
 
 impl CameraState {
-    fn from_bounds(bounds: &Bounds) -> Self {
+    fn from_bounds(bounds: &Bounds, collision: Option<&SceneCollision>) -> Self {
+        let mut camera = Self::default();
         let center = bounds.center();
         let extent = bounds.extent().length().max(1.0);
-        let position = Vec3::new(center.x, center.y + extent * 0.25, center.z + extent);
-        let dir = center.sub(position).normalize_or_zero();
-        let pitch = dir.y.asin();
-        let yaw = dir.x.atan2(-dir.z);
-        Self {
-            position,
-            yaw,
-            pitch,
-            speed: extent * 0.6,
-            sensitivity: 0.0025,
+        let mut position = Vec3::new(
+            center.x,
+            center.y + camera.eye_height,
+            center.z + extent * 0.25,
+        );
+        if let Some(collision) = collision {
+            if let Some(spawn) = collision.spawn_point(bounds, camera.eye_height) {
+                position = spawn;
+                camera.on_ground = true;
+            } else {
+                camera.position = position;
+                camera.snap_to_floor(collision);
+                position = camera.position;
+            }
         }
+        let dir = center.sub(position).normalize_or_zero();
+        camera.pitch = dir.y.asin();
+        camera.yaw = dir.x.atan2(-dir.z);
+        camera.position = position;
+        camera.speed = (extent * 0.15).max(PLAYER_SPEED);
+        camera
     }
 
     fn forward(&self) -> Vec3 {
@@ -98,14 +130,104 @@ impl CameraState {
         )
     }
 
-    fn right(&self) -> Vec3 {
-        self.forward().cross(CAMERA_UP).normalize_or_zero()
+    fn forward_flat(&self) -> Vec3 {
+        Vec3::new(self.yaw.sin(), 0.0, -self.yaw.cos())
     }
 
-    fn update(&mut self, input: &InputState, dt: f32) {
+    fn right_flat(&self) -> Vec3 {
+        Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin())
+    }
+
+    fn update(
+        &mut self,
+        input: &InputState,
+        dt: f32,
+        collision: Option<&SceneCollision>,
+        fly_mode: bool,
+    ) {
+        if fly_mode {
+            self.update_fly(input, dt);
+            return;
+        }
+        let mut wish_dir = Vec3::zero();
+        let forward = self.forward_flat();
+        let right = self.right_flat();
+        if input.forward {
+            wish_dir = wish_dir.add(forward);
+        }
+        if input.back {
+            wish_dir = wish_dir.sub(forward);
+        }
+        if input.right {
+            wish_dir = wish_dir.add(right);
+        }
+        if input.left {
+            wish_dir = wish_dir.sub(right);
+        }
+
+        if self.on_ground {
+            let speed = self.velocity.length();
+            if speed > 0.0 {
+                let control = speed.max(PLAYER_STOP_SPEED);
+                let drop = control * self.friction * dt;
+                let new_speed = (speed - drop).max(0.0);
+                self.velocity = self.velocity.scale(new_speed / speed);
+            }
+        }
+        if wish_dir.length() > 0.0 {
+            let wish_dir = wish_dir.normalize_or_zero();
+            let current_speed = self.velocity.dot(wish_dir);
+            let add_speed = self.speed - current_speed;
+            if add_speed > 0.0 {
+                let accel_speed = (self.accel * dt * self.speed).min(add_speed);
+                self.velocity = self.velocity.add(wish_dir.scale(accel_speed));
+            }
+        }
+
+        if self.on_ground && input.jump {
+            self.vertical_velocity = self.jump_speed;
+            self.on_ground = false;
+        }
+        self.vertical_velocity -= self.gravity * dt;
+
+        let origin = self.collision_origin();
+        let velocity = Vec3::new(self.velocity.x, self.vertical_velocity, self.velocity.z);
+        if let Some(scene) = collision {
+            let origin = scene.try_unstuck(origin);
+            let (mut new_origin, new_velocity, mut on_ground) =
+                scene.move_with_step(origin, velocity, dt, self.step_height);
+            if scene.hull_point_contents(scene.headnode, new_origin) == CONTENTS_SOLID {
+                let unstuck = scene.try_unstuck(new_origin);
+                if scene.hull_point_contents(scene.headnode, unstuck) != CONTENTS_SOLID {
+                    new_origin = unstuck;
+                }
+            }
+            let check = scene.trace(new_origin, new_origin.add(Vec3::new(0.0, -2.0, 0.0)));
+            if !check.start_solid && check.fraction < 1.0 && check.plane_normal.y > FLOOR_NORMAL_MIN
+            {
+                new_origin = check.end;
+                on_ground = true;
+            }
+            self.on_ground = on_ground;
+            self.vertical_velocity = if on_ground && new_velocity.y < 0.0 {
+                0.0
+            } else {
+                new_velocity.y
+            };
+            self.velocity.x = new_velocity.x;
+            self.velocity.z = new_velocity.z;
+            self.position = self.camera_from_origin(new_origin);
+        } else {
+            self.position = self.position.add(velocity.scale(dt));
+            self.velocity.x = velocity.x;
+            self.velocity.z = velocity.z;
+        }
+    }
+
+    fn update_fly(&mut self, input: &InputState, dt: f32) {
         let mut direction = Vec3::zero();
         let forward = self.forward();
-        let right = self.right();
+        let right = forward.cross(CAMERA_UP).normalize_or_zero();
         if input.forward {
             direction = direction.add(forward);
         }
@@ -118,7 +240,7 @@ impl CameraState {
         if input.left {
             direction = direction.sub(right);
         }
-        if input.up {
+        if input.jump {
             direction = direction.add(CAMERA_UP);
         }
         if input.down {
@@ -127,6 +249,35 @@ impl CameraState {
 
         let direction = direction.normalize_or_zero();
         self.position = self.position.add(direction.scale(self.speed * dt));
+        self.velocity = Vec3::zero();
+        self.vertical_velocity = 0.0;
+        self.on_ground = false;
+    }
+
+    fn snap_to_floor(&mut self, collision: &SceneCollision) {
+        let origin = self.collision_origin();
+        let target = origin.sub(Vec3::new(0.0, self.max_drop, 0.0));
+        let trace = collision.trace(origin, target);
+        if trace.start_solid {
+            return;
+        }
+        if trace.fraction < 1.0 {
+            self.position = self.camera_from_origin(trace.end);
+            self.on_ground = true;
+            self.vertical_velocity = 0.0;
+        }
+    }
+
+    fn collision_origin(&self) -> Vec3 {
+        Vec3::new(
+            self.position.x,
+            self.position.y - self.eye_height,
+            self.position.z,
+        )
+    }
+
+    fn camera_from_origin(&self, origin: Vec3) -> Vec3 {
+        Vec3::new(origin.x, origin.y + self.eye_height, origin.z)
     }
 
     fn apply_mouse(&mut self, delta_x: f64, delta_y: f64) {
@@ -157,6 +308,28 @@ impl CameraState {
                 1.0,
             ],
         ]
+    }
+}
+
+impl Default for CameraState {
+    fn default() -> Self {
+        Self {
+            position: Vec3::zero(),
+            yaw: 0.0,
+            pitch: 0.0,
+            velocity: Vec3::zero(),
+            vertical_velocity: 0.0,
+            on_ground: false,
+            speed: PLAYER_SPEED,
+            accel: PLAYER_ACCEL,
+            friction: PLAYER_FRICTION,
+            gravity: PLAYER_GRAVITY,
+            jump_speed: PLAYER_JUMP_SPEED,
+            eye_height: PLAYER_EYE_HEIGHT,
+            step_height: PLAYER_STEP_HEIGHT,
+            max_drop: PLAYER_MAX_DROP,
+            sensitivity: 0.0025,
+        }
     }
 }
 
@@ -261,6 +434,391 @@ impl Bounds {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Triangle {
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    normal: Vec3,
+}
+
+impl Triangle {
+    fn from_normal(a: Vec3, b: Vec3, c: Vec3, normal: Vec3) -> Option<Self> {
+        if normal.length() == 0.0 {
+            return None;
+        }
+        let normal = if normal.y < 0.0 {
+            normal.scale(-1.0)
+        } else {
+            normal
+        };
+        Some(Self { a, b, c, normal })
+    }
+
+    fn height_at(&self, x: f32, z: f32) -> Option<f32> {
+        let ny = self.normal.y;
+        if ny.abs() < 1e-6 {
+            return None;
+        }
+        let d = -self.normal.dot(self.a);
+        Some(-(self.normal.x * x + self.normal.z * z + d) / ny)
+    }
+
+    fn center(&self) -> Vec3 {
+        self.a.add(self.b).add(self.c).scale(1.0 / 3.0)
+    }
+}
+
+struct SceneCollision {
+    floors: Vec<Triangle>,
+    planes: Vec<CollisionPlane>,
+    clipnodes: Vec<ClipNode>,
+    headnode: i32,
+}
+
+struct CollisionPlane {
+    normal: Vec3,
+    dist: f32,
+}
+
+struct ClipNode {
+    plane_id: i32,
+    children: [i32; 2],
+}
+
+struct Trace {
+    fraction: f32,
+    end: Vec3,
+    plane_normal: Vec3,
+    start_solid: bool,
+    all_solid: bool,
+}
+
+fn clip_velocity(velocity: Vec3, normal: Vec3, overbounce: f32) -> Vec3 {
+    let backoff = velocity.dot(normal) * overbounce;
+    velocity.sub(normal.scale(backoff))
+}
+
+impl SceneCollision {
+    fn spawn_point(&self, bounds: &Bounds, eye_height: f32) -> Option<Vec3> {
+        let center = bounds.center();
+        let mut best: Option<(f32, Vec3)> = None;
+        for tri in &self.floors {
+            if tri.normal.y < FLOOR_NORMAL_MIN {
+                continue;
+            }
+            let tri_center = tri.center();
+            let y = match tri.height_at(tri_center.x, tri_center.z) {
+                Some(y) => y,
+                None => continue,
+            };
+            let dx = tri_center.x - center.x;
+            let dz = tri_center.z - center.z;
+            let dist2 = dx * dx + dz * dz;
+            let candidate = Vec3::new(tri_center.x, y + eye_height, tri_center.z);
+            let replace = match best.as_ref() {
+                Some((best_dist, _)) => dist2 < *best_dist,
+                None => true,
+            };
+            if replace {
+                best = Some((dist2, candidate));
+            }
+        }
+        best.map(|(_, position)| position)
+    }
+
+    fn move_with_step(
+        &self,
+        start: Vec3,
+        velocity: Vec3,
+        dt: f32,
+        step_height: f32,
+    ) -> (Vec3, Vec3, bool) {
+        let (down_pos, down_vel, down_ground, down_blocked) = self.slide_move(start, velocity, dt);
+        if !down_ground || !down_blocked {
+            return (down_pos, down_vel, down_ground);
+        }
+
+        let up = start.add(Vec3::new(0.0, step_height, 0.0));
+        if !self.has_headroom(start, up) {
+            return (down_pos, down_vel, down_ground);
+        }
+
+        let (step_pos, step_vel, _, _) = self.slide_move(up, velocity, dt);
+        let down = step_pos.add(Vec3::new(0.0, -step_height, 0.0));
+        let down_trace = self.trace(step_pos, down);
+        let step_end = down_trace.end;
+
+        let down_delta = Vec3::new(down_pos.x - start.x, 0.0, down_pos.z - start.z);
+        let step_delta = Vec3::new(step_end.x - start.x, 0.0, step_end.z - start.z);
+        let down_dist = down_delta.length();
+        let step_dist = step_delta.length();
+        if step_dist > down_dist {
+            let landed = !down_trace.start_solid
+                && down_trace.fraction < 1.0
+                && down_trace.plane_normal.y > FLOOR_NORMAL_MIN;
+            if landed {
+                let mut final_vel = step_vel;
+                if final_vel.y < 0.0 {
+                    final_vel.y = 0.0;
+                }
+                return (step_end, final_vel, true);
+            }
+        }
+
+        (down_pos, down_vel, down_ground)
+    }
+
+    fn slide_move(&self, start: Vec3, velocity: Vec3, dt: f32) -> (Vec3, Vec3, bool, bool) {
+        let mut pos = start;
+        let mut vel = velocity;
+        let mut time_left = dt;
+        let mut planes: Vec<Vec3> = Vec::new();
+        let mut on_ground = false;
+        let mut blocked = false;
+
+        for _ in 0..4 {
+            if vel.length() <= 0.0 {
+                break;
+            }
+            let end = pos.add(vel.scale(time_left));
+            let trace = self.trace(pos, end);
+            if trace.all_solid {
+                return (pos, Vec3::zero(), false, true);
+            }
+            if trace.fraction > 0.0 {
+                pos = trace.end;
+            }
+            if trace.fraction == 1.0 {
+                break;
+            }
+            blocked = true;
+
+            if trace.plane_normal.y > FLOOR_NORMAL_MIN {
+                on_ground = true;
+            }
+            time_left *= 1.0 - trace.fraction;
+
+            planes.push(trace.plane_normal);
+            let original = vel;
+            let primal = vel;
+            let mut new_vel = Vec3::zero();
+            let mut found = false;
+            for i in 0..planes.len() {
+                let test = clip_velocity(original, planes[i], 1.0);
+                let mut ok = true;
+                for (j, plane) in planes.iter().enumerate() {
+                    if j != i && test.dot(*plane) < 0.0 {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    new_vel = test;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                if planes.len() == 2 {
+                    let dir = planes[0].cross(planes[1]).normalize_or_zero();
+                    new_vel = dir.scale(dir.dot(primal));
+                } else {
+                    new_vel = Vec3::zero();
+                }
+            }
+            vel = new_vel;
+            if trace.plane_normal.y < -FLOOR_NORMAL_MIN && vel.y > 0.0 {
+                vel.y = 0.0;
+            }
+            if vel.length() <= 1e-6 {
+                vel = Vec3::zero();
+                break;
+            }
+        }
+
+        if on_ground && vel.y < 0.0 {
+            vel.y = 0.0;
+        }
+        (pos, vel, on_ground, blocked)
+    }
+
+    fn trace(&self, start: Vec3, end: Vec3) -> Trace {
+        let mut trace = Trace {
+            fraction: 1.0,
+            end,
+            plane_normal: Vec3::zero(),
+            start_solid: false,
+            all_solid: true,
+        };
+        let _ = self.recursive_hull_check(self.headnode, 0.0, 1.0, start, end, &mut trace);
+        if trace.start_solid {
+            trace.fraction = 0.0;
+            trace.end = start;
+            return trace;
+        }
+        if trace.fraction < 1.0 {
+            trace.end = start.add(end.sub(start).scale(trace.fraction));
+        } else {
+            trace.end = end;
+        }
+        trace
+    }
+
+    fn has_headroom(&self, origin: Vec3, up: Vec3) -> bool {
+        let trace = self.trace(origin, up);
+        !trace.start_solid && trace.fraction >= 1.0
+    }
+
+    fn try_unstuck(&self, position: Vec3) -> Vec3 {
+        if self.hull_point_contents(self.headnode, position) != CONTENTS_SOLID {
+            return position;
+        }
+        for dy in 1..=64 {
+            let candidate = position.add(Vec3::new(0.0, -(dy as f32), 0.0));
+            if self.hull_point_contents(self.headnode, candidate) != CONTENTS_SOLID {
+                return candidate;
+            }
+        }
+        let steps = [0.0, -2.0, -4.0, -8.0, -16.0, -24.0, -32.0, 1.0, 2.0, 4.0];
+        let radii = [1.0, 2.0, 4.0, 8.0, 12.0, 16.0];
+        for dy in steps {
+            for radius in radii {
+                for dx in [-1.0, 0.0, 1.0] {
+                    for dz in [-1.0, 0.0, 1.0] {
+                        if dx == 0.0 && dz == 0.0 && dy == 0.0 {
+                            continue;
+                        }
+                        let candidate = position.add(Vec3::new(dx * radius, dy, dz * radius));
+                        if self.hull_point_contents(self.headnode, candidate) != CONTENTS_SOLID {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+        }
+        position
+    }
+
+    fn recursive_hull_check(
+        &self,
+        node: i32,
+        start_frac: f32,
+        end_frac: f32,
+        start: Vec3,
+        end: Vec3,
+        trace: &mut Trace,
+    ) -> bool {
+        if node < 0 {
+            if node != CONTENTS_SOLID {
+                trace.all_solid = false;
+                return true;
+            }
+            trace.start_solid = true;
+            return false;
+        }
+        let clipnode = match self.clipnodes.get(node as usize) {
+            Some(node) => node,
+            None => return false,
+        };
+        let plane = match self.planes.get(clipnode.plane_id as usize) {
+            Some(plane) => plane,
+            None => return false,
+        };
+
+        let start_dist = plane.normal.dot(start) - plane.dist;
+        let end_dist = plane.normal.dot(end) - plane.dist;
+
+        if start_dist >= 0.0 && end_dist >= 0.0 {
+            return self.recursive_hull_check(
+                clipnode.children[0],
+                start_frac,
+                end_frac,
+                start,
+                end,
+                trace,
+            );
+        }
+        if start_dist < 0.0 && end_dist < 0.0 {
+            return self.recursive_hull_check(
+                clipnode.children[1],
+                start_frac,
+                end_frac,
+                start,
+                end,
+                trace,
+            );
+        }
+
+        let mut frac = if start_dist < 0.0 {
+            (start_dist + DIST_EPSILON) / (start_dist - end_dist)
+        } else {
+            (start_dist - DIST_EPSILON) / (start_dist - end_dist)
+        };
+        frac = frac.clamp(0.0, 1.0);
+        let mid_frac = start_frac + (end_frac - start_frac) * frac;
+        let mid = start.add(end.sub(start).scale(frac));
+        let side = if start_dist < 0.0 { 1 } else { 0 };
+
+        if !self.recursive_hull_check(
+            clipnode.children[side],
+            start_frac,
+            mid_frac,
+            start,
+            mid,
+            trace,
+        ) {
+            return false;
+        }
+
+        if self.hull_point_contents(clipnode.children[side ^ 1], mid) != CONTENTS_SOLID {
+            return self.recursive_hull_check(
+                clipnode.children[side ^ 1],
+                mid_frac,
+                end_frac,
+                mid,
+                end,
+                trace,
+            );
+        }
+
+        if trace.all_solid {
+            return false;
+        }
+
+        trace.fraction = mid_frac;
+        trace.plane_normal = if side == 0 {
+            plane.normal
+        } else {
+            plane.normal.scale(-1.0)
+        };
+        false
+    }
+
+    fn hull_point_contents(&self, node: i32, point: Vec3) -> i32 {
+        let mut node = node;
+        loop {
+            if node < 0 {
+                return node;
+            }
+            let clipnode = match self.clipnodes.get(node as usize) {
+                Some(node) => node,
+                None => return CONTENTS_SOLID,
+            };
+            let plane = match self.planes.get(clipnode.plane_id as usize) {
+                Some(plane) => plane,
+                None => return CONTENTS_SOLID,
+            };
+            let dist = plane.normal.dot(point) - plane.dist;
+            node = if dist >= 0.0 {
+                clipnode.children[0]
+            } else {
+                clipnode.children[1]
+            };
+        }
+    }
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(args) => args,
@@ -294,13 +852,9 @@ fn main() {
     let main_window_id = renderer.window_id();
 
     let mut input = InputState::default();
-    let mut camera = CameraState {
-        position: Vec3::zero(),
-        yaw: 0.0,
-        pitch: 0.0,
-        speed: 320.0,
-        sensitivity: 0.0025,
-    };
+    let mut camera = CameraState::default();
+    let mut collision: Option<SceneCollision> = None;
+    let mut fly_mode = false;
     let mut scene_active = false;
     let mut mouse_look = false;
     let mut mouse_grabbed = false;
@@ -340,7 +894,7 @@ fn main() {
             }
         };
 
-        let (mesh, bounds) = match load_bsp_scene(quake_dir, map) {
+        let (mesh, bounds, scene_collision, spawn) = match load_bsp_scene(quake_dir, map) {
             Ok(result) => result,
             Err(err) => {
                 eprintln!("{}", err.message);
@@ -353,7 +907,20 @@ fn main() {
             std::process::exit(EXIT_SCENE);
         }
 
-        camera = CameraState::from_bounds(&bounds);
+        collision = Some(scene_collision);
+        camera = CameraState::from_bounds(&bounds, collision.as_ref());
+        if let Some(spawn) = spawn {
+            let base = quake_to_render(spawn.origin);
+            camera.position = camera.camera_from_origin(base);
+            if let Some(angle) = spawn.angle {
+                camera.yaw = (90.0 - angle).to_radians();
+                camera.pitch = 0.0;
+            }
+            // Test-only spawn from BSP entities; M8 Lua spawning will replace this path.
+            if let Some(scene) = collision.as_ref() {
+                camera.snap_to_floor(scene);
+            }
+        }
         scene_active = true;
         mouse_look = false;
         mouse_grabbed = set_cursor_mode(window, mouse_look);
@@ -380,8 +947,18 @@ fn main() {
                             KeyCode::KeyS => input.back = pressed,
                             KeyCode::KeyA => input.left = pressed,
                             KeyCode::KeyD => input.right = pressed,
-                            KeyCode::Space => input.up = pressed,
+                            KeyCode::Space => input.jump = pressed,
                             KeyCode::ShiftLeft => input.down = pressed,
+                            KeyCode::KeyF if pressed => {
+                                fly_mode = !fly_mode;
+                                if fly_mode {
+                                    camera.velocity = Vec3::zero();
+                                    camera.vertical_velocity = 0.0;
+                                    camera.on_ground = false;
+                                } else if let Some(scene) = collision.as_ref() {
+                                    camera.snap_to_floor(scene);
+                                }
+                            }
                             KeyCode::Escape if pressed => {
                                 mouse_look = false;
                                 mouse_grabbed = set_cursor_mode(window, mouse_look);
@@ -424,7 +1001,7 @@ fn main() {
                     last_frame = now;
 
                     if scene_active {
-                        camera.update(&input, dt);
+                        camera.update(&input, dt, collision.as_ref(), fly_mode);
                         let aspect = aspect_ratio(renderer.size());
                         renderer.update_camera(camera.view_proj(aspect));
                     }
@@ -553,7 +1130,10 @@ fn load_lmp_image(quake_dir: &Path, asset: &str) -> Result<ImageData, ExitError>
     Ok(image)
 }
 
-fn load_bsp_scene(quake_dir: &Path, map: &str) -> Result<(MeshData, Bounds), ExitError> {
+fn load_bsp_scene(
+    quake_dir: &Path,
+    map: &str,
+) -> Result<(MeshData, Bounds, SceneCollision, Option<SpawnPoint>), ExitError> {
     let (pak, pak_path) = load_pak_from_quake_dir(quake_dir)?;
     let map_name = normalize_map_asset(map);
     let bsp_bytes = pak
@@ -573,14 +1153,19 @@ fn load_bsp_scene(quake_dir: &Path, map: &str) -> Result<(MeshData, Bounds), Exi
         bsp.faces.len()
     );
 
-    build_scene_mesh(&bsp)
+    let spawn = bsp::parse_spawn(bsp_bytes, &bsp.header)
+        .map_err(|err| ExitError::new(EXIT_BSP, format!("bsp spawn parse failed: {}", err)))?;
+
+    let (mesh, bounds, collision) = build_scene_mesh(&bsp)?;
+    Ok((mesh, bounds, collision, spawn))
 }
 
-fn build_scene_mesh(bsp: &Bsp) -> Result<(MeshData, Bounds), ExitError> {
+fn build_scene_mesh(bsp: &Bsp) -> Result<(MeshData, Bounds, SceneCollision), ExitError> {
     let face_range = bsp.world_face_range().unwrap_or(0..bsp.faces.len());
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
+    let mut floors = Vec::new();
     let mut bounds = Bounds::empty();
 
     for face_index in face_range {
@@ -654,6 +1239,11 @@ fn build_scene_mesh(bsp: &Bsp) -> Result<(MeshData, Bounds), ExitError> {
             let v1 = quake_to_render(polygon[i]);
             let v2 = quake_to_render(polygon[i + 1]);
             let normal = v1.sub(v0).cross(v2.sub(v0)).normalize_or_zero();
+            if let Some(triangle) = Triangle::from_normal(v0, v1, v2, normal) {
+                if triangle.normal.y >= FLOOR_NORMAL_MIN {
+                    floors.push(triangle);
+                }
+            }
             let color = normal.abs().scale(0.8).add(Vec3::new(0.2, 0.2, 0.2));
 
             let base = u32::try_from(vertices.len())
@@ -687,7 +1277,40 @@ fn build_scene_mesh(bsp: &Bsp) -> Result<(MeshData, Bounds), ExitError> {
 
     let mesh = MeshData::new(vertices, indices)
         .map_err(|err| ExitError::new(EXIT_BSP, format!("mesh build failed: {}", err)))?;
-    Ok((mesh, bounds))
+    let planes = bsp
+        .planes
+        .iter()
+        .map(|plane| CollisionPlane {
+            normal: quake_to_render(plane.normal),
+            dist: plane.dist,
+        })
+        .collect();
+    let clipnodes = bsp
+        .clipnodes
+        .iter()
+        .map(|node| ClipNode {
+            plane_id: node.plane_id,
+            children: node.children,
+        })
+        .collect();
+    let headnode = if bsp.clipnodes.is_empty() {
+        -1
+    } else {
+        bsp.models
+            .first()
+            .map(|model| model.headnode[1])
+            .unwrap_or(0)
+    };
+    Ok((
+        mesh,
+        bounds,
+        SceneCollision {
+            floors,
+            planes,
+            clipnodes,
+            headnode,
+        },
+    ))
 }
 
 fn load_pak_from_quake_dir(quake_dir: &Path) -> Result<(PakFile, PathBuf), ExitError> {

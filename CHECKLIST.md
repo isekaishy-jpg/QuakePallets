@@ -84,13 +84,13 @@ A PR is mergeable only if:
 # Milestones
 
 ## M0 — Workspace scaffold + CI + Pallet window
-- [ ] Workspace builds on Windows + Linux (macOS optional).
-- [ ] CI wired (fmt/clippy/test/deny).
-- [ ] `pallet` boots: creates a window + clears a frame via wgpu.
-- [ ] Structured logging + error conventions.
+- [x] Workspace builds on Windows + Linux (macOS optional).
+- [x] CI wired (fmt/clippy/test/deny).
+- [x] `pallet` boots: creates a window + clears a frame via wgpu.
+- [x] Structured logging + error conventions.
 
 **DoD evidence**
-- [ ] `cargo run -p pallet` opens a window and renders a clear color, prints timing.
+- [x] `cargo run -p pallet` opens a window and renders a clear color, prints timing.
 
 ---
 
@@ -144,11 +144,11 @@ A PR is mergeable only if:
 ---
 
 ## M5 — Collision + basic player movement
-- [ ] World collision queries (initially simplified).
-- [ ] Player controller system (tunable accel/friction/gravity).
+- [x] World collision queries (initially simplified).
+- [x] Player controller system (tunable accel/friction/gravity).
 
 **DoD evidence**
-- [ ] Walk around without falling through floors in typical cases.
+- [x] Walk around without falling through floors in typical cases.
 
 ---
 
