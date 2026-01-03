@@ -217,7 +217,7 @@ Given a user path to a legally acquired Quake install:
 - [ ] Mount `id1/pak0.pak` (and additional paks if present)
 - [ ] Load and render a BSP map
 - [ ] Walk/fly with collision
-- [ ] Play WAV SFX and stream OGG music if present
+- [x] Play WAV SFX and stream OGG music if present
 - [ ] Works in:
   - single-process loopback client/server
   - dedicated server + network client
