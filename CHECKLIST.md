@@ -173,8 +173,8 @@ Goal: modern replication, not Quake’s protocol.
 - Server emits snapshots; client interpolates remote entities and predicts local player.
 
 ### Implementation
-- [ ] `net_transport`: UDP + reliability channels (renet-style).
-- [ ] `net_protocol`:
+- [x] `net_transport`: UDP + reliability channels (renet-style).
+- [x] `net_protocol`:
   - snapshot schema for entities + replicated components
   - baseline/delta mechanism (start simple)
 - [ ] Single-player uses loopback client/server with identical codepaths.
@@ -208,7 +208,7 @@ Goal: modern replication, not Quake’s protocol.
 - [ ] Upload frames to GPU and render.
 
 **DoD evidence**
-- [ ] `--play-movie <file>` renders frames smoothly.
+- [ ] `--play-movie <file>` renders frames smoothly with sound.
 
 ---
 
