@@ -1,0 +1,78 @@
+[package]
+name = "ep-miniaudio-sys"
+version = "2.4.0"
+authors = ["ExPixel <adolphc@outlook.com>"]
+edition = "2018"
+description = "Raw bindings to the miniaudio C library."
+documentation = "https://docs.rs/ep-miniaudio-sys"
+repository = "https://github.com/ExPixel/miniaudio-rs"
+homepage = "https://github.com/ExPixel/miniaudio-rs"
+license = "MIT"
+keywords = ["audio", "miniaudio", "sound", "pcm"]
+publish = true
+categories = ["multimedia::audio", "multimedia"]
+
+include = [
+    "src/**/*.rs",
+    "bindings/**/*.rs",
+    "build.rs",
+    "bindings.h",
+    "bindings-with-vorbis.h",
+    "miniaudio-wrapper.c",
+    "miniaudio/miniaudio.h",
+    "miniaudio/extras/**/*.c",
+    "miniaudio/extras/**/*.h"
+]
+
+[lib]
+name = "miniaudio_sys"
+path = "src/lib.rs"
+crate_type = ["lib"]
+test = false
+doctest = false
+
+[features]
+default = ["ma-log-level-error"]
+
+ma-enable-vorbis = []
+
+ma-no-wav = []
+ma-no-mp3 = []
+ma-no-flac = []
+
+ma-no-wasapi = []
+ma-no-dsound = []
+ma-no-winmm = []
+ma-no-alsa = []
+ma-no-pulseaudio = []
+ma-no-jack = []
+ma-no-coreaudio = []
+ma-no-sndio = []
+ma-no-audio4 = []
+ma-no-oss = []
+ma-no-aaudio = []
+ma-no-opensl = []
+ma-no-webaudio = []
+ma-no-null = []
+ma-no-decoding = []
+ma-no-device-io = []
+ma-no-stdio = []
+ma-no-sse2 = []
+ma-no-avx2 = []
+ma-no-avx512 = []
+ma-no-neon = []
+
+ma-log-level-verbose = []
+ma-log-level-info = []
+ma-log-level-warning = []
+ma-log-level-error = []
+
+ma-debug-output = []
+
+[dependencies]
+libc = "0.2"
+bitflags = "1.2"
+
+[build-dependencies]
+cc = "1.0"
+bindgen = { version = "0.54", default-features = false, features = ["runtime"], optional = true }

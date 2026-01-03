@@ -8,3 +8,4 @@ license = "MIT OR Apache-2.0"
 path = "src/lib.rs"
 
 [dependencies]
+miniaudio = { path = "../third_party/miniaudio-rs/miniaudio", default-features = false, features = ["ma-enable-vorbis", "ma-log-level-error"] }

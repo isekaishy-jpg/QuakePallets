@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+audio = { path = "../audio", version = "0.1.0" }
 compat_quake = { path = "../compat_quake", version = "0.1.0" }
 engine_core = { path = "../engine_core", version = "0.1.0" }
 platform_winit = { path = "../platform_winit", version = "0.1.0" }

@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use audio::AudioEngine;
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
 use compat_quake::pak::{self, PakFile};
-use engine_core::vfs::Vfs;
+use engine_core::vfs::{Vfs, VfsError};
 use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, KeyCode,
     MouseButton, PhysicalKey, PhysicalPosition, PhysicalSize, Window, WindowEvent,
@@ -17,6 +18,7 @@ const EXIT_PAK: i32 = 11;
 const EXIT_IMAGE: i32 = 12;
 const EXIT_BSP: i32 = 13;
 const EXIT_SCENE: i32 = 14;
+const DEFAULT_SFX: &str = "sound/misc/menu1.wav";
 
 const CAMERA_UP: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 const CAMERA_FOV_Y: f32 = 70.0f32.to_radians();
@@ -64,6 +66,11 @@ impl ExitError {
             message: message.into(),
         }
     }
+}
+
+struct MusicTrack {
+    name: String,
+    data: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -851,6 +858,21 @@ fn main() {
     };
     let main_window_id = renderer.window_id();
 
+    let audio = match AudioEngine::new() {
+        Ok(audio) => Some(audio),
+        Err(err) => {
+            eprintln!("{}", err);
+            None
+        }
+    };
+    let mut sfx_data = None;
+    if let (Some(_), Some(quake_dir)) = (audio.as_ref(), args.quake_dir.as_ref()) {
+        match load_wav_sfx(quake_dir, DEFAULT_SFX) {
+            Ok(data) => sfx_data = Some(data),
+            Err(err) => eprintln!("{}", err.message),
+        }
+    }
+
     let mut input = InputState::default();
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
@@ -926,6 +948,20 @@ fn main() {
         mouse_grabbed = set_cursor_mode(window, mouse_look);
         let aspect = aspect_ratio(renderer.size());
         renderer.update_camera(camera.view_proj(aspect));
+
+        if let (Some(audio), Some(quake_dir)) = (audio.as_ref(), args.quake_dir.as_ref()) {
+            match load_music_track(quake_dir) {
+                Ok(Some(track)) => {
+                    if let Err(err) = audio.play_music(track.data) {
+                        eprintln!("{}", err);
+                    } else {
+                        println!("streaming {}", track.name);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => eprintln!("{}", err.message),
+            }
+        }
     }
 
     let mut last_frame = Instant::now();
@@ -957,6 +993,15 @@ fn main() {
                                     camera.on_ground = false;
                                 } else if let Some(scene) = collision.as_ref() {
                                     camera.snap_to_floor(scene);
+                                }
+                            }
+                            KeyCode::KeyP if pressed => {
+                                if let (Some(audio), Some(data)) =
+                                    (audio.as_ref(), sfx_data.as_ref())
+                                {
+                                    if let Err(err) = audio.play_wav(data.clone()) {
+                                        eprintln!("{}", err);
+                                    }
                                 }
                             }
                             KeyCode::Escape if pressed => {
@@ -1092,6 +1137,89 @@ fn print_usage() {
     eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
+}
+
+fn load_wav_sfx(quake_dir: &Path, asset: &str) -> Result<Vec<u8>, ExitError> {
+    let (pak, pak_path) = load_pak_from_quake_dir(quake_dir)?;
+    let asset_name = normalize_asset_name(asset);
+    let wav_bytes = pak
+        .entry_data(&asset_name)
+        .map_err(|err| ExitError::new(EXIT_PAK, format!("asset lookup failed: {}", err)))?
+        .ok_or_else(|| {
+            ExitError::new(
+                EXIT_PAK,
+                format!("asset not found in pak0.pak: {}", asset_name),
+            )
+        })?;
+    println!("loaded {} from {}", asset_name, pak_path.display());
+    Ok(wav_bytes.to_vec())
+}
+
+fn load_music_track(quake_dir: &Path) -> Result<Option<MusicTrack>, ExitError> {
+    let mut vfs = Vfs::new();
+    vfs.add_root(quake_dir);
+    for dir in ["id1/music", "music"] {
+        if let Some(track) = find_music_in_dir(&vfs, dir)? {
+            return Ok(Some(track));
+        }
+    }
+
+    let (pak, _) = load_pak_from_quake_dir(quake_dir)?;
+    Ok(find_music_in_pak(&pak))
+}
+
+fn find_music_in_dir(vfs: &Vfs, dir: &str) -> Result<Option<MusicTrack>, ExitError> {
+    let entries = match vfs.list_dir(dir) {
+        Ok(entries) => entries,
+        Err(VfsError::NotFound(_)) => return Ok(None),
+        Err(err) => {
+            return Err(ExitError::new(
+                EXIT_PAK,
+                format!("music scan failed: {}", err),
+            ))
+        }
+    };
+
+    let mut candidates: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| !entry.is_dir && entry.name.to_lowercase().ends_with(".ogg"))
+        .map(|entry| entry.name)
+        .collect();
+    candidates.sort();
+
+    if let Some(name) = candidates.into_iter().next() {
+        let path = format!("{}/{}", dir, name);
+        return match vfs.read(&path) {
+            Ok(data) => Ok(Some(MusicTrack { name: path, data })),
+            Err(err) => Err(ExitError::new(
+                EXIT_PAK,
+                format!("music read failed: {}", err),
+            )),
+        };
+    }
+
+    Ok(None)
+}
+
+fn find_music_in_pak(pak: &PakFile) -> Option<MusicTrack> {
+    let mut candidates: Vec<String> = pak
+        .entries()
+        .iter()
+        .filter(|entry| entry.name.starts_with("music/"))
+        .map(|entry| entry.name.clone())
+        .filter(|name| name.to_lowercase().ends_with(".ogg"))
+        .collect();
+    candidates.sort();
+
+    for name in candidates {
+        if let Ok(Some(bytes)) = pak.entry_data(&name) {
+            return Some(MusicTrack {
+                name,
+                data: bytes.to_vec(),
+            });
+        }
+    }
+    None
 }
 
 fn load_lmp_image(quake_dir: &Path, asset: &str) -> Result<ImageData, ExitError> {

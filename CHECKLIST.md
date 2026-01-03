@@ -153,14 +153,14 @@ A PR is mergeable only if:
 ---
 
 ## M6 — Audio: WAV + OGG/Vorbis streaming
-- [ ] miniaudio device init + mixer.
-- [ ] WAV decode + playback.
-- [ ] OGG/Vorbis decode + streaming (for rerelease music if present).
-- [ ] Restart/stop track.
+- [x] miniaudio device init + mixer.
+- [x] WAV decode + playback.
+- [x] OGG/Vorbis decode + streaming (for rerelease music if present).
+- [x] Restart/stop track.
 
 **DoD evidence**
-- [ ] Keypress plays WAV.
-- [ ] Map start streams an OGG track if present.
+- [x] Keypress plays WAV.
+- [x] Map start streams an OGG track if present.
 
 ---
 
