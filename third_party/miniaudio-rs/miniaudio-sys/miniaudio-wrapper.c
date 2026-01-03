@@ -1,17 +1,11 @@
-#ifdef DR_FLAC_IMPLEMENTATION
-#include "./miniaudio/extras/dr_flac.h"
-#endif
-
-#ifdef DR_MP3_IMPLEMENTATION
-#include "./miniaudio/extras/dr_mp3.h"
-#endif
-
-#ifdef DR_WAV_IMPLEMENTATION
-#include "./miniaudio/extras/dr_wav.h"
-#endif
-
-#ifdef DR_WAV_IMPLEMENTATION
-#include "./miniaudio/extras/dr_wav.h"
+#ifdef MA_ENABLE_VORBIS
+#define STB_VORBIS_HEADER_ONLY
+#include "./miniaudio/extras/stb_vorbis.c"
 #endif
 
 #include "./miniaudio/miniaudio.h"
+
+#ifdef MA_ENABLE_VORBIS
+#undef STB_VORBIS_HEADER_ONLY
+#include "./miniaudio/extras/stb_vorbis.c"
+#endif

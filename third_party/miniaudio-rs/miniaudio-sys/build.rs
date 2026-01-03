@@ -22,7 +22,7 @@ pub fn main() {
         .file("./miniaudio-wrapper.c");
 
     if cfg!(feature = "ma-enable-vorbis") {
-        cc_builder.file("./miniaudio/extras/stb_vorbis.c");
+        cc_builder.define("MA_ENABLE_VORBIS", "1");
     }
 
     cc_builder.compile("libminiaudio");
