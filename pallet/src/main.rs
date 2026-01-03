@@ -2,15 +2,18 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use audio::AudioEngine;
+use client::{Client, ClientInput};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
 use compat_quake::pak::{self, PakFile};
 use engine_core::vfs::{Vfs, VfsError};
+use net_transport::TransportConfig;
 use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, KeyCode,
     MouseButton, PhysicalKey, PhysicalPosition, PhysicalSize, Window, WindowEvent,
 };
 use render_wgpu::{ImageData, MeshData, MeshVertex, RenderError};
+use server::Server;
 
 const EXIT_USAGE: i32 = 2;
 const EXIT_QUAKE_DIR: i32 = 10;
@@ -81,6 +84,55 @@ struct InputState {
     right: bool,
     jump: bool,
     down: bool,
+}
+
+struct LoopbackNet {
+    client: Client,
+    server: Server,
+    saw_snapshot: bool,
+}
+
+impl LoopbackNet {
+    fn start() -> Result<Self, String> {
+        let transport = TransportConfig::default();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0"
+            .parse()
+            .map_err(|err: std::net::AddrParseError| err.to_string())?;
+        let server = Server::bind(bind_addr, transport.clone(), 1).map_err(|err| err.to_string())?;
+        let server_addr = server.local_addr().map_err(|err| err.to_string())?;
+        let client_bind: std::net::SocketAddr = "127.0.0.1:0"
+            .parse()
+            .map_err(|err: std::net::AddrParseError| err.to_string())?;
+        let client =
+            Client::connect(client_bind, server_addr, transport).map_err(|err| err.to_string())?;
+        Ok(Self {
+            client,
+            server,
+            saw_snapshot: false,
+        })
+    }
+
+    fn tick(&mut self, input: &InputState, camera: &CameraState) -> Result<(), String> {
+        let move_x = bool_to_axis(input.forward, input.back);
+        let move_y = bool_to_axis(input.right, input.left);
+        let buttons = if input.jump { 1 } else { 0 };
+        self.client
+            .send_input(ClientInput {
+                move_x,
+                move_y,
+                yaw: camera.yaw,
+                pitch: camera.pitch,
+                buttons,
+            })
+            .map_err(|err| err.to_string())?;
+        self.server.tick().map_err(|err| err.to_string())?;
+        self.client.poll().map_err(|err| err.to_string())?;
+        if !self.saw_snapshot && self.client.last_snapshot().is_some() {
+            println!("loopback snapshot received");
+            self.saw_snapshot = true;
+        }
+        Ok(())
+    }
 }
 
 struct CameraState {
@@ -878,6 +930,7 @@ fn main() {
     let mut collision: Option<SceneCollision> = None;
     let mut fly_mode = false;
     let mut scene_active = false;
+    let mut loopback: Option<LoopbackNet> = None;
     let mut mouse_look = false;
     let mut mouse_grabbed = false;
     let mut ignore_cursor_move = false;
@@ -948,6 +1001,14 @@ fn main() {
         mouse_grabbed = set_cursor_mode(window, mouse_look);
         let aspect = aspect_ratio(renderer.size());
         renderer.update_camera(camera.view_proj(aspect));
+
+        loopback = match LoopbackNet::start() {
+            Ok(net) => Some(net),
+            Err(err) => {
+                eprintln!("loopback init failed: {}", err);
+                None
+            }
+        };
 
         if let (Some(audio), Some(quake_dir)) = (audio.as_ref(), args.quake_dir.as_ref()) {
             match load_music_track(quake_dir) {
@@ -1049,6 +1110,12 @@ fn main() {
                         camera.update(&input, dt, collision.as_ref(), fly_mode);
                         let aspect = aspect_ratio(renderer.size());
                         renderer.update_camera(camera.view_proj(aspect));
+                        if let Some(loopback_net) = loopback.as_mut() {
+                            if let Err(err) = loopback_net.tick(&input, &camera) {
+                                eprintln!("loopback tick failed: {}", err);
+                                loopback = None;
+                            }
+                        }
                     }
 
                     match renderer.render() {
@@ -1520,6 +1587,10 @@ fn aspect_ratio(size: PhysicalSize<u32>) -> f32 {
     let width = size.width.max(1) as f32;
     let height = size.height.max(1) as f32;
     width / height
+}
+
+fn bool_to_axis(positive: bool, negative: bool) -> f32 {
+    (positive as i32 - negative as i32) as f32
 }
 
 fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {

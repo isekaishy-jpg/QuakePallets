@@ -1400,10 +1400,13 @@ name = "pallet"
 version = "0.1.0"
 dependencies = [
  "audio",
+ "client",
  "compat_quake",
  "engine_core",
+ "net_transport",
  "platform_winit",
  "render_wgpu",
+ "server",
 ]
 
 [[package]]

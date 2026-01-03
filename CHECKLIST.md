@@ -177,7 +177,7 @@ Goal: modern replication, not Quake’s protocol.
 - [x] `net_protocol`:
   - snapshot schema for entities + replicated components
   - baseline/delta mechanism (start simple)
-- [ ] Single-player uses loopback client/server with identical codepaths.
+- [x] Single-player uses loopback client/server with identical codepaths.
 
 **DoD evidence**
 - [ ] Headless dedicated server accepts one client.
