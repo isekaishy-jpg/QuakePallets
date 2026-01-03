@@ -10,6 +10,7 @@ homepage = "https://github.com/ExPixel/miniaudio-rs"
 license = "MIT"
 keywords = ["audio", "miniaudio", "sound", "pcm"]
 publish = true
+autoexamples = false
 categories = ["multimedia::audio", "multimedia"]
 
 include = [
@@ -33,6 +34,7 @@ doctest = false
 
 [features]
 default = ["ma-log-level-error"]
+bindgen = ["dep:bindgen"]
 
 ma-enable-vorbis = []
 

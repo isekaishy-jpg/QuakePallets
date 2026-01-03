@@ -29,13 +29,13 @@ pub fn main() {
 
     emit_supported_features();
 
-    #[cfg(feature = "bindgen")]
-    {
-        generate_bindings();
-    }
-
-    #[cfg(not(feature = "bindgen"))]
-    {
+    if cfg!(feature = "bindgen") {
+        if std::env::var("MINIAUDIO_SYS_USE_BINDGEN").is_ok() {
+            generate_bindings();
+        } else {
+            check_pregenerated_bindings();
+        }
+    } else {
         check_pregenerated_bindings();
     }
 
@@ -45,7 +45,6 @@ pub fn main() {
     println!("cargo:rerun-if-env-changed=CC");
 }
 
-#[cfg(not(feature = "bindgen"))]
 fn check_pregenerated_bindings() {
     use std::path::Path;
 
@@ -209,10 +208,10 @@ fn apply_definitions<F: FnMut(&str, &str)>(mut define: F) {
     }
 
     let mut log_level: Option<&'static str> = None;
-    const LOG_LEVEL_VERBOSE: &'static str = "4";
-    const LOG_LEVEL_INFO: &'static str = "3";
-    const LOG_LEVEL_WARNING: &'static str = "2";
-    const LOG_LEVEL_ERROR: &'static str = "1";
+    const LOG_LEVEL_VERBOSE: &str = "4";
+    const LOG_LEVEL_INFO: &str = "3";
+    const LOG_LEVEL_WARNING: &str = "2";
+    const LOG_LEVEL_ERROR: &str = "1";
 
     if cfg!(feature = "ma-log-level-error") {
         log_level = Some(LOG_LEVEL_ERROR);
@@ -233,7 +232,7 @@ fn apply_definitions<F: FnMut(&str, &str)>(mut define: F) {
 }
 
 /// Enables SIMD flags for CC based on enabled Rust features.
-#[allow(clippy::logic_bug)]
+#[allow(clippy::overly_complex_bool_expr, clippy::nonminimal_bool)]
 fn apply_flags(b: &mut cc::Build) {
     if cfg!(target_feature = "sse2") && !(cfg!(feature = "ma-no-sse2")) {
         b.flag_if_supported("-msse2");
@@ -243,7 +242,7 @@ fn apply_flags(b: &mut cc::Build) {
         b.flag_if_supported("-mavx2");
     }
 
-    if cfg!(target_feature = "avx512") && !(cfg!(feature = "ma-no-avx512")) {
+    if cfg!(target_feature = "avx512f") && !(cfg!(feature = "ma-no-avx512")) {
         b.flag_if_supported("-mavx512");
     }
 
@@ -253,7 +252,7 @@ fn apply_flags(b: &mut cc::Build) {
 }
 
 /// Emits features that map to miniaudio platform feature macros.
-#[allow(clippy::logic_bug)]
+#[allow(clippy::overly_complex_bool_expr)]
 fn emit_supported_features() {
     let emit_feat = |feature: &'static str| {
         println!("cargo:rustc-cfg=feature=\"{}\"", feature);
@@ -314,7 +313,7 @@ fn emit_supported_features() {
     let mut support_webaudio = false;
     let mut support_null = false;
 
-    if !cfg!(target_feature = "no-device-io") {
+    if !cfg!(feature = "ma-no-device-io") {
         if ma_win32 {
             support_wasapi = true;
             if ma_win32_desktop {

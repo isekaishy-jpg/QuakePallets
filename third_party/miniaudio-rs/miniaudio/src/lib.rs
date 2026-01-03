@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 /// This is a panic which only occurs in debug mode.
 #[cfg(debug_assertions)]
 const MA_DEBUG_PANIC: bool = true;

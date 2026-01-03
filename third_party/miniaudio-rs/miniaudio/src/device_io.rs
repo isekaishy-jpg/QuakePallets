@@ -261,47 +261,19 @@ impl DeviceConfig {
     }
 
     pub fn no_pre_zeroed_output_buffer(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.noPreZeroedOutputBuffer)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.noPreZeroedOutputBuffer)
-        }
+        from_bool32(self.0.noPreZeroedOutputBuffer)
     }
 
     pub fn set_no_pre_zeroed_output_buffer(&mut self, value: bool) {
-        #[cfg(feature = "bindgen")]
-        {
-            self.0.noPreZeroedOutputBuffer = to_bool8(value);
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            self.0.noPreZeroedOutputBuffer = to_bool32(value);
-        }
+        self.0.noPreZeroedOutputBuffer = to_bool32(value);
     }
 
     pub fn no_clip(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.noClip)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.noClip)
-        }
+        from_bool32(self.0.noClip)
     }
 
     pub fn set_no_clip(&mut self, no_clip: bool) {
-        #[cfg(feature = "bindgen")]
-        {
-            self.0.noClip = to_bool8(no_clip);
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            self.0.noClip = to_bool32(no_clip);
-        }
+        self.0.noClip = to_bool32(no_clip);
     }
 
     #[inline]
@@ -1048,14 +1020,7 @@ impl RawContext {
     }
 
     pub fn is_backend_asynchronous(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.isBackendAsynchronous)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.isBackendAsynchronous())
-        }
+        from_bool32(self.0.isBackendAsynchronous())
     }
 
     /// Retrieves basic information about every active playback and capture device. This function
@@ -1416,14 +1381,7 @@ impl RawDevice {
     /// Rust side.
     #[inline]
     fn is_owner_of_context(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.isOwnerOfContext)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.isOwnerOfContext())
-        }
+        from_bool32(self.0.isOwnerOfContext())
     }
 
     #[inline]
@@ -1578,36 +1536,15 @@ impl DeviceCapture {
     }
 
     pub fn using_default_format(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.usingDefaultFormat)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.usingDefaultFormat())
-        }
+        from_bool32(self.0.usingDefaultFormat())
     }
 
     pub fn using_default_channels(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.usingDefaultChannels)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.usingDefaultChannels())
-        }
+        from_bool32(self.0.usingDefaultChannels())
     }
 
     pub fn using_default_channel_map(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.usingDefaultChannelMap)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.usingDefaultChannelMap())
-        }
+        from_bool32(self.0.usingDefaultChannelMap())
     }
 
     pub fn format(&self) -> Format {
@@ -1642,36 +1579,15 @@ impl DevicePlayback {
     }
 
     pub fn using_default_format(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.usingDefaultFormat)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.usingDefaultFormat())
-        }
+        from_bool32(self.0.usingDefaultFormat())
     }
 
     pub fn using_default_channels(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.usingDefaultChannels)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.usingDefaultChannels())
-        }
+        from_bool32(self.0.usingDefaultChannels())
     }
 
     pub fn using_default_channel_map(&self) -> bool {
-        #[cfg(feature = "bindgen")]
-        {
-            from_bool8(self.0.usingDefaultChannelMap)
-        }
-        #[cfg(not(feature = "bindgen"))]
-        {
-            from_bool32(self.0.usingDefaultChannelMap())
-        }
+        from_bool32(self.0.usingDefaultChannelMap())
     }
 
     pub fn format(&self) -> Format {
