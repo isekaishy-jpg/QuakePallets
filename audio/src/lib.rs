@@ -186,22 +186,35 @@ impl AudioState {
         channels: usize,
         scratch: &mut [f32],
     ) {
-        let scratch = &mut scratch[..output.len()];
-        scratch.fill(0.0);
         let frame_count = output.len() / channels;
-        let mut frames = FramesMut::wrap::<f32>(scratch, OUTPUT_FORMAT, channels as u32);
-        let read_frames = sound.decoder.read_pcm_frames(&mut frames) as usize;
-        let sample_count = read_frames * channels;
-        for i in 0..sample_count {
-            output[i] += scratch[i] * sound.volume;
-        }
-
-        if read_frames < frame_count {
-            if sound.looping {
-                let _ = sound.decoder.seek_to_pcm_frame(0);
-            } else {
-                sound.finished = true;
+        let scratch = &mut scratch[..output.len()];
+        let mut frames_read = 0usize;
+        while frames_read < frame_count {
+            let sample_offset = frames_read * channels;
+            let remaining_samples = output.len() - sample_offset;
+            let scratch_slice = &mut scratch[sample_offset..sample_offset + remaining_samples];
+            let mut frames =
+                FramesMut::wrap::<f32>(scratch_slice, OUTPUT_FORMAT, channels as u32);
+            let read_frames = sound.decoder.read_pcm_frames(&mut frames) as usize;
+            if read_frames == 0 {
+                if sound.looping {
+                    let _ = sound.decoder.seek_to_pcm_frame(0);
+                    if frames_read == 0 {
+                        sound.finished = true;
+                        break;
+                    }
+                    continue;
+                } else {
+                    sound.finished = true;
+                }
+                break;
             }
+
+            let sample_count = read_frames * channels;
+            for i in 0..sample_count {
+                output[sample_offset + i] += scratch_slice[i] * sound.volume;
+            }
+            frames_read += read_frames;
         }
     }
 
