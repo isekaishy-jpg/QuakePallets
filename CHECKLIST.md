@@ -197,6 +197,7 @@ Goal: modern replication, not Quake’s protocol.
   - snapshot schema for entities + replicated components
   - baseline/delta mechanism (start simple)
 - [x] Single-player uses loopback client/server with identical codepaths.
+Note: Renet integration is deferred to a later networking checklist; current transport is minimal.
 
 **DoD evidence**
 - [ ] Headless dedicated server accepts one client.
