@@ -6,7 +6,8 @@ use std::fmt;
 use std::net::SocketAddr;
 
 use net_protocol::{
-    Connect, Disconnect, InputCommand, ProtocolError, ProtocolMessage, Snapshot, SnapshotEntity,
+    Connect, DeltaSnapshot, Disconnect, InputCommand, ProtocolError, ProtocolMessage, Snapshot,
+    SnapshotEntity,
 };
 use net_transport::{Transport, TransportConfig, TransportError, TransportEvent, UdpTransport};
 
@@ -15,6 +16,7 @@ const INPUT_CHANNEL: u8 = 1;
 const SNAPSHOT_CHANNEL: u8 = 2;
 const FIXED_DT: f32 = 1.0 / 60.0;
 const MOVE_SPEED: f32 = 320.0;
+const BASELINE_INTERVAL: u32 = 30;
 
 #[derive(Clone, Debug)]
 struct EntityState {
@@ -37,6 +39,7 @@ struct ClientState {
     entity: EntityState,
     last_input: Option<InputCommand>,
     last_seq: u32,
+    last_snapshot: Option<Snapshot>,
 }
 
 pub struct Server {
@@ -135,6 +138,7 @@ impl Server {
                                 entity: EntityState::default(),
                                 last_input: None,
                                 last_seq: 0,
+                                last_snapshot: None,
                             })
                         }
                     };
@@ -170,14 +174,46 @@ impl Server {
                 })
                 .collect();
 
-            for (addr, client) in self.clients.iter() {
-                let snapshot = Snapshot {
+            for (addr, client) in self.clients.iter_mut() {
+                let baseline = client.last_snapshot.as_ref();
+                let mut send_full = baseline.is_none();
+                if let Some(snapshot) = baseline {
+                    let age = self.tick.wrapping_sub(snapshot.server_tick);
+                    if age >= BASELINE_INTERVAL {
+                        send_full = true;
+                    }
+                }
+
+                let delta_entities = if send_full {
+                    None
+                } else {
+                    baseline.and_then(|snapshot| delta_entities(&snapshot.entities, &entities))
+                };
+                if delta_entities.is_none() {
+                    send_full = true;
+                }
+
+                let next_snapshot = Snapshot {
                     server_tick: self.tick,
                     ack_client_seq: client.last_seq,
                     entities: entities.clone(),
                 };
-                let payload = ProtocolMessage::Snapshot(snapshot).encode()?;
-                self.transport.send(*addr, SNAPSHOT_CHANNEL, payload)?;
+
+                if send_full {
+                    let payload = ProtocolMessage::Snapshot(next_snapshot.clone()).encode()?;
+                    self.transport.send(*addr, SNAPSHOT_CHANNEL, payload)?;
+                } else if let Some(delta_entities) = delta_entities {
+                    let payload = ProtocolMessage::DeltaSnapshot(DeltaSnapshot {
+                        server_tick: self.tick,
+                        baseline_tick: baseline.expect("baseline exists").server_tick,
+                        ack_client_seq: client.last_seq,
+                        entities: delta_entities,
+                    })
+                    .encode()?;
+                    self.transport.send(*addr, SNAPSHOT_CHANNEL, payload)?;
+                }
+
+                client.last_snapshot = Some(next_snapshot);
             }
             self.transport.flush()?;
             report.snapshots_sent = self.clients.len();
@@ -193,6 +229,7 @@ impl Server {
                 entity: EntityState::default(),
                 last_input: None,
                 last_seq: 0,
+                last_snapshot: None,
             });
         }
     }
@@ -200,6 +237,27 @@ impl Server {
     fn unregister_client(&mut self, addr: SocketAddr, _disconnect: Disconnect) {
         self.clients.remove(&addr);
     }
+}
+
+fn delta_entities(
+    baseline: &[SnapshotEntity],
+    current: &[SnapshotEntity],
+) -> Option<Vec<SnapshotEntity>> {
+    if baseline.len() != current.len() {
+        return None;
+    }
+    let mut baseline_map = HashMap::with_capacity(baseline.len());
+    for entity in baseline {
+        baseline_map.insert(entity.net_id, entity);
+    }
+    let mut delta = Vec::new();
+    for entity in current {
+        let baseline_entity = baseline_map.get(&entity.net_id)?;
+        if *baseline_entity != entity {
+            delta.push(entity.clone());
+        }
+    }
+    Some(delta)
 }
 
 #[cfg(test)]

@@ -3,7 +3,9 @@
 use std::fmt;
 use std::net::SocketAddr;
 
-use net_protocol::{Connect, Disconnect, InputCommand, ProtocolError, ProtocolMessage, Snapshot};
+use net_protocol::{
+    Connect, DeltaSnapshot, Disconnect, InputCommand, ProtocolError, ProtocolMessage, Snapshot,
+};
 use net_transport::{Transport, TransportConfig, TransportError, TransportEvent, UdpTransport};
 
 const CONTROL_CHANNEL: u8 = 0;
@@ -140,8 +142,20 @@ impl Client {
             if channel != SNAPSHOT_CHANNEL {
                 continue;
             }
-            if let Ok(ProtocolMessage::Snapshot(snapshot)) = ProtocolMessage::decode(&payload) {
-                self.last_snapshot = Some(snapshot);
+            if let Ok(message) = ProtocolMessage::decode(&payload) {
+                match message {
+                    ProtocolMessage::Snapshot(snapshot) => {
+                        self.last_snapshot = Some(snapshot);
+                    }
+                    ProtocolMessage::DeltaSnapshot(delta) => {
+                        if let Some(baseline) = self.last_snapshot.as_ref() {
+                            if let Some(next) = apply_delta_snapshot(baseline, &delta) {
+                                self.last_snapshot = Some(next);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(())
@@ -157,4 +171,26 @@ impl Client {
             .send(self.server_addr, CONTROL_CHANNEL, payload)?;
         Ok(())
     }
+}
+
+fn apply_delta_snapshot(baseline: &Snapshot, delta: &DeltaSnapshot) -> Option<Snapshot> {
+    if baseline.server_tick != delta.baseline_tick {
+        return None;
+    }
+    let mut entities = baseline.entities.clone();
+    for delta_entity in &delta.entities {
+        if let Some(existing) = entities
+            .iter_mut()
+            .find(|entity| entity.net_id == delta_entity.net_id)
+        {
+            *existing = delta_entity.clone();
+        } else {
+            entities.push(delta_entity.clone());
+        }
+    }
+    Some(Snapshot {
+        server_tick: delta.server_tick,
+        ack_client_seq: delta.ack_client_seq,
+        entities,
+    })
 }

@@ -14,6 +14,7 @@ const MAX_SENT_PACKETS: usize = 256;
 const SEQ_WINDOW: u16 = 0x8000;
 const RELIABLE_FLAG: u8 = 1 << 0;
 const SEQUENCED_FLAG: u8 = 1 << 1;
+const RETRY_INTERVAL_MS: u64 = 100;
 
 type LoopbackQueue = Arc<Mutex<VecDeque<TransportEvent>>>;
 type LoopbackRegistry = Mutex<HashMap<SocketAddr, LoopbackQueue>>;
@@ -140,6 +141,7 @@ pub struct UdpTransport {
     peers: HashMap<SocketAddr, PeerState>,
     recv_buf: Vec<u8>,
     start: Instant,
+    last_retry_ms: u64,
 }
 
 impl UdpTransport {
@@ -153,6 +155,7 @@ impl UdpTransport {
             peers: HashMap::new(),
             recv_buf: vec![0u8; recv_len],
             start: Instant::now(),
+            last_retry_ms: 0,
         })
     }
 
@@ -202,6 +205,7 @@ impl UdpTransport {
             let _ = self.socket.send_to(&bytes, addr)?;
         }
 
+        self.last_retry_ms = self.now_ms();
         Ok(())
     }
 
@@ -235,6 +239,11 @@ impl UdpTransport {
             for msg in decoded.messages {
                 peer.receive_message(from, msg, &mut events);
             }
+        }
+
+        let now = self.now_ms();
+        if now.wrapping_sub(self.last_retry_ms) >= RETRY_INTERVAL_MS {
+            self.flush()?;
         }
 
         Ok(events)
