@@ -264,6 +264,7 @@ fn delta_entities(
 mod tests {
     use super::*;
     use client::{Client, ClientInput};
+    use net_protocol::Snapshot;
     use net_transport::{LoopbackTransport, TransportConfig};
 
     #[test]
@@ -299,5 +300,61 @@ mod tests {
         client.disconnect().expect("disconnect");
         server.tick().expect("server tick");
         assert_eq!(server.client_count(), 0);
+    }
+
+    #[test]
+    fn replay_produces_identical_snapshots() {
+        let inputs = build_inputs(120);
+        let first = run_session(&inputs);
+        let second = run_session(&inputs);
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+    }
+
+    fn build_inputs(ticks: usize) -> Vec<ClientInput> {
+        (0..ticks)
+            .map(|tick| ClientInput {
+                move_x: if tick % 2 == 0 { 1.0 } else { -1.0 },
+                move_y: 0.5,
+                yaw: tick as f32 * 0.01,
+                pitch: 0.0,
+                buttons: tick as u32,
+            })
+            .collect()
+    }
+
+    fn run_session(inputs: &[ClientInput]) -> Vec<Snapshot> {
+        let transport = TransportConfig::default();
+        let mut server_transport =
+            LoopbackTransport::bind(transport.clone()).expect("loopback bind");
+        let mut client_transport = LoopbackTransport::bind(transport).expect("loopback bind");
+        let server_addr = server_transport.local_addr().expect("server addr");
+        let client_addr = client_transport.local_addr().expect("client addr");
+        server_transport.connect_peer(client_addr);
+        client_transport.connect_peer(server_addr);
+
+        let mut server = Server::bind(Box::new(server_transport), 1).expect("server bind");
+        let mut client =
+            Client::connect(Box::new(client_transport), server_addr, 1).expect("client connect");
+
+        let mut snapshots = Vec::new();
+        let mut last_tick = None;
+
+        for input in inputs {
+            client.send_input(*input).expect("send input");
+            server.tick().expect("server tick");
+            client.poll().expect("client poll");
+            if let Some(snapshot) = client.last_snapshot() {
+                if last_tick != Some(snapshot.server_tick) {
+                    last_tick = Some(snapshot.server_tick);
+                    snapshots.push(snapshot.clone());
+                }
+            }
+        }
+
+        client.disconnect().expect("disconnect");
+        server.tick().expect("server tick");
+
+        snapshots
     }
 }
