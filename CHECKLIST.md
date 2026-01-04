@@ -203,7 +203,7 @@ Note: Renet integration is deferred to a later networking checklist to reduce fr
 **DoD evidence**
 - [x] Headless dedicated server accepts one client.
 - [x] Client connects, receives snapshots, and moves around.
-- [ ] Replay test yields stable authoritative results.
+- [x] Replay test yields stable authoritative results.
 
 ---
 
