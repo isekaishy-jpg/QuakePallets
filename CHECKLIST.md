@@ -201,8 +201,8 @@ Goal: modern replication, not Quake’s protocol.
 Note: Renet integration is deferred to a later networking checklist to reduce friction and leave room for broader networking options; current transport is minimal.
 
 **DoD evidence**
-- [ ] Headless dedicated server accepts one client.
-- [ ] Client connects, receives snapshots, and moves around.
+- [x] Headless dedicated server accepts one client.
+- [x] Client connects, receives snapshots, and moves around.
 - [ ] Replay test yields stable authoritative results.
 
 ---
