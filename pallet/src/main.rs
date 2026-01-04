@@ -7,7 +7,7 @@ use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
 use compat_quake::pak::{self, PakFile};
 use engine_core::vfs::{Vfs, VfsError};
-use net_transport::TransportConfig;
+use net_transport::{LoopbackTransport, Transport, TransportConfig};
 use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, KeyCode,
     MouseButton, PhysicalKey, PhysicalPosition, PhysicalSize, Window, WindowEvent,
@@ -95,16 +95,23 @@ struct LoopbackNet {
 impl LoopbackNet {
     fn start() -> Result<Self, String> {
         let transport = TransportConfig::default();
-        let bind_addr: std::net::SocketAddr = "127.0.0.1:0"
-            .parse()
-            .map_err(|err: std::net::AddrParseError| err.to_string())?;
-        let server = Server::bind(bind_addr, transport.clone(), 1).map_err(|err| err.to_string())?;
-        let server_addr = server.local_addr().map_err(|err| err.to_string())?;
-        let client_bind: std::net::SocketAddr = "127.0.0.1:0"
-            .parse()
-            .map_err(|err: std::net::AddrParseError| err.to_string())?;
-        let client =
-            Client::connect(client_bind, server_addr, transport).map_err(|err| err.to_string())?;
+        let mut server_transport =
+            LoopbackTransport::bind(transport.clone()).map_err(|err| err.to_string())?;
+        let mut client_transport =
+            LoopbackTransport::bind(transport).map_err(|err| err.to_string())?;
+        let server_addr = server_transport
+            .local_addr()
+            .map_err(|err: net_transport::TransportError| err.to_string())?;
+        let client_addr = client_transport
+            .local_addr()
+            .map_err(|err: net_transport::TransportError| err.to_string())?;
+        server_transport.connect_peer(client_addr);
+        client_transport.connect_peer(server_addr);
+
+        let server =
+            Server::bind(Box::new(server_transport), 1).map_err(|err| err.to_string())?;
+        let client = Client::connect(Box::new(client_transport), server_addr, 1)
+            .map_err(|err| err.to_string())?;
         Ok(Self {
             client,
             server,

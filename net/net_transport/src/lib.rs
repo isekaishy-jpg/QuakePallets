@@ -2,7 +2,11 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 const HEADER_SIZE: usize = 4 + 2 + 2 + 4 + 1;
 const MESSAGE_HEADER_SIZE: usize = 1 + 1 + 2 + 2;
@@ -112,11 +116,27 @@ pub enum TransportEvent {
     },
 }
 
+pub trait Transport {
+    fn local_addr(&self) -> Result<SocketAddr, TransportError>;
+    fn connect_peer(&mut self, addr: SocketAddr);
+    fn send(
+        &mut self,
+        addr: SocketAddr,
+        channel: u8,
+        payload: Vec<u8>,
+    ) -> Result<(), TransportError>;
+    fn flush(&mut self) -> Result<(), TransportError>;
+    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError>;
+    fn mtu(&self) -> usize;
+    fn now_ms(&self) -> u64;
+}
+
 pub struct UdpTransport {
     socket: UdpSocket,
     config: TransportConfig,
     peers: HashMap<SocketAddr, PeerState>,
     recv_buf: Vec<u8>,
+    start: Instant,
 }
 
 impl UdpTransport {
@@ -129,6 +149,7 @@ impl UdpTransport {
             config,
             peers: HashMap::new(),
             recv_buf: vec![0u8; recv_len],
+            start: Instant::now(),
         })
     }
 
@@ -215,6 +236,158 @@ impl UdpTransport {
 
         Ok(events)
     }
+
+    pub fn mtu(&self) -> usize {
+        self.config.mtu
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+}
+
+impl Transport for UdpTransport {
+    fn local_addr(&self) -> Result<SocketAddr, TransportError> {
+        self.local_addr()
+    }
+
+    fn connect_peer(&mut self, addr: SocketAddr) {
+        self.connect_peer(addr);
+    }
+
+    fn send(
+        &mut self,
+        addr: SocketAddr,
+        channel: u8,
+        payload: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send(addr, channel, payload)
+    }
+
+    fn flush(&mut self) -> Result<(), TransportError> {
+        self.flush()
+    }
+
+    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        self.poll()
+    }
+
+    fn mtu(&self) -> usize {
+        self.mtu()
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.now_ms()
+    }
+}
+
+pub struct LoopbackTransport {
+    addr: SocketAddr,
+    config: TransportConfig,
+    peers: HashMap<SocketAddr, Arc<Mutex<VecDeque<TransportEvent>>>>,
+    inbox: Arc<Mutex<VecDeque<TransportEvent>>>,
+    start: Instant,
+}
+
+impl LoopbackTransport {
+    pub fn bind(config: TransportConfig) -> Result<Self, TransportError> {
+        let addr = next_loopback_addr();
+        let inbox = Arc::new(Mutex::new(VecDeque::new()));
+        loopback_registry()
+            .lock()
+            .expect("loopback registry poisoned")
+            .insert(addr, Arc::clone(&inbox));
+        Ok(Self {
+            addr,
+            config,
+            peers: HashMap::new(),
+            inbox,
+            start: Instant::now(),
+        })
+    }
+}
+
+impl Drop for LoopbackTransport {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = loopback_registry().lock() {
+            registry.remove(&self.addr);
+        }
+    }
+}
+
+impl Transport for LoopbackTransport {
+    fn local_addr(&self) -> Result<SocketAddr, TransportError> {
+        Ok(self.addr)
+    }
+
+    fn connect_peer(&mut self, addr: SocketAddr) {
+        if let Some(queue) = loopback_registry()
+            .lock()
+            .ok()
+            .and_then(|registry| registry.get(&addr).cloned())
+        {
+            self.peers.insert(addr, queue);
+        }
+    }
+
+    fn send(
+        &mut self,
+        addr: SocketAddr,
+        channel: u8,
+        payload: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        if payload.len() + HEADER_SIZE + MESSAGE_HEADER_SIZE > self.config.mtu {
+            return Err(TransportError::Encode(format!(
+                "payload size {} exceeds mtu {}",
+                payload.len(),
+                self.config.mtu
+            )));
+        }
+        let queue = self.peers.get(&addr).ok_or_else(|| {
+            TransportError::Channel(format!("loopback peer {} not connected", addr))
+        })?;
+        let mut queue = queue.lock().expect("loopback queue poisoned");
+        queue.push_back(TransportEvent::Message {
+            from: self.addr,
+            channel,
+            payload,
+        });
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        let mut events = Vec::new();
+        let mut inbox = self.inbox.lock().expect("loopback inbox poisoned");
+        while let Some(event) = inbox.pop_front() {
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    fn mtu(&self) -> usize {
+        self.config.mtu
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+}
+
+fn loopback_registry(
+) -> &'static Mutex<HashMap<SocketAddr, Arc<Mutex<VecDeque<TransportEvent>>>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<SocketAddr, Arc<Mutex<VecDeque<TransportEvent>>>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_loopback_addr() -> SocketAddr {
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(40000);
+    let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+    SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
 }
 
 struct PacketBytes {

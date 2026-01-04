@@ -107,6 +107,25 @@ A PR is mergeable only if:
 
 ---
 
+## M1.5 ??" Net interface and loopback transport
+- [x] `net_protocol`:
+  - `InputCommand`
+  - `Snapshot` (single entity transform ok)
+  - `Connect`/`Disconnect` control messages
+- [x] `net_transport`:
+  - `Transport` trait (send/recv + time + MTU budget)
+  - `LoopbackTransport` (in-memory queues)
+- [x] `client`/`server` crates:
+  - server processes input, advances fixed tick, emits snapshots
+  - client sends input, applies snapshots (no prediction yet)
+
+**DoD evidence**
+- [x] Loopback client connects, moves one entity, receives snapshots for N ticks, exits.
+- [x] Client can swap transports without gameplay changes.
+
+---
+
+
 ## M2 — VFS + Quake probing (no assets committed)
 - [x] `engine_core::vfs`:
   - search paths (base + mod dirs)

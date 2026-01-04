@@ -23,7 +23,7 @@ fn main() {
     };
 
     let transport = TransportConfig::default();
-    let mut server = match Server::bind(args.bind, transport, args.snapshot_stride) {
+    let mut server = match Server::bind_udp(args.bind, transport, args.snapshot_stride) {
         Ok(server) => server,
         Err(err) => {
             eprintln!("{}", err);

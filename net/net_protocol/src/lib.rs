@@ -5,6 +5,8 @@ use std::fmt;
 const TYPE_INPUT: u8 = 1;
 const TYPE_SNAPSHOT: u8 = 2;
 const TYPE_DELTA_SNAPSHOT: u8 = 3;
+const TYPE_CONNECT: u8 = 4;
+const TYPE_DISCONNECT: u8 = 5;
 const MAX_ENTITIES: usize = 2048;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,10 +44,22 @@ pub struct DeltaSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Connect {
+    pub client_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Disconnect {
+    pub client_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolMessage {
     Input(InputCommand),
     Snapshot(Snapshot),
     DeltaSnapshot(DeltaSnapshot),
+    Connect(Connect),
+    Disconnect(Disconnect),
 }
 
 #[derive(Debug)]
@@ -71,6 +85,8 @@ impl ProtocolMessage {
             ProtocolMessage::Input(cmd) => encode_input(cmd),
             ProtocolMessage::Snapshot(snapshot) => encode_snapshot(snapshot),
             ProtocolMessage::DeltaSnapshot(snapshot) => encode_delta_snapshot(snapshot),
+            ProtocolMessage::Connect(connect) => encode_connect(connect),
+            ProtocolMessage::Disconnect(disconnect) => encode_disconnect(disconnect),
         }
     }
 
@@ -82,6 +98,8 @@ impl ProtocolMessage {
             TYPE_INPUT => decode_input(rest).map(ProtocolMessage::Input),
             TYPE_SNAPSHOT => decode_snapshot(rest).map(ProtocolMessage::Snapshot),
             TYPE_DELTA_SNAPSHOT => decode_delta_snapshot(rest).map(ProtocolMessage::DeltaSnapshot),
+            TYPE_CONNECT => decode_connect(rest).map(ProtocolMessage::Connect),
+            TYPE_DISCONNECT => decode_disconnect(rest).map(ProtocolMessage::Disconnect),
             _ => Err(ProtocolError::Decode(format!(
                 "unknown message type {}",
                 msg_type
@@ -258,6 +276,36 @@ fn decode_delta_snapshot(mut data: &[u8]) -> Result<DeltaSnapshot, ProtocolError
     })
 }
 
+fn encode_connect(connect: &Connect) -> Result<Vec<u8>, ProtocolError> {
+    let mut bytes = Vec::with_capacity(1 + 4);
+    bytes.push(TYPE_CONNECT);
+    write_u32(&mut bytes, connect.client_id);
+    Ok(bytes)
+}
+
+fn decode_connect(mut data: &[u8]) -> Result<Connect, ProtocolError> {
+    let client_id = read_u32(&mut data)?;
+    if !data.is_empty() {
+        return Err(ProtocolError::Decode("connect trailing bytes".into()));
+    }
+    Ok(Connect { client_id })
+}
+
+fn encode_disconnect(disconnect: &Disconnect) -> Result<Vec<u8>, ProtocolError> {
+    let mut bytes = Vec::with_capacity(1 + 4);
+    bytes.push(TYPE_DISCONNECT);
+    write_u32(&mut bytes, disconnect.client_id);
+    Ok(bytes)
+}
+
+fn decode_disconnect(mut data: &[u8]) -> Result<Disconnect, ProtocolError> {
+    let client_id = read_u32(&mut data)?;
+    if !data.is_empty() {
+        return Err(ProtocolError::Decode("disconnect trailing bytes".into()));
+    }
+    Ok(Disconnect { client_id })
+}
+
 fn write_u16(bytes: &mut Vec<u8>, value: u16) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
@@ -361,5 +409,18 @@ mod tests {
         let encoded = msg.encode().expect("encode delta snapshot");
         let decoded = ProtocolMessage::decode(&encoded).expect("decode delta snapshot");
         assert_eq!(decoded, ProtocolMessage::DeltaSnapshot(snapshot));
+    }
+
+    #[test]
+    fn control_round_trip() {
+        let connect = ProtocolMessage::Connect(Connect { client_id: 7 });
+        let encoded = connect.encode().expect("encode connect");
+        let decoded = ProtocolMessage::decode(&encoded).expect("decode connect");
+        assert_eq!(decoded, connect);
+
+        let disconnect = ProtocolMessage::Disconnect(Disconnect { client_id: 7 });
+        let encoded = disconnect.encode().expect("encode disconnect");
+        let decoded = ProtocolMessage::decode(&encoded).expect("decode disconnect");
+        assert_eq!(decoded, disconnect);
     }
 }

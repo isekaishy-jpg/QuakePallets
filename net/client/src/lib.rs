@@ -3,11 +3,12 @@
 use std::fmt;
 use std::net::SocketAddr;
 
-use net_protocol::{InputCommand, ProtocolError, ProtocolMessage, Snapshot};
-use net_transport::{TransportConfig, TransportError, TransportEvent, UdpTransport};
+use net_protocol::{Connect, Disconnect, InputCommand, ProtocolError, ProtocolMessage, Snapshot};
+use net_transport::{Transport, TransportConfig, TransportError, TransportEvent, UdpTransport};
 
-const INPUT_CHANNEL: u8 = 0;
-const SNAPSHOT_CHANNEL: u8 = 1;
+const CONTROL_CHANNEL: u8 = 0;
+const INPUT_CHANNEL: u8 = 1;
+const SNAPSHOT_CHANNEL: u8 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClientInput {
@@ -31,8 +32,9 @@ impl Default for ClientInput {
 }
 
 pub struct Client {
-    transport: UdpTransport,
+    transport: Box<dyn Transport>,
     server_addr: SocketAddr,
+    client_id: u32,
     next_seq: u32,
     next_tick: u32,
     last_snapshot: Option<Snapshot>,
@@ -69,19 +71,32 @@ impl From<ProtocolError> for ClientError {
 
 impl Client {
     pub fn connect(
-        bind_addr: SocketAddr,
+        mut transport: Box<dyn Transport>,
         server_addr: SocketAddr,
-        transport: TransportConfig,
+        client_id: u32,
     ) -> Result<Self, ClientError> {
-        let mut transport = UdpTransport::bind(bind_addr, transport)?;
         transport.connect_peer(server_addr);
-        Ok(Self {
+        let mut client = Self {
             transport,
             server_addr,
+            client_id,
             next_seq: 0,
             next_tick: 0,
             last_snapshot: None,
-        })
+        };
+        client.send_control(ProtocolMessage::Connect(Connect { client_id }))?;
+        client.transport.flush()?;
+        Ok(client)
+    }
+
+    pub fn connect_udp(
+        bind_addr: SocketAddr,
+        server_addr: SocketAddr,
+        transport: TransportConfig,
+        client_id: u32,
+    ) -> Result<Self, ClientError> {
+        let transport = UdpTransport::bind(bind_addr, transport)?;
+        Self::connect(Box::new(transport), server_addr, client_id)
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, ClientError> {
@@ -102,8 +117,15 @@ impl Client {
         self.next_tick = self.next_tick.wrapping_add(1);
 
         let payload = ProtocolMessage::Input(cmd).encode()?;
-        self.transport
-            .send(self.server_addr, INPUT_CHANNEL, payload)?;
+        self.transport.send(self.server_addr, INPUT_CHANNEL, payload)?;
+        self.transport.flush()?;
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self) -> Result<(), ClientError> {
+        self.send_control(ProtocolMessage::Disconnect(Disconnect {
+            client_id: self.client_id,
+        }))?;
         self.transport.flush()?;
         Ok(())
     }
@@ -127,5 +149,12 @@ impl Client {
 
     pub fn last_snapshot(&self) -> Option<&Snapshot> {
         self.last_snapshot.as_ref()
+    }
+
+    fn send_control(&mut self, message: ProtocolMessage) -> Result<(), ClientError> {
+        let payload = message.encode()?;
+        self.transport
+            .send(self.server_addr, CONTROL_CHANNEL, payload)?;
+        Ok(())
     }
 }

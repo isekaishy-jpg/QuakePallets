@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::collections::hash_map::Entry;
 
-use net_protocol::{InputCommand, ProtocolError, ProtocolMessage, Snapshot, SnapshotEntity};
-use net_transport::{TransportConfig, TransportError, TransportEvent, UdpTransport};
+use net_protocol::{
+    Connect, Disconnect, InputCommand, ProtocolError, ProtocolMessage, Snapshot, SnapshotEntity,
+};
+use net_transport::{Transport, TransportConfig, TransportError, TransportEvent, UdpTransport};
 
-const INPUT_CHANNEL: u8 = 0;
-const SNAPSHOT_CHANNEL: u8 = 1;
+const CONTROL_CHANNEL: u8 = 0;
+const INPUT_CHANNEL: u8 = 1;
+const SNAPSHOT_CHANNEL: u8 = 2;
 const FIXED_DT: f32 = 1.0 / 60.0;
 const MOVE_SPEED: f32 = 320.0;
 
@@ -37,7 +40,7 @@ struct ClientState {
 }
 
 pub struct Server {
-    transport: UdpTransport,
+    transport: Box<dyn Transport>,
     tick: u32,
     snapshot_stride: u32,
     clients: HashMap<SocketAddr, ClientState>,
@@ -79,17 +82,24 @@ impl From<ProtocolError> for ServerError {
 
 impl Server {
     pub fn bind(
-        bind_addr: SocketAddr,
-        transport: TransportConfig,
+        transport: Box<dyn Transport>,
         snapshot_stride: u32,
     ) -> Result<Self, ServerError> {
-        let transport = UdpTransport::bind(bind_addr, transport)?;
         Ok(Self {
             transport,
             tick: 0,
             snapshot_stride: snapshot_stride.max(1),
             clients: HashMap::new(),
         })
+    }
+
+    pub fn bind_udp(
+        bind_addr: SocketAddr,
+        transport: TransportConfig,
+        snapshot_stride: u32,
+    ) -> Result<Self, ServerError> {
+        let transport = UdpTransport::bind(bind_addr, transport)?;
+        Self::bind(Box::new(transport), snapshot_stride)
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, ServerError> {
@@ -112,11 +122,14 @@ impl Server {
                 channel,
                 payload,
             } = event;
-            if channel != INPUT_CHANNEL {
-                continue;
-            }
             match ProtocolMessage::decode(&payload) {
-                Ok(ProtocolMessage::Input(cmd)) => {
+                Ok(ProtocolMessage::Connect(connect)) if channel == CONTROL_CHANNEL => {
+                    self.register_client(from, connect);
+                }
+                Ok(ProtocolMessage::Disconnect(disconnect)) if channel == CONTROL_CHANNEL => {
+                    self.unregister_client(from, disconnect);
+                }
+                Ok(ProtocolMessage::Input(cmd)) if channel == INPUT_CHANNEL => {
                     let client = match self.clients.entry(from) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
@@ -176,24 +189,42 @@ impl Server {
         self.tick = self.tick.wrapping_add(1);
         Ok(report)
     }
+
+    fn register_client(&mut self, addr: SocketAddr, _connect: Connect) {
+        if let Entry::Vacant(entry) = self.clients.entry(addr) {
+            entry.insert(ClientState {
+                entity: EntityState::default(),
+                last_input: None,
+                last_seq: 0,
+            });
+        }
+    }
+
+    fn unregister_client(&mut self, addr: SocketAddr, _disconnect: Disconnect) {
+        self.clients.remove(&addr);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use client::{Client, ClientInput};
-    use net_transport::TransportConfig;
+    use net_transport::{LoopbackTransport, TransportConfig};
 
     #[test]
     fn loopback_exchanges_snapshots() {
         let transport = TransportConfig::default();
-        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut server = Server::bind(bind_addr, transport.clone(), 1).expect("server bind");
-        let server_addr = server.local_addr().expect("server addr");
+        let mut server_transport = LoopbackTransport::bind(transport.clone()).expect("loopback bind");
+        let mut client_transport = LoopbackTransport::bind(transport).expect("loopback bind");
+        let server_addr = server_transport.local_addr().expect("server addr");
+        let client_addr = client_transport.local_addr().expect("client addr");
+        server_transport.connect_peer(client_addr);
+        client_transport.connect_peer(server_addr);
 
-        let client_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut client =
-            Client::connect(client_bind, server_addr, transport).expect("client connect");
+        let mut server =
+            Server::bind(Box::new(server_transport), 1).expect("server bind");
+        let mut client = Client::connect(Box::new(client_transport), server_addr, 1)
+            .expect("client connect");
 
         for _ in 0..5 {
             client
@@ -210,5 +241,8 @@ mod tests {
         }
 
         assert!(client.last_snapshot().is_some());
+        client.disconnect().expect("disconnect");
+        server.tick().expect("server tick");
+        assert_eq!(server.client_count(), 0);
     }
 }
