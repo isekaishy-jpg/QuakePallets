@@ -8,5 +8,5 @@ license = "MIT OR Apache-2.0"
 path = "src/lib.rs"
 
 [dependencies]
-net_transport = { path = "../net_transport" }
-net_protocol = { path = "../net_protocol" }
+net_transport = { path = "../net_transport", version = "0.1.0" }
+net_protocol = { path = "../net_protocol", version = "0.1.0" }
