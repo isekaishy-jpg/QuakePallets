@@ -108,8 +108,7 @@ impl LoopbackNet {
         server_transport.connect_peer(client_addr);
         client_transport.connect_peer(server_addr);
 
-        let server =
-            Server::bind(Box::new(server_transport), 1).map_err(|err| err.to_string())?;
+        let server = Server::bind(Box::new(server_transport), 1).map_err(|err| err.to_string())?;
         let client = Client::connect(Box::new(client_transport), server_addr, 1)
             .map_err(|err| err.to_string())?;
         Ok(Self {

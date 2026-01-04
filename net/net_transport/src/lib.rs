@@ -15,6 +15,9 @@ const SEQ_WINDOW: u16 = 0x8000;
 const RELIABLE_FLAG: u8 = 1 << 0;
 const SEQUENCED_FLAG: u8 = 1 << 1;
 
+type LoopbackQueue = Arc<Mutex<VecDeque<TransportEvent>>>;
+type LoopbackRegistry = Mutex<HashMap<SocketAddr, LoopbackQueue>>;
+
 #[derive(Clone, Copy, Debug)]
 pub enum ChannelKind {
     ReliableOrdered,
@@ -284,8 +287,8 @@ impl Transport for UdpTransport {
 pub struct LoopbackTransport {
     addr: SocketAddr,
     config: TransportConfig,
-    peers: HashMap<SocketAddr, Arc<Mutex<VecDeque<TransportEvent>>>>,
-    inbox: Arc<Mutex<VecDeque<TransportEvent>>>,
+    peers: HashMap<SocketAddr, LoopbackQueue>,
+    inbox: LoopbackQueue,
     start: Instant,
 }
 
@@ -377,10 +380,8 @@ impl Transport for LoopbackTransport {
     }
 }
 
-fn loopback_registry(
-) -> &'static Mutex<HashMap<SocketAddr, Arc<Mutex<VecDeque<TransportEvent>>>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<SocketAddr, Arc<Mutex<VecDeque<TransportEvent>>>>>> =
-        OnceLock::new();
+fn loopback_registry() -> &'static LoopbackRegistry {
+    static REGISTRY: OnceLock<LoopbackRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -479,9 +480,9 @@ impl PeerState {
                     buffer: BTreeMap::new(),
                     max_pending: cfg.max_pending,
                 },
-                ChannelKind::UnreliableSequenced => RecvChannel::UnreliableSequenced {
-                    last_id: None,
-                },
+                ChannelKind::UnreliableSequenced => {
+                    RecvChannel::UnreliableSequenced { last_id: None }
+                }
                 ChannelKind::Unreliable => RecvChannel::Unreliable,
             });
         }
@@ -498,9 +499,10 @@ impl PeerState {
 
     fn enqueue(&mut self, channel: u8, payload: Vec<u8>) -> Result<(), TransportError> {
         let channel_idx = usize::from(channel);
-        let send_channel = self.send_channels.get_mut(channel_idx).ok_or_else(|| {
-            TransportError::Channel(format!("channel {} out of range", channel))
-        })?;
+        let send_channel = self
+            .send_channels
+            .get_mut(channel_idx)
+            .ok_or_else(|| TransportError::Channel(format!("channel {} out of range", channel)))?;
 
         match send_channel {
             SendChannel::ReliableOrdered {
@@ -575,13 +577,7 @@ impl PeerState {
                         if !fits_packet(&bytes, msg.payload.len(), mtu) {
                             break;
                         }
-                        encode_message(
-                            &mut bytes,
-                            channel_id,
-                            RELIABLE_FLAG,
-                            msg.id,
-                            &msg.payload,
-                        );
+                        encode_message(&mut bytes, channel_id, RELIABLE_FLAG, msg.id, &msg.payload);
                         msg_count = msg_count.saturating_add(1);
                         reliable_refs.push(ReliableRef {
                             channel: channel_id,
@@ -690,7 +686,7 @@ impl PeerState {
                     true
                 } else {
                     let back = last.wrapping_sub(sequence);
-                    if back >= 1 && back <= 32 {
+                    if (1..=32).contains(&back) {
                         self.received_mask |= 1 << (back - 1);
                     }
                     false
@@ -732,10 +728,9 @@ impl PeerState {
                         });
                         *expected_id = expected_id.wrapping_add(1);
                     }
-                } else if sequence_more_recent(msg.id, *expected_id) {
-                    if buffer.len() < *max_pending {
-                        buffer.insert(msg.id, msg.payload);
-                    }
+                } else if sequence_more_recent(msg.id, *expected_id) && buffer.len() < *max_pending
+                {
+                    buffer.insert(msg.id, msg.payload);
                 }
             }
             RecvChannel::UnreliableSequenced { last_id } => {
@@ -779,13 +774,7 @@ fn fits_packet(current: &[u8], payload_len: usize, mtu: usize) -> bool {
         .unwrap_or(false)
 }
 
-fn encode_message(
-    bytes: &mut Vec<u8>,
-    channel: u8,
-    flags: u8,
-    id: u16,
-    payload: &[u8],
-) {
+fn encode_message(bytes: &mut Vec<u8>, channel: u8, flags: u8, id: u16, payload: &[u8]) {
     bytes.push(channel);
     bytes.push(flags);
     bytes.extend_from_slice(&id.to_le_bytes());

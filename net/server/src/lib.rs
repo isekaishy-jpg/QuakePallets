@@ -81,10 +81,7 @@ impl From<ProtocolError> for ServerError {
 }
 
 impl Server {
-    pub fn bind(
-        transport: Box<dyn Transport>,
-        snapshot_stride: u32,
-    ) -> Result<Self, ServerError> {
+    pub fn bind(transport: Box<dyn Transport>, snapshot_stride: u32) -> Result<Self, ServerError> {
         Ok(Self {
             transport,
             tick: 0,
@@ -160,7 +157,7 @@ impl Server {
             client.entity.position[2] += client.entity.velocity[2] * FIXED_DT;
         }
 
-        if self.tick % self.snapshot_stride == 0 {
+        if self.tick.is_multiple_of(self.snapshot_stride) {
             let entities: Vec<SnapshotEntity> = self
                 .clients
                 .iter()
@@ -214,17 +211,17 @@ mod tests {
     #[test]
     fn loopback_exchanges_snapshots() {
         let transport = TransportConfig::default();
-        let mut server_transport = LoopbackTransport::bind(transport.clone()).expect("loopback bind");
+        let mut server_transport =
+            LoopbackTransport::bind(transport.clone()).expect("loopback bind");
         let mut client_transport = LoopbackTransport::bind(transport).expect("loopback bind");
         let server_addr = server_transport.local_addr().expect("server addr");
         let client_addr = client_transport.local_addr().expect("client addr");
         server_transport.connect_peer(client_addr);
         client_transport.connect_peer(server_addr);
 
-        let mut server =
-            Server::bind(Box::new(server_transport), 1).expect("server bind");
-        let mut client = Client::connect(Box::new(client_transport), server_addr, 1)
-            .expect("client connect");
+        let mut server = Server::bind(Box::new(server_transport), 1).expect("server bind");
+        let mut client =
+            Client::connect(Box::new(client_transport), server_addr, 1).expect("client connect");
 
         for _ in 0..5 {
             client

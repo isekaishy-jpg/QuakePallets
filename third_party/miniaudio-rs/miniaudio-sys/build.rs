@@ -105,14 +105,12 @@ fn generate_bindings() {
         // We just use one big generated header created by concatenating what we need.
         .header(header)
         .size_t_is_usize(true)
-        .rustfmt_bindings(true)
         .layout_tests(true)
         .derive_copy(true)
         .impl_debug(true)
         .prepend_enum_name(false)
         .rust_target(
-            bindgen::RustTarget::stable(70, 0)
-                .expect("bindgen rust target 1.70 should be valid"),
+            bindgen::RustTarget::stable(70, 0).expect("bindgen rust target 1.70 should be valid"),
         )
         .generate()
         .expect("failed to generate bindings");

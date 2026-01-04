@@ -266,7 +266,9 @@ fn decode_delta_snapshot(mut data: &[u8]) -> Result<DeltaSnapshot, ProtocolError
         });
     }
     if !data.is_empty() {
-        return Err(ProtocolError::Decode("delta snapshot trailing bytes".into()));
+        return Err(ProtocolError::Decode(
+            "delta snapshot trailing bytes".into(),
+        ));
     }
     Ok(DeltaSnapshot {
         server_tick,

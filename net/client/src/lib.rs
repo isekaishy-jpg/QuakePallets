@@ -117,7 +117,8 @@ impl Client {
         self.next_tick = self.next_tick.wrapping_add(1);
 
         let payload = ProtocolMessage::Input(cmd).encode()?;
-        self.transport.send(self.server_addr, INPUT_CHANNEL, payload)?;
+        self.transport
+            .send(self.server_addr, INPUT_CHANNEL, payload)?;
         self.transport.flush()?;
         Ok(())
     }
@@ -133,15 +134,14 @@ impl Client {
     pub fn poll(&mut self) -> Result<(), ClientError> {
         let events = self.transport.poll()?;
         for event in events {
-            let TransportEvent::Message { channel, payload, .. } = event;
+            let TransportEvent::Message {
+                channel, payload, ..
+            } = event;
             if channel != SNAPSHOT_CHANNEL {
                 continue;
             }
-            match ProtocolMessage::decode(&payload) {
-                Ok(ProtocolMessage::Snapshot(snapshot)) => {
-                    self.last_snapshot = Some(snapshot);
-                }
-                _ => {}
+            if let Ok(ProtocolMessage::Snapshot(snapshot)) = ProtocolMessage::decode(&payload) {
+                self.last_snapshot = Some(snapshot);
             }
         }
         Ok(())

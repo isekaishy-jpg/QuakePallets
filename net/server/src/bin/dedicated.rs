@@ -52,10 +52,7 @@ fn main() {
         match server.tick() {
             Ok(report) => {
                 if report.new_clients > 0 {
-                    println!(
-                        "client connected (total {})",
-                        server.client_count()
-                    );
+                    println!("client connected (total {})", server.client_count());
                 }
             }
             Err(err) => {

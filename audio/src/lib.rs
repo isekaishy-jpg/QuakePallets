@@ -193,8 +193,7 @@ impl AudioState {
             let sample_offset = frames_read * channels;
             let remaining_samples = output.len() - sample_offset;
             let scratch_slice = &mut scratch[sample_offset..sample_offset + remaining_samples];
-            let mut frames =
-                FramesMut::wrap::<f32>(scratch_slice, OUTPUT_FORMAT, channels as u32);
+            let mut frames = FramesMut::wrap::<f32>(scratch_slice, OUTPUT_FORMAT, channels as u32);
             let read_frames = sound.decoder.read_pcm_frames(&mut frames) as usize;
             if read_frames == 0 {
                 if sound.looping {
