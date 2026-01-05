@@ -22,6 +22,7 @@ pub const VIDEO_DECODE_AUDIO_BUDGET_PACKETS: usize = 8;
 pub const VIDEO_AUDIO_PREBUFFER_MS: u64 = 100;
 pub const VIDEO_AUDIO_PREBUFFER_MAX_MS: u64 = 500;
 pub const VIDEO_INTERMISSION_MS: u64 = 150;
+pub const VIDEO_HOLD_LAST_FRAME_MS: u64 = 350;
 pub const VIDEO_PREDECODE_START_DELAY_MS: u64 = 500;
 pub const VIDEO_PREDECODE_MIN_ELAPSED_MS: u64 = 1000;
 pub const VIDEO_PREDECODE_MIN_AUDIO_MS: u64 = 250;
@@ -45,6 +46,18 @@ pub struct VideoDebugStats {
     audio_channels: AtomicU64,
     last_audio_ms: AtomicU64,
     last_video_ms: AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaylistEntry {
+    pub path: PathBuf,
+    pub hold_ms: u64,
+}
+
+impl PlaylistEntry {
+    pub fn new(path: PathBuf, hold_ms: u64) -> Self {
+        Self { path, hold_ms }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -816,13 +829,15 @@ pub fn start_video_playback(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn advance_playlist(
     current: &mut Option<VideoPlayback>,
     next: &mut Option<VideoPlayback>,
-    remaining: &mut VecDeque<PathBuf>,
+    remaining: &mut VecDeque<PlaylistEntry>,
     audio: Option<&Rc<AudioEngine>>,
     debug: Option<Arc<VideoDebugStats>>,
-    next_path_out: &mut Option<PathBuf>,
+    next_entry_out: &mut Option<PlaylistEntry>,
+    current_entry_out: &mut Option<PlaylistEntry>,
     defer_predecode: bool,
 ) -> bool {
     if let Some(stats) = debug.as_ref() {
@@ -836,41 +851,46 @@ pub fn advance_playlist(
         audio.clear_pcm();
     }
 
+    let mut promoted_entry = None;
     if let Some(video) = next.take() {
         video.set_audio_enabled(true);
         video.set_max_queued_video_ms(VIDEO_PLAYBACK_WARM_MS);
         *current = Some(video);
-    } else if let Some(path) = remaining.pop_front() {
+        promoted_entry = next_entry_out.take();
+    } else if let Some(entry) = remaining.pop_front() {
         *current = Some(start_video_playback(
-            path,
+            entry.path.clone(),
             audio,
             debug.clone(),
             VIDEO_PLAYBACK_WARM_MS,
             true,
         ));
+        promoted_entry = Some(entry);
     }
 
     if current.is_none() {
+        *current_entry_out = None;
         return false;
     }
+    *current_entry_out = promoted_entry;
 
-    if let Some(path) = remaining.pop_front() {
+    if let Some(entry) = remaining.pop_front() {
         if defer_predecode {
             *next = None;
-            *next_path_out = Some(path);
+            *next_entry_out = Some(entry);
         } else {
             *next = Some(start_video_playback(
-                path,
+                entry.path.clone(),
                 audio,
                 debug.clone(),
                 VIDEO_PREDECODE_WARM_MS,
                 true,
             ));
-            *next_path_out = None;
+            *next_entry_out = Some(entry);
         }
     } else {
         *next = None;
-        *next_path_out = None;
+        *next_entry_out = None;
     }
     true
 }

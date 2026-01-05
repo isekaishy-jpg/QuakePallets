@@ -20,12 +20,12 @@ use render_wgpu::{ImageData, MeshData, MeshVertex, RenderError, YuvImageView};
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
 use video::{
-    advance_playlist, start_video_playback, VideoDebugSnapshot, VideoDebugStats, VideoPlayback,
-    VIDEO_AUDIO_PREBUFFER_MS, VIDEO_INTERMISSION_MS, VIDEO_MAX_QUEUED_MS_PLAYBACK,
-    VIDEO_MAX_QUEUED_MS_PREDECODE, VIDEO_PLAYBACK_WARM_MS, VIDEO_PLAYBACK_WARM_UP_MS,
-    VIDEO_PREDECODE_MIN_AUDIO_MS, VIDEO_PREDECODE_MIN_ELAPSED_MS, VIDEO_PREDECODE_MIN_FRAMES,
-    VIDEO_PREDECODE_RAMP_MS, VIDEO_PREDECODE_START_DELAY_MS, VIDEO_PREDECODE_WARM_MS,
-    VIDEO_START_MIN_FRAMES,
+    advance_playlist, start_video_playback, PlaylistEntry, VideoDebugSnapshot, VideoDebugStats,
+    VideoPlayback, VIDEO_AUDIO_PREBUFFER_MS, VIDEO_HOLD_LAST_FRAME_MS, VIDEO_INTERMISSION_MS,
+    VIDEO_MAX_QUEUED_MS_PLAYBACK, VIDEO_MAX_QUEUED_MS_PREDECODE, VIDEO_PLAYBACK_WARM_MS,
+    VIDEO_PLAYBACK_WARM_UP_MS, VIDEO_PREDECODE_MIN_AUDIO_MS, VIDEO_PREDECODE_MIN_ELAPSED_MS,
+    VIDEO_PREDECODE_MIN_FRAMES, VIDEO_PREDECODE_RAMP_MS, VIDEO_PREDECODE_START_DELAY_MS,
+    VIDEO_PREDECODE_WARM_MS, VIDEO_START_MIN_FRAMES,
 };
 
 mod video;
@@ -1028,10 +1028,12 @@ fn main() {
 
     let mut video: Option<VideoPlayback> = None;
     let mut next_video: Option<VideoPlayback> = None;
-    let mut next_video_path: Option<PathBuf> = None;
+    let mut next_video_entry: Option<PlaylistEntry> = None;
+    let mut current_video_entry: Option<PlaylistEntry> = None;
     let mut next_video_start_at: Option<Instant> = None;
     let mut next_video_created_at: Option<Instant> = None;
     let mut video_start_delay_until: Option<Instant> = None;
+    let mut video_hold_until: Option<Instant> = None;
     let video_debug = std::env::var_os("CRUSTQUAKE_VIDEO_DEBUG").is_some();
     let video_debug_stats = if video_debug {
         Some(Arc::new(VideoDebugStats::new()))
@@ -1052,7 +1054,7 @@ fn main() {
         last_audio_ms: 0,
         last_video_ms: 0,
     };
-    let mut playlist_paths = if let Some(playlist_path) = args.playlist.as_ref() {
+    let mut playlist_entries = if let Some(playlist_path) = args.playlist.as_ref() {
         match load_playlist(playlist_path) {
             Ok(list) => list,
             Err(err) => {
@@ -1063,15 +1065,20 @@ fn main() {
     } else {
         let mut list = VecDeque::new();
         if let Some(movie_path) = args.play_movie.as_ref() {
-            list.push_back(movie_path.clone());
+            list.push_back(PlaylistEntry::new(
+                movie_path.clone(),
+                VIDEO_HOLD_LAST_FRAME_MS,
+            ));
         }
         list
     };
-    if !playlist_paths.is_empty() {
+    if !playlist_entries.is_empty() {
         if let Some(audio) = audio.as_ref() {
             audio.clear_pcm();
         }
-        if let Some(path) = playlist_paths.pop_front() {
+        if let Some(entry) = playlist_entries.pop_front() {
+            let path = entry.path.clone();
+            current_video_entry = Some(entry);
             video = Some(start_video_playback(
                 path,
                 audio.as_ref(),
@@ -1080,11 +1087,11 @@ fn main() {
                 true,
             ));
         }
-        next_video_path = playlist_paths.pop_front();
+        next_video_entry = playlist_entries.pop_front();
         if video.is_some() {
             video_start_delay_until =
                 Some(Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS));
-            if next_video_path.is_some() {
+            if next_video_entry.is_some() {
                 next_video_start_at =
                     Some(Instant::now() + Duration::from_millis(VIDEO_PREDECODE_START_DELAY_MS));
             }
@@ -1244,19 +1251,21 @@ fn main() {
                             let advanced = advance_playlist(
                                 &mut video,
                                 &mut next_video,
-                                &mut playlist_paths,
+                                &mut playlist_entries,
                                 audio.as_ref(),
                                 video_debug_stats.clone(),
-                                &mut next_video_path,
+                                &mut next_video_entry,
+                                &mut current_video_entry,
                                 true,
                             );
                             if !advanced {
                                 elwt.exit();
                             }
+                            video_hold_until = None;
                             video_start_delay_until = Some(
                                 Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS),
                             );
-                            next_video_start_at = next_video_path
+                            next_video_start_at = next_video_entry
                                 .as_ref()
                                 .map(|_| Instant::now() + Duration::from_millis(
                                     VIDEO_PREDECODE_START_DELAY_MS,
@@ -1445,8 +1454,8 @@ fn main() {
                             .map(|start_at| now >= start_at)
                             .unwrap_or(false);
                         if should_start {
-                            if let (Some(path), Some(current)) =
-                                (next_video_path.take(), video.as_ref())
+                            if let (Some(entry), Some(current)) =
+                                (next_video_entry.as_ref(), video.as_ref())
                             {
                                 let buffered_audio_ms = audio
                                     .as_ref()
@@ -1458,7 +1467,7 @@ fn main() {
                                     && buffered_audio_ms >= VIDEO_PREDECODE_MIN_AUDIO_MS;
                                 if ready_for_predecode {
                                     next_video = Some(start_video_playback(
-                                        path,
+                                        entry.path.clone(),
                                         audio.as_ref(),
                                         video_debug_stats.clone(),
                                         VIDEO_PREDECODE_WARM_MS,
@@ -1466,8 +1475,6 @@ fn main() {
                                     ));
                                     next_video_created_at = Some(now);
                                     next_video_start_at = None;
-                                } else {
-                                    next_video_path = Some(path);
                                 }
                             }
                         }
@@ -1663,26 +1670,47 @@ fn main() {
                             }
                         }
                         if video.is_finished() {
-                            advance_video = true;
+                            let hold_ms = current_video_entry
+                                .as_ref()
+                                .map(|entry| entry.hold_ms)
+                                .unwrap_or(VIDEO_HOLD_LAST_FRAME_MS);
+                            if hold_ms > 0 {
+                                match video_hold_until {
+                                    Some(until) => {
+                                        if now >= until {
+                                            advance_video = true;
+                                        }
+                                    }
+                                    None => {
+                                        video_hold_until = Some(
+                                            now + Duration::from_millis(hold_ms),
+                                        );
+                                    }
+                                }
+                            } else {
+                                advance_video = true;
+                            }
                         }
                     }
                     if advance_video {
                         let advanced = advance_playlist(
                             &mut video,
                             &mut next_video,
-                            &mut playlist_paths,
+                            &mut playlist_entries,
                             audio.as_ref(),
                             video_debug_stats.clone(),
-                            &mut next_video_path,
+                            &mut next_video_entry,
+                            &mut current_video_entry,
                             true,
                         );
                         if !advanced {
                             elwt.exit();
                         }
+                        video_hold_until = None;
                         video_start_delay_until = Some(
                             Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS),
                         );
-                        next_video_start_at = next_video_path
+                        next_video_start_at = next_video_entry
                             .as_ref()
                             .map(|_| Instant::now() + Duration::from_millis(
                                 VIDEO_PREDECODE_START_DELAY_MS,
@@ -1854,7 +1882,7 @@ fn print_usage() {
     eprintln!("example: pallet --playlist movies_playlist.txt");
 }
 
-fn load_playlist(path: &Path) -> Result<VecDeque<PathBuf>, ExitError> {
+fn load_playlist(path: &Path) -> Result<VecDeque<PlaylistEntry>, ExitError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|err| ExitError::new(EXIT_USAGE, format!("playlist read failed: {}", err)))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1864,13 +1892,45 @@ fn load_playlist(path: &Path) -> Result<VecDeque<PathBuf>, ExitError> {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        let entry = PathBuf::from(line);
+        let (path_part, meta_part) = line.split_once('|').unwrap_or((line, ""));
+        let path_part = path_part.trim();
+        if path_part.is_empty() {
+            continue;
+        }
+        let mut hold_ms = VIDEO_HOLD_LAST_FRAME_MS;
+        let meta_part = meta_part.trim();
+        if !meta_part.is_empty() {
+            for token in meta_part.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                let value = token
+                    .strip_prefix("hold=")
+                    .or_else(|| token.strip_prefix("hold_ms="))
+                    .unwrap_or(token);
+                if value.chars().all(|ch| ch.is_ascii_digit()) {
+                    hold_ms = value.parse::<u64>().map_err(|_| {
+                        ExitError::new(
+                            EXIT_USAGE,
+                            format!("invalid playlist hold value: {}", token),
+                        )
+                    })?;
+                } else {
+                    return Err(ExitError::new(
+                        EXIT_USAGE,
+                        format!("invalid playlist option: {}", token),
+                    ));
+                }
+            }
+        }
+        let entry = PathBuf::from(path_part);
         let entry = if entry.is_relative() {
             base.join(entry)
         } else {
             entry
         };
-        entries.push_back(entry);
+        entries.push_back(PlaylistEntry::new(entry, hold_ms));
     }
     if entries.is_empty() {
         return Err(ExitError::new(EXIT_USAGE, "playlist is empty".to_string()));
