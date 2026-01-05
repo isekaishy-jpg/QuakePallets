@@ -31,7 +31,7 @@ use video::{
 };
 
 use settings::{Settings, WindowMode};
-use ui::{MenuMode, ResolutionModel, UiFacade, UiFrameInput, UiState};
+use ui::{MenuMode, MenuScreen, ResolutionModel, UiFacade, UiFrameInput, UiState};
 
 mod settings;
 mod ui;
@@ -75,6 +75,7 @@ struct CliArgs {
     play_movie: Option<PathBuf>,
     playlist: Option<PathBuf>,
     script: Option<PathBuf>,
+    input_script: bool,
 }
 
 enum ArgParseError {
@@ -181,6 +182,75 @@ struct InputState {
 struct ConsoleState {
     active: bool,
     buffer: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputLayer {
+    Console,
+    Menu,
+    Game,
+}
+
+struct InputRouter {
+    ui_wants_keyboard: bool,
+    ui_wants_pointer: bool,
+}
+
+impl InputRouter {
+    fn new() -> Self {
+        Self {
+            ui_wants_keyboard: false,
+            ui_wants_pointer: false,
+        }
+    }
+
+    fn update_ui_focus(&mut self, wants_keyboard: bool, wants_pointer: bool) {
+        self.ui_wants_keyboard = wants_keyboard;
+        self.ui_wants_pointer = wants_pointer;
+    }
+
+    fn active_layer(&self, console_open: bool, menu_open: bool) -> InputLayer {
+        if console_open {
+            InputLayer::Console
+        } else if menu_open {
+            InputLayer::Menu
+        } else {
+            InputLayer::Game
+        }
+    }
+
+    fn allow_console_toggle(&self, menu_open: bool) -> bool {
+        !(menu_open && self.ui_wants_keyboard)
+    }
+}
+
+const INPUT_SCRIPT_STEP_DELAY_MS: u64 = 200;
+
+struct InputScript {
+    step: usize,
+    next_at: Instant,
+    ui_scale_before: f32,
+    reported_missing_map: bool,
+}
+
+impl InputScript {
+    fn new(now: Instant, settings: &Settings) -> Self {
+        Self {
+            step: 0,
+            next_at: now,
+            ui_scale_before: settings.ui_scale,
+            reported_missing_map: false,
+        }
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        now >= self.next_at
+    }
+
+    fn advance(&mut self, now: Instant) {
+        self.step = self.step.saturating_add(1);
+        self.next_at = now + Duration::from_millis(INPUT_SCRIPT_STEP_DELAY_MS);
+    }
 }
 
 struct ScriptEntity {
@@ -1213,6 +1283,7 @@ fn main() {
 
     let mut input = InputState::default();
     let mut console = ConsoleState::default();
+    let mut input_router = InputRouter::new();
     let mut ui_facade = UiFacade::new(window, renderer.device(), renderer.surface_format());
     let mut ui_state = UiState::default();
     let mut text_overlay = TextOverlay::new();
@@ -1269,13 +1340,23 @@ fn main() {
         ui_state.menu_open = false;
     }
 
+    let mut input_script = if args.input_script {
+        Some(InputScript::new(Instant::now(), &settings))
+    } else {
+        None
+    };
+
     let mut last_frame = Instant::now();
 
     if let Err(err) = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
         match event {
             Event::WindowEvent { event, window_id } if window_id == main_window_id => {
-                let _ = ui_facade.handle_window_event(&event);
+                let _ = if ui_state.menu_open && !console.active {
+                    ui_facade.handle_window_event(&event)
+                } else {
+                    false
+                };
                 match event {
                 WindowEvent::CloseRequested => elwt.exit(),
                 WindowEvent::Resized(size) => renderer.resize(size),
@@ -1342,116 +1423,26 @@ fn main() {
                             }
                             return;
                         }
-                        if pressed && !is_repeat && code == KeyCode::Backquote {
-                            console.active = !console.active;
-                            window.set_ime_allowed(console.active);
-                            if console.active {
-                                console.buffer.clear();
-                                input = InputState::default();
-                                mouse_look = false;
-                                mouse_grabbed = set_cursor_mode(window, mouse_look);
-                                println!("console: open");
-                            } else {
-                                println!("console: closed");
-                            }
-                        } else if console.active {
-                            if pressed {
-                                match code {
-                                    KeyCode::Enter | KeyCode::NumpadEnter => {
-                                        let line = console.buffer.trim().to_string();
-                                        console.buffer.clear();
-                                        if !line.is_empty() {
-                                            println!("> {}", line);
-                                            if let Some((command, args)) = parse_command_line(&line)
-                                            {
-                                                if let Some(script) = script.as_mut() {
-                                                    match script.engine.run_command(&command, &args)
-                                                    {
-                                                        Ok(true) => {}
-                                                        Ok(false) => {
-                                                            eprintln!(
-                                                                "unknown script command: {}",
-                                                                command
-                                                            );
-                                                        }
-                                                        Err(err) => {
-                                                            eprintln!(
-                                                                "lua command failed: {}",
-                                                                err
-                                                            );
-                                                        }
-                                                    }
-                                                } else {
-                                                    eprintln!("no script loaded");
-                                                }
-                                            }
-                                        }
-                                    }
-                                    KeyCode::Backspace => {
-                                        console.buffer.pop();
-                                    }
-                                    KeyCode::Escape => {
-                                        console.active = false;
-                                        console.buffer.clear();
-                                        window.set_ime_allowed(false);
-                                        println!("console: closed");
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        } else {
-                            if pressed && !is_repeat && code == KeyCode::Escape {
-                                if ui_state.menu_open {
-                                    if ui_state.menu_mode == MenuMode::Pause {
-                                        ui_state.close_menu();
-                                        mouse_look = was_mouse_look;
-                                        mouse_grabbed = set_cursor_mode(window, mouse_look);
-                                    }
-                                } else if scene_active {
-                                    was_mouse_look = mouse_look;
-                                    ui_state.open_pause();
-                                    mouse_look = false;
-                                    mouse_grabbed = set_cursor_mode(window, mouse_look);
-                                }
-                                return;
-                            }
-                            if !ui_state.menu_open {
-                                match code {
-                                    KeyCode::KeyW => input.forward = pressed,
-                                    KeyCode::KeyS => input.back = pressed,
-                                    KeyCode::KeyA => input.left = pressed,
-                                    KeyCode::KeyD => input.right = pressed,
-                                    KeyCode::Space => input.jump = pressed,
-                                    KeyCode::ShiftLeft => input.down = pressed,
-                                    KeyCode::KeyF if pressed => {
-                                        fly_mode = !fly_mode;
-                                        if fly_mode {
-                                            camera.velocity = Vec3::zero();
-                                            camera.vertical_velocity = 0.0;
-                                            camera.on_ground = false;
-                                        } else if let Some(scene) = collision.as_ref() {
-                                            camera.snap_to_floor(scene);
-                                        }
-                                    }
-                                    KeyCode::KeyP if pressed => {
-                                        if let (Some(audio), Some(data)) =
-                                            (audio.as_ref(), sfx_data.as_ref())
-                                        {
-                                            if let Err(err) = audio.play_wav(data.clone()) {
-                                                eprintln!("{}", err);
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                if let Some(script) = script.as_mut() {
-                                    let key = key_name(code);
-                                    if let Err(err) = script.engine.on_key(&key, pressed) {
-                                        eprintln!("lua on_key failed: {}", err);
-                                    }
-                                }
-                            }
-                        }
+                        let _ = handle_non_video_key_input(
+                            code,
+                            pressed,
+                            is_repeat,
+                            &input_router,
+                            &mut console,
+                            &mut ui_state,
+                            window,
+                            &mut input,
+                            &mut mouse_look,
+                            &mut mouse_grabbed,
+                            &mut was_mouse_look,
+                            scene_active,
+                            &mut fly_mode,
+                            &mut camera,
+                            collision.as_ref(),
+                            audio.as_ref(),
+                            sfx_data.as_ref(),
+                            &mut script,
+                        );
                     }
                 }
                 WindowEvent::Ime(Ime::Commit(text)) => {
@@ -1461,7 +1452,11 @@ fn main() {
                 }
                 WindowEvent::Ime(_) => {}
                 WindowEvent::MouseInput { state, button, .. } => {
-                    if button == MouseButton::Right && state == ElementState::Pressed {
+                    if input_router.active_layer(console.active, ui_state.menu_open)
+                        == InputLayer::Game
+                        && button == MouseButton::Right
+                        && state == ElementState::Pressed
+                    {
                         mouse_look = !mouse_look;
                         mouse_grabbed = set_cursor_mode(window, mouse_look);
                         if mouse_look && !mouse_grabbed {
@@ -1470,7 +1465,12 @@ fn main() {
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    if scene_active && mouse_look && !mouse_grabbed {
+                    if input_router.active_layer(console.active, ui_state.menu_open)
+                        == InputLayer::Game
+                        && scene_active
+                        && mouse_look
+                        && !mouse_grabbed
+                    {
                         if ignore_cursor_move {
                             ignore_cursor_move = false;
                         } else {
@@ -1488,15 +1488,231 @@ fn main() {
                     mouse_look = false;
                     mouse_grabbed = set_cursor_mode(window, mouse_look);
                     if console.active {
-                        console.active = false;
-                        console.buffer.clear();
-                        window.set_ime_allowed(false);
+                        close_console(&mut console, &mut ui_state, window);
                     }
                 }
                 WindowEvent::RedrawRequested => {
                     let now = Instant::now();
                     let dt = (now - last_frame).as_secs_f32().min(0.1);
                     last_frame = now;
+                    let mut finish_input_script = false;
+                    if let Some(scripted) = input_script.as_mut() {
+                        if scripted.ready(now) {
+                            match scripted.step {
+                                0 => {
+                                    if video.is_some() {
+                                        scripted.next_at =
+                                            now + Duration::from_millis(INPUT_SCRIPT_STEP_DELAY_MS);
+                                    } else if !scene_active {
+                                        if let Some((quake_dir, map)) = pending_map.take() {
+                                            match enter_map_scene(
+                                                &mut renderer,
+                                                window,
+                                                &quake_dir,
+                                                &map,
+                                                audio.as_ref(),
+                                                &mut camera,
+                                                &mut collision,
+                                                &mut scene_active,
+                                                &mut mouse_look,
+                                                &mut mouse_grabbed,
+                                                &mut loopback,
+                                            ) {
+                                                Ok(()) => {
+                                                    ui_state.close_menu();
+                                                }
+                                                Err(err) => {
+                                                    eprintln!("{}", err.message);
+                                                    pending_map = Some((quake_dir, map));
+                                                    finish_input_script = true;
+                                                }
+                                            }
+                                        } else {
+                                            if !scripted.reported_missing_map {
+                                                eprintln!(
+                                                    "input script requires --map and --quake-dir"
+                                                );
+                                                scripted.reported_missing_map = true;
+                                            }
+                                            finish_input_script = true;
+                                        }
+                                        if scene_active {
+                                            mouse_look = true;
+                                            mouse_grabbed = set_cursor_mode(window, mouse_look);
+                                            println!("input script: ready");
+                                        }
+                                        scripted.advance(now);
+                                    } else {
+                                        mouse_look = true;
+                                        mouse_grabbed = set_cursor_mode(window, mouse_look);
+                                        println!("input script: ready");
+                                        scripted.advance(now);
+                                    }
+                                }
+                                1 => {
+                                    let _ = handle_non_video_key_input(
+                                        KeyCode::Escape,
+                                        true,
+                                        false,
+                                        &input_router,
+                                        &mut console,
+                                        &mut ui_state,
+                                        window,
+                                        &mut input,
+                                        &mut mouse_look,
+                                        &mut mouse_grabbed,
+                                        &mut was_mouse_look,
+                                        scene_active,
+                                        &mut fly_mode,
+                                        &mut camera,
+                                        collision.as_ref(),
+                                        audio.as_ref(),
+                                        sfx_data.as_ref(),
+                                        &mut script,
+                                    );
+                                    println!("input script: open menu");
+                                    scripted.advance(now);
+                                }
+                                2 => {
+                                    ui_state.menu_screen = MenuScreen::Options;
+                                    let target_scale = if (settings.ui_scale - 1.25).abs() < 0.01 {
+                                        1.0
+                                    } else {
+                                        1.25
+                                    };
+                                    settings.ui_scale = target_scale;
+                                    if let Err(err) = settings.save() {
+                                        eprintln!("settings save failed: {}", err);
+                                    }
+                                    println!(
+                                        "input script: ui scale changed from {:.2} to {:.2}",
+                                        scripted.ui_scale_before, settings.ui_scale
+                                    );
+                                    scripted.ui_scale_before = settings.ui_scale;
+                                    scripted.advance(now);
+                                }
+                                3 => {
+                                    let _ = handle_non_video_key_input(
+                                        KeyCode::Escape,
+                                        true,
+                                        false,
+                                        &input_router,
+                                        &mut console,
+                                        &mut ui_state,
+                                        window,
+                                        &mut input,
+                                        &mut mouse_look,
+                                        &mut mouse_grabbed,
+                                        &mut was_mouse_look,
+                                        scene_active,
+                                        &mut fly_mode,
+                                        &mut camera,
+                                        collision.as_ref(),
+                                        audio.as_ref(),
+                                        sfx_data.as_ref(),
+                                        &mut script,
+                                    );
+                                    println!("input script: close menu");
+                                    scripted.advance(now);
+                                }
+                                4 => {
+                                    let _ = handle_non_video_key_input(
+                                        KeyCode::Backquote,
+                                        true,
+                                        false,
+                                        &input_router,
+                                        &mut console,
+                                        &mut ui_state,
+                                        window,
+                                        &mut input,
+                                        &mut mouse_look,
+                                        &mut mouse_grabbed,
+                                        &mut was_mouse_look,
+                                        scene_active,
+                                        &mut fly_mode,
+                                        &mut camera,
+                                        collision.as_ref(),
+                                        audio.as_ref(),
+                                        sfx_data.as_ref(),
+                                        &mut script,
+                                    );
+                                    println!("input script: open console");
+                                    scripted.advance(now);
+                                }
+                                5 => {
+                                    if console.active {
+                                        console.buffer.push_str("status");
+                                        println!("input script: type command");
+                                        scripted.advance(now);
+                                    }
+                                }
+                                6 => {
+                                    let _ = handle_non_video_key_input(
+                                        KeyCode::Enter,
+                                        true,
+                                        false,
+                                        &input_router,
+                                        &mut console,
+                                        &mut ui_state,
+                                        window,
+                                        &mut input,
+                                        &mut mouse_look,
+                                        &mut mouse_grabbed,
+                                        &mut was_mouse_look,
+                                        scene_active,
+                                        &mut fly_mode,
+                                        &mut camera,
+                                        collision.as_ref(),
+                                        audio.as_ref(),
+                                        sfx_data.as_ref(),
+                                        &mut script,
+                                    );
+                                    println!("input script: submit command");
+                                    scripted.advance(now);
+                                }
+                                7 => {
+                                    let _ = handle_non_video_key_input(
+                                        KeyCode::Escape,
+                                        true,
+                                        false,
+                                        &input_router,
+                                        &mut console,
+                                        &mut ui_state,
+                                        window,
+                                        &mut input,
+                                        &mut mouse_look,
+                                        &mut mouse_grabbed,
+                                        &mut was_mouse_look,
+                                        scene_active,
+                                        &mut fly_mode,
+                                        &mut camera,
+                                        collision.as_ref(),
+                                        audio.as_ref(),
+                                        sfx_data.as_ref(),
+                                        &mut script,
+                                    );
+                                    println!("input script: close console");
+                                    scripted.advance(now);
+                                }
+                                8 => {
+                                    if scene_active {
+                                        mouse_look = true;
+                                        mouse_grabbed = set_cursor_mode(window, mouse_look);
+                                        println!("input script: resume mouse-look");
+                                    }
+                                    finish_input_script = true;
+                                    scripted.advance(now);
+                                }
+                                _ => {
+                                    finish_input_script = true;
+                                }
+                            }
+                        }
+                    }
+                    if finish_input_script {
+                        input_script = None;
+                        println!("input script: done");
+                    }
                     let resolution = ResolutionModel::new(
                         renderer.size(),
                         window.scale_factor(),
@@ -1519,8 +1735,13 @@ fn main() {
                         audio_available: audio.is_some(),
                     };
                     let mut ui_ctx = ui_facade.begin_frame(frame_input);
+                    ui_state.console_open = console.active;
                     ui_facade.build_ui(&mut ui_ctx, &mut ui_state, &mut settings);
                     let ui_draw = ui_facade.end_frame(ui_ctx);
+                    input_router.update_ui_focus(
+                        ui_draw.output.wants_keyboard,
+                        ui_draw.output.wants_pointer,
+                    );
                     if ui_draw.output.settings_changed {
                         if let Err(err) = settings.save() {
                             eprintln!("settings save failed: {}", err);
@@ -1935,7 +2156,11 @@ fn main() {
                 }
             }
             Event::DeviceEvent { event, .. } => {
-                if scene_active && mouse_look && mouse_grabbed {
+                if input_router.active_layer(console.active, ui_state.menu_open) == InputLayer::Game
+                    && scene_active
+                    && mouse_look
+                    && mouse_grabbed
+                {
                     if let DeviceEvent::MouseMotion { delta } = event {
                         camera.apply_mouse(delta.0, delta.1);
                     }
@@ -1958,6 +2183,7 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
     let mut play_movie = None;
     let mut playlist = None;
     let mut script = None;
+    let mut input_script = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -1998,6 +2224,9 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
                     .ok_or_else(|| ArgParseError::Message("--script expects a path".into()))?;
                 script = Some(PathBuf::from(value));
             }
+            "--input-script" => {
+                input_script = true;
+            }
             "-h" | "--help" => return Err(ArgParseError::Help),
             _ => {
                 return Err(ArgParseError::Message(format!(
@@ -2036,16 +2265,18 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
         play_movie,
         playlist,
         script,
+        input_script,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <file>] [--script <path>]");
+    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <file>] [--script <path>] [--input-script]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script scripts/demo.lua");
     eprintln!("example: pallet --play-movie intro.ogv");
     eprintln!("example: pallet --playlist movies_playlist.txt");
+    eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --input-script");
 }
 
 fn load_playlist(path: &Path) -> Result<VecDeque<PlaylistEntry>, ExitError> {
@@ -2477,6 +2708,157 @@ fn normalize_map_asset(name: &str) -> String {
         normalized.push_str(".bsp");
     }
     format!("maps/{}", normalized)
+}
+
+fn open_console(
+    console: &mut ConsoleState,
+    ui_state: &mut UiState,
+    window: &Window,
+    input: &mut InputState,
+    mouse_look: &mut bool,
+    mouse_grabbed: &mut bool,
+) {
+    console.active = true;
+    console.buffer.clear();
+    ui_state.console_open = true;
+    *input = InputState::default();
+    *mouse_look = false;
+    *mouse_grabbed = set_cursor_mode(window, *mouse_look);
+    window.set_ime_allowed(true);
+    println!("console: open");
+}
+
+fn close_console(console: &mut ConsoleState, ui_state: &mut UiState, window: &Window) {
+    console.active = false;
+    console.buffer.clear();
+    ui_state.console_open = false;
+    window.set_ime_allowed(false);
+    println!("console: closed");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_non_video_key_input(
+    code: KeyCode,
+    pressed: bool,
+    is_repeat: bool,
+    input_router: &InputRouter,
+    console: &mut ConsoleState,
+    ui_state: &mut UiState,
+    window: &Window,
+    input: &mut InputState,
+    mouse_look: &mut bool,
+    mouse_grabbed: &mut bool,
+    was_mouse_look: &mut bool,
+    scene_active: bool,
+    fly_mode: &mut bool,
+    camera: &mut CameraState,
+    collision: Option<&SceneCollision>,
+    audio: Option<&Rc<AudioEngine>>,
+    sfx_data: Option<&Vec<u8>>,
+    script: &mut Option<ScriptRuntime>,
+) -> bool {
+    if pressed && !is_repeat && code == KeyCode::Backquote {
+        if input_router.allow_console_toggle(ui_state.menu_open) {
+            if console.active {
+                close_console(console, ui_state, window);
+            } else {
+                open_console(console, ui_state, window, input, mouse_look, mouse_grabbed);
+            }
+        }
+        return true;
+    }
+    if pressed && !is_repeat && code == KeyCode::Escape {
+        if console.active {
+            close_console(console, ui_state, window);
+            return true;
+        }
+        if ui_state.menu_open {
+            if ui_state.menu_mode == MenuMode::Pause {
+                ui_state.close_menu();
+                *mouse_look = *was_mouse_look;
+                *mouse_grabbed = set_cursor_mode(window, *mouse_look);
+            }
+            return true;
+        }
+        if scene_active {
+            *was_mouse_look = *mouse_look;
+            ui_state.open_pause();
+            *input = InputState::default();
+            *mouse_look = false;
+            *mouse_grabbed = set_cursor_mode(window, *mouse_look);
+        }
+        return true;
+    }
+    match input_router.active_layer(console.active, ui_state.menu_open) {
+        InputLayer::Console => {
+            if pressed {
+                match code {
+                    KeyCode::Enter | KeyCode::NumpadEnter => {
+                        let line = console.buffer.trim().to_string();
+                        console.buffer.clear();
+                        if !line.is_empty() {
+                            println!("> {}", line);
+                            if let Some((command, args)) = parse_command_line(&line) {
+                                if let Some(script) = script.as_mut() {
+                                    match script.engine.run_command(&command, &args) {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            eprintln!("unknown script command: {}", command);
+                                        }
+                                        Err(err) => {
+                                            eprintln!("lua command failed: {}", err);
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("no script loaded");
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        console.buffer.pop();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        InputLayer::Menu => {}
+        InputLayer::Game => {
+            match code {
+                KeyCode::KeyW => input.forward = pressed,
+                KeyCode::KeyS => input.back = pressed,
+                KeyCode::KeyA => input.left = pressed,
+                KeyCode::KeyD => input.right = pressed,
+                KeyCode::Space => input.jump = pressed,
+                KeyCode::ShiftLeft => input.down = pressed,
+                KeyCode::KeyF if pressed => {
+                    *fly_mode = !*fly_mode;
+                    if *fly_mode {
+                        camera.velocity = Vec3::zero();
+                        camera.vertical_velocity = 0.0;
+                        camera.on_ground = false;
+                    } else if let Some(scene) = collision {
+                        camera.snap_to_floor(scene);
+                    }
+                }
+                KeyCode::KeyP if pressed => {
+                    if let (Some(audio), Some(data)) = (audio, sfx_data) {
+                        if let Err(err) = audio.play_wav(data.clone()) {
+                            eprintln!("{}", err);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if let Some(script) = script.as_mut() {
+                let key = key_name(code);
+                if let Err(err) = script.engine.on_key(&key, pressed) {
+                    eprintln!("lua on_key failed: {}", err);
+                }
+            }
+        }
+    }
+    false
 }
 
 fn apply_window_settings(window: &Window, settings: &Settings) {

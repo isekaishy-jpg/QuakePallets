@@ -81,17 +81,17 @@ This checklist is intentionally a single vertical slice to avoid coupling with l
 ---
 
 ## D2 — Input focus routing (menu/console/game) and mouse capture policy
-- [ ] Implement a single `InputRouter` in `pallet` with this strict priority:
+- [x] Implement a single `InputRouter` in `pallet` with this strict priority:
   1) If console open: keyboard to console; pointer optional; game does not receive gameplay input.
   2) Else if menu open: egui receives pointer/keyboard; game does not receive gameplay input.
   3) Else: game receives input; mouse captured/relative; cursor hidden.
-- [ ] Ensure “escape stack” behavior:
+- [x] Ensure “escape stack” behavior:
   - Esc closes console first; then menus; then returns to game.
-- [ ] Ensure toggle keys behave predictably:
+- [x] Ensure toggle keys behave predictably:
   - backtick (or chosen key): toggle console (unless an egui text field has focus)
 
 **DoD**
-- [ ] A scripted input sequence produces deterministic UI state transitions:
+- [x] A scripted input sequence produces deterministic UI state transitions:
   - open menu → change slider → close
   - open console → type command → close
   - resume mouse-look
