@@ -2,27 +2,33 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use audio::{AudioClock, AudioEngine, PcmWriter};
+use audio::AudioEngine;
 use client::{Client, ClientInput};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
 use compat_quake::pak::{self, PakFile};
 use engine_core::vfs::{Vfs, VfsError};
-use miniaudio::{DataConverter, DataConverterConfig, Format, Frames, FramesMut};
 use net_transport::{LoopbackTransport, Transport, TransportConfig};
 use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Ime, KeyCode,
     MouseButton, PhysicalKey, PhysicalPosition, PhysicalSize, Window, WindowEvent,
 };
-use render_wgpu::{ImageData, MeshData, MeshVertex, RenderError, YuvImageData};
+use render_wgpu::{ImageData, MeshData, MeshVertex, RenderError, YuvImageView};
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
-use video_theora::{AudioPacket, VideoFrame, VideoPlayer};
+use video::{
+    advance_playlist, start_video_playback, VideoDebugSnapshot, VideoDebugStats, VideoPlayback,
+    VIDEO_AUDIO_PREBUFFER_MS, VIDEO_INTERMISSION_MS, VIDEO_MAX_QUEUED_MS_PLAYBACK,
+    VIDEO_MAX_QUEUED_MS_PREDECODE, VIDEO_PLAYBACK_WARM_MS, VIDEO_PLAYBACK_WARM_UP_MS,
+    VIDEO_PREDECODE_MIN_AUDIO_MS, VIDEO_PREDECODE_MIN_ELAPSED_MS, VIDEO_PREDECODE_MIN_FRAMES,
+    VIDEO_PREDECODE_RAMP_MS, VIDEO_PREDECODE_START_DELAY_MS, VIDEO_PREDECODE_WARM_MS,
+    VIDEO_START_MIN_FRAMES,
+};
+
+mod video;
 
 const EXIT_USAGE: i32 = 2;
 const EXIT_QUAKE_DIR: i32 = 10;
@@ -48,13 +54,6 @@ const PLAYER_MAX_DROP: f32 = 256.0;
 const FLOOR_NORMAL_MIN: f32 = 0.7;
 const DIST_EPSILON: f32 = 0.03125;
 const CONTENTS_SOLID: i32 = -2;
-const VIDEO_START_MIN_FRAMES: usize = 3;
-const VIDEO_MAX_QUEUED_FRAMES_PLAYBACK: usize = 120;
-const VIDEO_MAX_QUEUED_FRAMES_PREDECODE: usize = 8;
-const VIDEO_AUDIO_PREBUFFER_MS: u64 = 100;
-const VIDEO_AUDIO_PREBUFFER_MAX_MS: u64 = 500;
-const VIDEO_INTERMISSION_MS: u64 = 150;
-const VIDEO_PREDECODE_MAX_MS: u64 = 1000;
 const OPENGL_TO_WGPU: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -249,735 +248,6 @@ struct CameraState {
     step_height: f32,
     max_drop: f32,
     sensitivity: f32,
-}
-
-enum VideoEvent {
-    Video(VideoFrame),
-    AudioEnded,
-    End,
-    Error(String),
-}
-
-struct VideoDebugStats {
-    audio_packets: AtomicU64,
-    audio_frames_in: AtomicU64,
-    audio_frames_out: AtomicU64,
-    audio_frames_queued: AtomicU64,
-    pending_audio_frames: AtomicU64,
-    audio_sample_rate: AtomicU64,
-    audio_channels: AtomicU64,
-    last_audio_ms: AtomicU64,
-    last_video_ms: AtomicU64,
-}
-
-struct VideoDebugSnapshot {
-    audio_packets: u64,
-    audio_frames_in: u64,
-    audio_frames_out: u64,
-    audio_frames_queued: u64,
-    pending_audio_frames: u64,
-    audio_sample_rate: u64,
-    audio_channels: u64,
-    last_audio_ms: u64,
-    last_video_ms: u64,
-}
-
-impl VideoDebugStats {
-    fn new() -> Self {
-        Self {
-            audio_packets: AtomicU64::new(0),
-            audio_frames_in: AtomicU64::new(0),
-            audio_frames_out: AtomicU64::new(0),
-            audio_frames_queued: AtomicU64::new(0),
-            pending_audio_frames: AtomicU64::new(0),
-            audio_sample_rate: AtomicU64::new(0),
-            audio_channels: AtomicU64::new(0),
-            last_audio_ms: AtomicU64::new(0),
-            last_video_ms: AtomicU64::new(0),
-        }
-    }
-
-    fn reset(&self) {
-        self.audio_packets.store(0, Ordering::Release);
-        self.audio_frames_in.store(0, Ordering::Release);
-        self.audio_frames_out.store(0, Ordering::Release);
-        self.audio_frames_queued.store(0, Ordering::Release);
-        self.pending_audio_frames.store(0, Ordering::Release);
-        self.audio_sample_rate.store(0, Ordering::Release);
-        self.audio_channels.store(0, Ordering::Release);
-        self.last_audio_ms.store(0, Ordering::Release);
-        self.last_video_ms.store(0, Ordering::Release);
-    }
-
-    fn snapshot(&self) -> VideoDebugSnapshot {
-        VideoDebugSnapshot {
-            audio_packets: self.audio_packets.load(Ordering::Acquire),
-            audio_frames_in: self.audio_frames_in.load(Ordering::Acquire),
-            audio_frames_out: self.audio_frames_out.load(Ordering::Acquire),
-            audio_frames_queued: self.audio_frames_queued.load(Ordering::Acquire),
-            pending_audio_frames: self.pending_audio_frames.load(Ordering::Acquire),
-            audio_sample_rate: self.audio_sample_rate.load(Ordering::Acquire),
-            audio_channels: self.audio_channels.load(Ordering::Acquire),
-            last_audio_ms: self.last_audio_ms.load(Ordering::Acquire),
-            last_video_ms: self.last_video_ms.load(Ordering::Acquire),
-        }
-    }
-}
-
-struct VideoPlayback {
-    rx: mpsc::Receiver<VideoEvent>,
-    stop: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<()>>,
-    start_clock_ms: Option<u64>,
-    start_clock_shared: Arc<AtomicU64>,
-    start_instant: Option<Instant>,
-    clock: Option<AudioClock>,
-    video_base_ms: Option<u32>,
-    frames: VecDeque<VideoFrame>,
-    queued_frames: Arc<AtomicUsize>,
-    max_queued_frames: Arc<AtomicUsize>,
-    audio_enabled: Arc<AtomicBool>,
-    prebuffered_audio_frames: Arc<AtomicU64>,
-    previewed: bool,
-    first_frame_uploaded: bool,
-    finished: bool,
-    audio_finished: bool,
-    debug: Option<Arc<VideoDebugStats>>,
-}
-
-impl VideoPlayback {
-    fn start(
-        path: PathBuf,
-        audio: Option<(PcmWriter, AudioClock, u32)>,
-        debug: Option<Arc<VideoDebugStats>>,
-        max_queued_frames: usize,
-        audio_enabled: bool,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = Arc::clone(&stop);
-        let clock = audio.as_ref().map(|(_, clock, _)| clock.clone());
-        let stats = debug.as_ref().map(Arc::clone);
-        let start_clock_shared = Arc::new(AtomicU64::new(u64::MAX));
-        let start_clock_thread = Arc::clone(&start_clock_shared);
-        let queued_frames = Arc::new(AtomicUsize::new(0));
-        let queued_frames_thread = Arc::clone(&queued_frames);
-        let max_queued_frames = Arc::new(AtomicUsize::new(max_queued_frames));
-        let max_queued_frames_thread = Arc::clone(&max_queued_frames);
-        let audio_enabled = Arc::new(AtomicBool::new(audio_enabled));
-        let audio_enabled_thread = Arc::clone(&audio_enabled);
-        let prebuffered_audio_frames = Arc::new(AtomicU64::new(0));
-        let prebuffered_audio_frames_thread = Arc::clone(&prebuffered_audio_frames);
-        let worker = thread::spawn(move || {
-            let mut player = match VideoPlayer::open(&path) {
-                Ok(player) => player,
-                Err(err) => {
-                    let _ = tx.send(VideoEvent::Error(format!("video init failed: {:?}", err)));
-                    return;
-                }
-            };
-            let mut converter: Option<AudioConverter> = None;
-            let mut pending_audio: VecDeque<AudioPacket> = VecDeque::new();
-            let mut pending_samples: VecDeque<Vec<f32>> = VecDeque::new();
-            let mut audio_base_ms: Option<u32> = None;
-            let mut last_audio_ms: Option<u64> = None;
-            let mut decoded_audio_frames: u64 = 0;
-            let mut audio_end_sent = false;
-            let mut predecode_video_base_ms: Option<u32> = None;
-            let mut predecode_video_ms: u64 = 0;
-            let mut predecode_audio_ms: u64 = 0;
-            let mut decoder_finished = false;
-            let audio_out_rate = audio
-                .as_ref()
-                .map(|(_, clock, _)| clock.sample_rate())
-                .unwrap_or(0);
-            let prebuffer_max_frames = if audio_out_rate == 0 {
-                0
-            } else {
-                (audio_out_rate as u64).saturating_mul(VIDEO_AUDIO_PREBUFFER_MAX_MS) / 1000
-            } as usize;
-            let prebuffer_min_frames = if audio_out_rate == 0 {
-                0
-            } else {
-                (audio_out_rate as u64).saturating_mul(VIDEO_AUDIO_PREBUFFER_MS) / 1000
-            } as usize;
-            loop {
-                if stop_thread.load(Ordering::Relaxed) {
-                    player.stop();
-                    break;
-                }
-
-                let max_frames = max_queued_frames_thread.load(Ordering::Acquire);
-                let queued = queued_frames_thread.load(Ordering::Acquire);
-                let video_queue_full = max_frames > 0 && queued >= max_frames;
-                let audio_started = start_clock_thread.load(Ordering::Acquire) != u64::MAX;
-                let pending_frames =
-                    prebuffered_audio_frames_thread.load(Ordering::Acquire) as usize;
-                let prebuffer_ready =
-                    prebuffer_min_frames == 0 || pending_frames >= prebuffer_min_frames;
-                let predecode_ms = predecode_video_ms.max(predecode_audio_ms);
-                if !audio_started
-                    && predecode_ms >= VIDEO_PREDECODE_MAX_MS
-                    && prebuffer_ready
-                    && queued >= VIDEO_START_MIN_FRAMES
-                {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                if video_queue_full
-                    && !audio_started
-                    && prebuffer_max_frames > 0
-                    && pending_frames >= prebuffer_max_frames
-                {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-
-                let mut did_work = false;
-                if !decoder_finished {
-                    player.pump();
-
-                    match player.take_video() {
-                        Ok(frames) => {
-                            if !frames.is_empty() {
-                                did_work = true;
-                            }
-                            for frame in frames {
-                                if predecode_video_base_ms.is_none() {
-                                    predecode_video_base_ms = Some(frame.play_ms);
-                                }
-                                if let Some(base_ms) = predecode_video_base_ms {
-                                    let frame_ms = frame.play_ms.saturating_sub(base_ms) as u64;
-                                    if frame_ms > predecode_video_ms {
-                                        predecode_video_ms = frame_ms;
-                                    }
-                                }
-                                if let Some(stats) = stats.as_ref() {
-                                    stats
-                                        .last_video_ms
-                                        .store(frame.play_ms as u64, Ordering::Release);
-                                }
-                                if tx.send(VideoEvent::Video(frame)).is_err() {
-                                    return;
-                                }
-                                queued_frames_thread.fetch_add(1, Ordering::AcqRel);
-                            }
-                        }
-                        Err(_) => {
-                            let _ = tx.send(VideoEvent::Error("video decode failed".into()));
-                            return;
-                        }
-                    }
-
-                    if audio_enabled_thread.load(Ordering::Acquire) {
-                        let audio_started = start_clock_thread.load(Ordering::Acquire) != u64::MAX;
-                        let mut allow_decode = true;
-                        if !audio_started && prebuffer_max_frames > 0 {
-                            let pending_frames =
-                                prebuffered_audio_frames_thread.load(Ordering::Acquire) as usize;
-                            if pending_frames >= prebuffer_max_frames {
-                                allow_decode = false;
-                            }
-                        }
-                        if allow_decode {
-                            match player.take_audio() {
-                                Ok(packets) => {
-                                    if let Some((_writer, _clock, _out_channels)) = audio.as_ref() {
-                                        if !packets.is_empty() {
-                                            did_work = true;
-                                            if let Some(stats) = stats.as_ref() {
-                                                if stats.audio_sample_rate.load(Ordering::Acquire)
-                                                    == 0
-                                                {
-                                                    let sample_rate = packets[0].sample_rate as u64;
-                                                    let channels =
-                                                        packets[0].channels.max(1) as u64;
-                                                    stats
-                                                        .audio_sample_rate
-                                                        .compare_exchange(
-                                                            0,
-                                                            sample_rate,
-                                                            Ordering::AcqRel,
-                                                            Ordering::Relaxed,
-                                                        )
-                                                        .ok();
-                                                    stats
-                                                        .audio_channels
-                                                        .compare_exchange(
-                                                            0,
-                                                            channels,
-                                                            Ordering::AcqRel,
-                                                            Ordering::Relaxed,
-                                                        )
-                                                        .ok();
-                                                }
-                                                let mut frames = 0u64;
-                                                for packet in packets.iter() {
-                                                    let channels = packet.channels.max(1) as usize;
-                                                    if channels > 0 {
-                                                        frames += (packet.samples.len() / channels)
-                                                            as u64;
-                                                    }
-                                                }
-                                                stats.audio_packets.fetch_add(
-                                                    packets.len() as u64,
-                                                    Ordering::AcqRel,
-                                                );
-                                                stats
-                                                    .audio_frames_in
-                                                    .fetch_add(frames, Ordering::AcqRel);
-                                            }
-                                            pending_audio.extend(packets);
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    let _ =
-                                        tx.send(VideoEvent::Error("audio decode failed".into()));
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some((writer, clock, out_channels)) = audio.as_ref() {
-                    let start_clock_ms = start_clock_thread.load(Ordering::Acquire);
-                    let audio_started = start_clock_ms != u64::MAX;
-                    let audio_now_ms = if audio_started {
-                        Some(clock.time_ms().saturating_sub(start_clock_ms))
-                    } else {
-                        None
-                    };
-                    let out_rate = clock.sample_rate();
-                    let out_channels = (*out_channels).max(1);
-                    let out_channels_usize = out_channels as usize;
-                    let mut released_any = false;
-                    if audio_started {
-                        while let Some(samples) = pending_samples.pop_front() {
-                            let samples_len = samples.len();
-                            match writer.try_push(samples) {
-                                Ok(()) => {
-                                    released_any = true;
-                                    did_work = true;
-                                }
-                                Err(samples) => {
-                                    if samples.len() < samples_len {
-                                        released_any = true;
-                                        did_work = true;
-                                    }
-                                    pending_samples.push_front(samples);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if pending_samples.is_empty() || !audio_started {
-                        while let Some(packet) = pending_audio.pop_front() {
-                            if !audio_started {
-                                let pending_frames = pending_samples
-                                    .iter()
-                                    .map(|chunk| chunk.len())
-                                    .sum::<usize>()
-                                    / out_channels_usize;
-                                if prebuffer_max_frames > 0
-                                    && pending_frames >= prebuffer_max_frames
-                                {
-                                    pending_audio.push_front(packet);
-                                    break;
-                                }
-                            }
-                            let base_ms = audio_base_ms.get_or_insert(packet.play_ms);
-                            let packet_ms = packet.play_ms.saturating_sub(*base_ms) as u64;
-                            if let Some(now_ms) = audio_now_ms {
-                                const AUDIO_MAX_AHEAD_MS: u64 = 2000;
-                                if packet_ms > now_ms + AUDIO_MAX_AHEAD_MS {
-                                    pending_audio.push_front(packet);
-                                    break;
-                                }
-                            }
-                            let in_channels = packet.channels.max(1);
-                            let mut samples = packet.samples;
-                            let packet_frames = samples.len() / in_channels.max(1) as usize;
-                            let packet_duration_ms = if packet.sample_rate > 0 {
-                                (packet_frames as u64).saturating_mul(1000)
-                                    / packet.sample_rate as u64
-                            } else {
-                                0
-                            };
-                            let packet_end_ms = packet_ms.saturating_add(packet_duration_ms);
-                            if packet_end_ms > predecode_audio_ms {
-                                predecode_audio_ms = packet_end_ms;
-                            }
-
-                            if packet.sample_rate == out_rate && in_channels == out_channels {
-                                if !samples.is_empty() {
-                                    if let Some(stats) = stats.as_ref() {
-                                        let out_frames = samples.len() / out_channels_usize;
-                                        stats
-                                            .audio_frames_out
-                                            .fetch_add(out_frames as u64, Ordering::AcqRel);
-                                    }
-                                    if out_rate > 0 {
-                                        let out_frames = samples.len() / out_channels_usize;
-                                        decoded_audio_frames =
-                                            decoded_audio_frames.saturating_add(out_frames as u64);
-                                        let decoded_ms = decoded_audio_frames.saturating_mul(1000)
-                                            / out_rate as u64;
-                                        last_audio_ms = Some(decoded_ms);
-                                        if let Some(stats) = stats.as_ref() {
-                                            stats
-                                                .last_audio_ms
-                                                .store(decoded_ms, Ordering::Release);
-                                        }
-                                    }
-                                    if audio_started {
-                                        let total_frames = samples.len() / out_channels_usize;
-                                        let samples_len = samples.len();
-                                        match writer.try_push(samples) {
-                                            Ok(()) => {
-                                                if let Some(stats) = stats.as_ref() {
-                                                    let queued_frames = total_frames;
-                                                    stats.audio_frames_queued.fetch_add(
-                                                        queued_frames as u64,
-                                                        Ordering::AcqRel,
-                                                    );
-                                                }
-                                                released_any = true;
-                                            }
-                                            Err(samples) => {
-                                                if let Some(stats) = stats.as_ref() {
-                                                    let remaining_frames =
-                                                        samples.len() / out_channels_usize;
-                                                    let queued_frames = total_frames
-                                                        .saturating_sub(remaining_frames);
-                                                    stats.audio_frames_queued.fetch_add(
-                                                        queued_frames as u64,
-                                                        Ordering::AcqRel,
-                                                    );
-                                                }
-                                                if samples.len() < samples_len {
-                                                    released_any = true;
-                                                }
-                                                pending_samples.push_front(samples);
-                                                break;
-                                            }
-                                        }
-                                    } else {
-                                        pending_samples.push_back(samples);
-                                    }
-                                }
-                                continue;
-                            }
-
-                            let converter_ref = match converter.as_mut() {
-                                Some(existing)
-                                    if existing.matches(
-                                        packet.sample_rate,
-                                        out_rate,
-                                        in_channels,
-                                        out_channels,
-                                    ) =>
-                                {
-                                    existing
-                                }
-                                _ => {
-                                    match AudioConverter::new(
-                                        packet.sample_rate,
-                                        out_rate,
-                                        in_channels,
-                                        out_channels,
-                                    ) {
-                                        Ok(new_converter) => {
-                                            converter = Some(new_converter);
-                                            converter.as_mut().unwrap()
-                                        }
-                                        Err(err) => {
-                                            let _ = tx.send(VideoEvent::Error(err));
-                                            return;
-                                        }
-                                    }
-                                }
-                            };
-                            samples = converter_ref.process(samples);
-                            if !samples.is_empty() {
-                                if let Some(stats) = stats.as_ref() {
-                                    let out_frames = samples.len() / out_channels_usize;
-                                    stats
-                                        .audio_frames_out
-                                        .fetch_add(out_frames as u64, Ordering::AcqRel);
-                                }
-                                if out_rate > 0 {
-                                    let out_frames = samples.len() / out_channels_usize;
-                                    decoded_audio_frames =
-                                        decoded_audio_frames.saturating_add(out_frames as u64);
-                                    let decoded_ms =
-                                        decoded_audio_frames.saturating_mul(1000) / out_rate as u64;
-                                    last_audio_ms = Some(decoded_ms);
-                                    if let Some(stats) = stats.as_ref() {
-                                        stats.last_audio_ms.store(decoded_ms, Ordering::Release);
-                                    }
-                                }
-                                if audio_started {
-                                    let total_frames = samples.len() / out_channels_usize;
-                                    let samples_len = samples.len();
-                                    match writer.try_push(samples) {
-                                        Ok(()) => {
-                                            if let Some(stats) = stats.as_ref() {
-                                                let queued_frames = total_frames;
-                                                stats.audio_frames_queued.fetch_add(
-                                                    queued_frames as u64,
-                                                    Ordering::AcqRel,
-                                                );
-                                            }
-                                            released_any = true;
-                                        }
-                                        Err(samples) => {
-                                            if let Some(stats) = stats.as_ref() {
-                                                let remaining_frames =
-                                                    samples.len() / out_channels_usize;
-                                                let queued_frames =
-                                                    total_frames.saturating_sub(remaining_frames);
-                                                stats.audio_frames_queued.fetch_add(
-                                                    queued_frames as u64,
-                                                    Ordering::AcqRel,
-                                                );
-                                            }
-                                            if samples.len() < samples_len {
-                                                released_any = true;
-                                            }
-                                            pending_samples.push_front(samples);
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    pending_samples.push_back(samples);
-                                }
-                            }
-                        }
-                    }
-                    if let (Some(now_ms), Some(last_ms)) = (audio_now_ms, last_audio_ms) {
-                        if !audio_end_sent
-                            && pending_audio.is_empty()
-                            && pending_samples.is_empty()
-                            && now_ms > last_ms.saturating_add(500)
-                        {
-                            let _ = tx.send(VideoEvent::AudioEnded);
-                            audio_end_sent = true;
-                        }
-                    }
-                    if released_any {
-                        did_work = true;
-                    }
-                    let pending_frames = pending_samples
-                        .iter()
-                        .map(|chunk| chunk.len())
-                        .sum::<usize>()
-                        / out_channels_usize;
-                    prebuffered_audio_frames_thread.store(pending_frames as u64, Ordering::Release);
-                    if let Some(stats) = stats.as_ref() {
-                        stats
-                            .pending_audio_frames
-                            .store(pending_frames as u64, Ordering::Release);
-                    }
-                }
-
-                if !decoder_finished && player.is_finished() {
-                    decoder_finished = true;
-                    let _ = tx.send(VideoEvent::End);
-                }
-                if decoder_finished
-                    && pending_audio.is_empty()
-                    && pending_samples.is_empty()
-                    && (!audio_enabled_thread.load(Ordering::Acquire) || audio_end_sent)
-                {
-                    return;
-                }
-
-                if !did_work {
-                    thread::sleep(Duration::from_millis(5));
-                } else {
-                    thread::yield_now();
-                }
-            }
-        });
-
-        Self {
-            rx,
-            stop,
-            worker: Some(worker),
-            start_clock_ms: None,
-            start_clock_shared,
-            start_instant: None,
-            clock,
-            video_base_ms: None,
-            frames: VecDeque::new(),
-            queued_frames,
-            max_queued_frames,
-            audio_enabled,
-            prebuffered_audio_frames,
-            previewed: false,
-            first_frame_uploaded: false,
-            finished: false,
-            audio_finished: false,
-            debug,
-        }
-    }
-
-    fn drain_events(&mut self) -> Result<(), String> {
-        while let Ok(event) = self.rx.try_recv() {
-            match event {
-                VideoEvent::Video(frame) => {
-                    if self.clock.is_none() && self.start_instant.is_none() {
-                        self.start_instant = Some(Instant::now());
-                    }
-                    if self.video_base_ms.is_none() {
-                        self.video_base_ms = Some(frame.play_ms);
-                    }
-                    self.frames.push_back(frame);
-                }
-                VideoEvent::AudioEnded => self.audio_finished = true,
-                VideoEvent::End => self.finished = true,
-                VideoEvent::Error(err) => return Err(err),
-            }
-        }
-        Ok(())
-    }
-
-    fn elapsed_ms(&self) -> u64 {
-        if let (Some(clock), Some(start_ms)) = (&self.clock, self.start_clock_ms) {
-            return clock.time_ms().saturating_sub(start_ms);
-        }
-        self.start_instant
-            .map(|start| start.elapsed().as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    fn is_started(&self) -> bool {
-        if self.clock.is_some() {
-            self.start_clock_ms.is_some()
-        } else {
-            self.start_instant.is_some()
-        }
-    }
-
-    fn has_frames(&self) -> bool {
-        !self.frames.is_empty()
-    }
-
-    fn prebuffered_audio_ms(&self) -> u64 {
-        let rate = self
-            .clock
-            .as_ref()
-            .map(|clock| clock.sample_rate())
-            .unwrap_or(0);
-        if rate == 0 {
-            return 0;
-        }
-        let frames = self.prebuffered_audio_frames.load(Ordering::Acquire);
-        frames.saturating_mul(1000) / rate as u64
-    }
-
-    fn preview_frame(&mut self) -> Option<VideoFrame> {
-        if self.previewed || self.frames.is_empty() {
-            return None;
-        }
-        self.previewed = true;
-        self.frames.front().cloned()
-    }
-
-    fn mark_frame_uploaded(&mut self) {
-        if !self.first_frame_uploaded {
-            self.first_frame_uploaded = true;
-        }
-    }
-
-    fn is_ready_to_start(&self) -> bool {
-        self.first_frame_uploaded
-    }
-
-    fn set_max_queued_frames(&self, max_frames: usize) {
-        self.max_queued_frames.store(max_frames, Ordering::Release);
-    }
-
-    fn set_audio_enabled(&self, enabled: bool) {
-        self.audio_enabled.store(enabled, Ordering::Release);
-    }
-
-    fn start_with_clock(&mut self, clock_ms: u64) {
-        if self.start_clock_ms.is_none() {
-            self.start_clock_ms = Some(clock_ms);
-            self.start_clock_shared.store(clock_ms, Ordering::Release);
-        }
-    }
-
-    fn start_now(&mut self) {
-        if self.start_instant.is_none() {
-            self.start_instant = Some(Instant::now());
-        }
-    }
-
-    fn next_frame(&mut self, elapsed_ms: u64) -> Option<VideoFrame> {
-        if self.clock.is_some() {
-            self.start_clock_ms?;
-        } else {
-            self.start_instant?;
-        }
-        const LATE_FRAME_MS: u64 = 50;
-        let base_ms = self.video_base_ms.unwrap_or(0);
-        while let Some(frame) = self.frames.front() {
-            let frame_ms = frame.play_ms.saturating_sub(base_ms) as u64;
-            if frame_ms + LATE_FRAME_MS < elapsed_ms {
-                self.frames.pop_front();
-                self.queued_frames.fetch_sub(1, Ordering::AcqRel);
-                continue;
-            }
-            break;
-        }
-        if let Some(frame) = self.frames.front() {
-            let frame_ms = frame.play_ms.saturating_sub(base_ms) as u64;
-            if frame_ms <= elapsed_ms {
-                let frame = self.frames.pop_front();
-                if frame.is_some() {
-                    self.queued_frames.fetch_sub(1, Ordering::AcqRel);
-                }
-                return frame;
-            }
-        }
-        None
-    }
-
-    fn frame_queue_len(&self) -> usize {
-        self.frames.len()
-    }
-
-    fn debug_snapshot(&self) -> Option<VideoDebugSnapshot> {
-        self.debug.as_ref().map(|stats| stats.snapshot())
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished && self.frames.is_empty()
-    }
-
-    fn take_audio_finished(&mut self) -> bool {
-        if self.audio_finished {
-            self.audio_finished = false;
-            return true;
-        }
-        false
-    }
-
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        self.frames.clear();
-        self.queued_frames.store(0, Ordering::Release);
-        self.prebuffered_audio_frames.store(0, Ordering::Release);
-        self.finished = true;
-    }
 }
 
 impl CameraState {
@@ -1758,6 +1028,9 @@ fn main() {
 
     let mut video: Option<VideoPlayback> = None;
     let mut next_video: Option<VideoPlayback> = None;
+    let mut next_video_path: Option<PathBuf> = None;
+    let mut next_video_start_at: Option<Instant> = None;
+    let mut next_video_created_at: Option<Instant> = None;
     let mut video_start_delay_until: Option<Instant> = None;
     let video_debug = std::env::var_os("CRUSTQUAKE_VIDEO_DEBUG").is_some();
     let video_debug_stats = if video_debug {
@@ -1803,22 +1076,18 @@ fn main() {
                 path,
                 audio.as_ref(),
                 video_debug_stats.clone(),
-                VIDEO_MAX_QUEUED_FRAMES_PLAYBACK,
+                VIDEO_PLAYBACK_WARM_MS,
                 true,
             ));
         }
-        if let Some(path) = playlist_paths.pop_front() {
-            next_video = Some(start_video_playback(
-                path,
-                audio.as_ref(),
-                video_debug_stats.clone(),
-                VIDEO_MAX_QUEUED_FRAMES_PREDECODE,
-                true,
-            ));
-        }
+        next_video_path = playlist_paths.pop_front();
         if video.is_some() {
             video_start_delay_until =
                 Some(Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS));
+            if next_video_path.is_some() {
+                next_video_start_at =
+                    Some(Instant::now() + Duration::from_millis(VIDEO_PREDECODE_START_DELAY_MS));
+            }
             renderer.clear_textured_quad();
         }
     }
@@ -1978,6 +1247,8 @@ fn main() {
                                 &mut playlist_paths,
                                 audio.as_ref(),
                                 video_debug_stats.clone(),
+                                &mut next_video_path,
+                                true,
                             );
                             if !advanced {
                                 elwt.exit();
@@ -1985,6 +1256,12 @@ fn main() {
                             video_start_delay_until = Some(
                                 Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS),
                             );
+                            next_video_start_at = next_video_path
+                                .as_ref()
+                                .map(|_| Instant::now() + Duration::from_millis(
+                                    VIDEO_PREDECODE_START_DELAY_MS,
+                                ));
+                            next_video_created_at = None;
                             renderer.clear_textured_quad();
                             if video_debug {
                                 last_underrun_frames = audio
@@ -2163,11 +1440,61 @@ fn main() {
                         }
                     }
 
+                    if next_video.is_none() {
+                        let should_start = next_video_start_at
+                            .map(|start_at| now >= start_at)
+                            .unwrap_or(false);
+                        if should_start {
+                            if let (Some(path), Some(current)) =
+                                (next_video_path.take(), video.as_ref())
+                            {
+                                let buffered_audio_ms = audio
+                                    .as_ref()
+                                    .map(|engine| engine.pcm_buffered_ms())
+                                    .unwrap_or(0);
+                                let ready_for_predecode = current.is_started()
+                                    && current.elapsed_ms() >= VIDEO_PREDECODE_MIN_ELAPSED_MS
+                                    && current.frame_queue_len() >= VIDEO_PREDECODE_MIN_FRAMES
+                                    && buffered_audio_ms >= VIDEO_PREDECODE_MIN_AUDIO_MS;
+                                if ready_for_predecode {
+                                    next_video = Some(start_video_playback(
+                                        path,
+                                        audio.as_ref(),
+                                        video_debug_stats.clone(),
+                                        VIDEO_PREDECODE_WARM_MS,
+                                        true,
+                                    ));
+                                    next_video_created_at = Some(now);
+                                    next_video_start_at = None;
+                                } else {
+                                    next_video_path = Some(path);
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(preload) = next_video.as_mut() {
+                        if let Some(created_at) = next_video_created_at {
+                            let elapsed = now.saturating_duration_since(created_at);
+                            let elapsed_ms = elapsed.as_millis() as u64;
+                            let start_ms =
+                                VIDEO_PREDECODE_WARM_MS.min(VIDEO_MAX_QUEUED_MS_PREDECODE);
+                            let target_ms = if elapsed_ms >= VIDEO_PREDECODE_RAMP_MS {
+                                VIDEO_MAX_QUEUED_MS_PREDECODE
+                            } else {
+                                let full_ms = VIDEO_MAX_QUEUED_MS_PREDECODE;
+                                let ramp = (full_ms - start_ms)
+                                    .saturating_mul(elapsed_ms)
+                                    / VIDEO_PREDECODE_RAMP_MS.max(1);
+                                start_ms + ramp
+                            };
+                            preload.set_max_queued_video_ms(target_ms);
+                        }
                         if let Err(err) = preload.drain_events() {
                             eprintln!("video preload failed: {}", err);
                             preload.stop();
                             next_video = None;
+                            next_video_created_at = None;
                         }
                     }
 
@@ -2185,6 +1512,20 @@ fn main() {
                             if video.take_audio_finished() {
                                 audio.clear_pcm();
                             }
+                        }
+                        if video.is_started() {
+                            let elapsed = video.elapsed_ms();
+                            let target_ms = if elapsed >= VIDEO_PLAYBACK_WARM_UP_MS {
+                                VIDEO_MAX_QUEUED_MS_PLAYBACK
+                            } else {
+                                let start_ms = VIDEO_PLAYBACK_WARM_MS;
+                                let full_ms = VIDEO_MAX_QUEUED_MS_PLAYBACK;
+                                let ramp = (full_ms - start_ms)
+                                    .saturating_mul(elapsed)
+                                    / VIDEO_PLAYBACK_WARM_UP_MS.max(1);
+                                start_ms + ramp
+                            };
+                            video.set_max_queued_video_ms(target_ms);
                         }
                         if video_debug {
                             let now = Instant::now();
@@ -2265,20 +1606,24 @@ fn main() {
                         }
                         if !delay_active {
                             if !video.is_started() {
+                                let mut preview_uploaded = false;
                                 if let Some(frame) = video.preview_frame() {
-                                    if let Ok(image) = YuvImageData::new(
+                                    if let Ok(image) = YuvImageView::new(
                                         frame.width,
                                         frame.height,
-                                        frame.y,
-                                        frame.u,
-                                        frame.v,
+                                        frame.y_plane(),
+                                        frame.u_plane(),
+                                        frame.v_plane(),
                                     ) {
-                                        if let Err(err) = renderer.update_yuv_image(&image) {
+                                        if let Err(err) = renderer.update_yuv_image_view(&image) {
                                             eprintln!("video frame upload failed: {}", err);
                                         } else {
-                                            video.mark_frame_uploaded();
+                                            preview_uploaded = true;
                                         }
                                     }
+                                }
+                                if preview_uploaded {
+                                    video.mark_frame_uploaded();
                                 }
                             }
                             if !video.is_started() {
@@ -2300,14 +1645,16 @@ fn main() {
                             }
                             let elapsed_ms = video.elapsed_ms();
                             if let Some(frame) = video.next_frame(elapsed_ms) {
-                                if let Ok(image) = YuvImageData::new(
+                                if let Ok(image) = YuvImageView::new(
                                     frame.width,
                                     frame.height,
-                                    frame.y,
-                                    frame.u,
-                                    frame.v,
+                                    frame.y_plane(),
+                                    frame.u_plane(),
+                                    frame.v_plane(),
                                 ) {
-                                    if let Err(err) = renderer.update_yuv_image(&image) {
+                                    if let Err(err) =
+                                        renderer.update_yuv_image_view(&image)
+                                    {
                                         eprintln!("video frame upload failed: {}", err);
                                     } else {
                                         video.mark_frame_uploaded();
@@ -2326,6 +1673,8 @@ fn main() {
                             &mut playlist_paths,
                             audio.as_ref(),
                             video_debug_stats.clone(),
+                            &mut next_video_path,
+                            true,
                         );
                         if !advanced {
                             elwt.exit();
@@ -2333,6 +1682,12 @@ fn main() {
                         video_start_delay_until = Some(
                             Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS),
                         );
+                        next_video_start_at = next_video_path
+                            .as_ref()
+                            .map(|_| Instant::now() + Duration::from_millis(
+                                VIDEO_PREDECODE_START_DELAY_MS,
+                            ));
+                        next_video_created_at = None;
                         renderer.clear_textured_quad();
                         if video_debug {
                             last_underrun_frames = audio
@@ -2499,27 +1854,6 @@ fn print_usage() {
     eprintln!("example: pallet --playlist movies_playlist.txt");
 }
 
-fn build_audio_config(audio: Option<&Rc<AudioEngine>>) -> Option<(PcmWriter, AudioClock, u32)> {
-    audio.map(|engine| {
-        (
-            engine.pcm_writer(),
-            engine.clock(),
-            engine.output_channels(),
-        )
-    })
-}
-
-fn start_video_playback(
-    path: PathBuf,
-    audio: Option<&Rc<AudioEngine>>,
-    debug: Option<Arc<VideoDebugStats>>,
-    max_queued_frames: usize,
-    audio_enabled: bool,
-) -> VideoPlayback {
-    let audio_config = build_audio_config(audio);
-    VideoPlayback::start(path, audio_config, debug, max_queued_frames, audio_enabled)
-}
-
 fn load_playlist(path: &Path) -> Result<VecDeque<PathBuf>, ExitError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|err| ExitError::new(EXIT_USAGE, format!("playlist read failed: {}", err)))?;
@@ -2544,56 +1878,6 @@ fn load_playlist(path: &Path) -> Result<VecDeque<PathBuf>, ExitError> {
     Ok(entries)
 }
 
-fn advance_playlist(
-    current: &mut Option<VideoPlayback>,
-    next: &mut Option<VideoPlayback>,
-    remaining: &mut VecDeque<PathBuf>,
-    audio: Option<&Rc<AudioEngine>>,
-    debug: Option<Arc<VideoDebugStats>>,
-) -> bool {
-    if let Some(stats) = debug.as_ref() {
-        stats.reset();
-    }
-    if let Some(video) = current.as_mut() {
-        video.stop();
-    }
-    *current = None;
-    if let Some(audio) = audio {
-        audio.clear_pcm();
-    }
-
-    if let Some(video) = next.take() {
-        video.set_audio_enabled(true);
-        video.set_max_queued_frames(VIDEO_MAX_QUEUED_FRAMES_PLAYBACK);
-        *current = Some(video);
-    } else if let Some(path) = remaining.pop_front() {
-        *current = Some(start_video_playback(
-            path,
-            audio,
-            debug.clone(),
-            VIDEO_MAX_QUEUED_FRAMES_PLAYBACK,
-            true,
-        ));
-    }
-
-    if current.is_none() {
-        return false;
-    }
-
-    if let Some(path) = remaining.pop_front() {
-        *next = Some(start_video_playback(
-            path,
-            audio,
-            debug.clone(),
-            VIDEO_MAX_QUEUED_FRAMES_PREDECODE,
-            true,
-        ));
-    } else {
-        *next = None;
-    }
-    true
-}
-
 fn key_name(code: KeyCode) -> String {
     match code {
         KeyCode::KeyW => "W".to_string(),
@@ -2615,116 +1899,6 @@ fn parse_command_line(line: &str) -> Option<(String, Vec<String>)> {
     let command = parts.next()?.to_string();
     let args = parts.map(|part| part.to_string()).collect();
     Some((command, args))
-}
-
-struct AudioConverter {
-    converter: DataConverter,
-    in_rate: u32,
-    out_rate: u32,
-    in_channels: u32,
-    out_channels: u32,
-    pending: Vec<f32>,
-}
-
-impl AudioConverter {
-    fn new(
-        in_rate: u32,
-        out_rate: u32,
-        in_channels: u32,
-        out_channels: u32,
-    ) -> Result<Self, String> {
-        let converter = Self::build_converter(in_rate, out_rate, in_channels, out_channels)?;
-        Ok(Self {
-            converter,
-            in_rate,
-            out_rate,
-            in_channels,
-            out_channels,
-            pending: Vec::new(),
-        })
-    }
-
-    fn matches(&self, in_rate: u32, out_rate: u32, in_channels: u32, out_channels: u32) -> bool {
-        self.in_rate == in_rate
-            && self.out_rate == out_rate
-            && self.in_channels == in_channels
-            && self.out_channels == out_channels
-    }
-
-    fn build_converter(
-        in_rate: u32,
-        out_rate: u32,
-        in_channels: u32,
-        out_channels: u32,
-    ) -> Result<DataConverter, String> {
-        let config = DataConverterConfig::new(
-            Format::F32,
-            Format::F32,
-            in_channels,
-            out_channels,
-            in_rate,
-            out_rate,
-        );
-        DataConverter::new(&config).map_err(|err| format!("audio converter init failed: {}", err))
-    }
-
-    fn process(&mut self, samples: Vec<f32>) -> Vec<f32> {
-        if samples.is_empty() || self.in_channels == 0 || self.out_channels == 0 {
-            return Vec::new();
-        }
-
-        let mut samples = if self.pending.is_empty() {
-            samples
-        } else {
-            let mut combined = std::mem::take(&mut self.pending);
-            combined.extend_from_slice(&samples);
-            combined
-        };
-
-        let in_channels = self.in_channels as usize;
-        let aligned_len = samples.len() / in_channels * in_channels;
-        if aligned_len == 0 {
-            self.pending = samples;
-            return Vec::new();
-        }
-
-        let mut tail = Vec::new();
-        if aligned_len < samples.len() {
-            tail = samples.split_off(aligned_len);
-        }
-
-        let in_frames = aligned_len / in_channels;
-        let expected_out_frames =
-            self.converter.expected_output_frame_count(in_frames as u64) as usize;
-        if expected_out_frames == 0 {
-            self.pending = tail;
-            return Vec::new();
-        }
-
-        let mut out = vec![0.0f32; expected_out_frames * self.out_channels as usize];
-        let input = Frames::wrap::<f32>(&samples, Format::F32, self.in_channels);
-        let mut output = FramesMut::wrap::<f32>(&mut out, Format::F32, self.out_channels);
-        let (out_frames, in_frames_used) =
-            match self.converter.process_pcm_frames(&mut output, &input) {
-                Ok(result) => result,
-                Err(_) => {
-                    self.pending = tail;
-                    return Vec::new();
-                }
-            };
-
-        let used_samples = in_frames_used as usize * in_channels;
-        if used_samples < samples.len() {
-            let mut remainder = samples.split_off(used_samples);
-            remainder.extend_from_slice(&tail);
-            self.pending = remainder;
-        } else {
-            self.pending = tail;
-        }
-
-        out.truncate(out_frames as usize * self.out_channels as usize);
-        out
-    }
 }
 
 fn load_wav_sfx(quake_dir: &Path, asset: &str) -> Result<Vec<u8>, ExitError> {

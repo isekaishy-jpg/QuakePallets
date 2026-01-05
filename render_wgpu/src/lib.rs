@@ -160,6 +160,71 @@ impl YuvImageData {
             v,
         })
     }
+
+    pub fn as_view(&self) -> YuvImageView<'_> {
+        YuvImageView {
+            width: self.width,
+            height: self.height,
+            y: &self.y,
+            u: &self.u,
+            v: &self.v,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct YuvImageView<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub y: &'a [u8],
+    pub u: &'a [u8],
+    pub v: &'a [u8],
+}
+
+impl<'a> YuvImageView<'a> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        y: &'a [u8],
+        u: &'a [u8],
+        v: &'a [u8],
+    ) -> Result<Self, ImageError> {
+        if width == 0 || height == 0 {
+            return Err(ImageError::InvalidDimensions { width, height });
+        }
+        let y_expected = plane_len(width, height)?;
+        if y.len() != y_expected {
+            return Err(ImageError::PlaneSizeMismatch {
+                plane: "y",
+                expected: y_expected,
+                actual: y.len(),
+            });
+        }
+        let uv_width = width.div_ceil(2);
+        let uv_height = height.div_ceil(2);
+        let uv_expected = plane_len(uv_width, uv_height)?;
+        if u.len() != uv_expected {
+            return Err(ImageError::PlaneSizeMismatch {
+                plane: "u",
+                expected: uv_expected,
+                actual: u.len(),
+            });
+        }
+        if v.len() != uv_expected {
+            return Err(ImageError::PlaneSizeMismatch {
+                plane: "v",
+                expected: uv_expected,
+                actual: v.len(),
+            });
+        }
+        Ok(Self {
+            width,
+            height,
+            y,
+            u,
+            v,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -371,11 +436,16 @@ impl<'window> Renderer<'window> {
     }
 
     pub fn set_yuv_image(&mut self, image: YuvImageData) -> Result<(), ImageError> {
+        let view = image.as_view();
+        self.set_yuv_image_view(&view)
+    }
+
+    pub fn set_yuv_image_view(&mut self, image: &YuvImageView) -> Result<(), ImageError> {
         let quad = YuvQuad::new(
             &self.device,
             &self.queue,
             &self.config,
-            &image,
+            image,
             &mut self.yuv_pipeline,
         )?;
         self.textured_quad = Some(Quad::Yuv(quad));
@@ -383,6 +453,11 @@ impl<'window> Renderer<'window> {
     }
 
     pub fn update_yuv_image(&mut self, image: &YuvImageData) -> Result<(), ImageError> {
+        let view = image.as_view();
+        self.update_yuv_image_view(&view)
+    }
+
+    pub fn update_yuv_image_view(&mut self, image: &YuvImageView) -> Result<(), ImageError> {
         if let Some(Quad::Yuv(quad)) = &self.textured_quad {
             quad.update(&self.queue, image)?;
             return Ok(());
@@ -856,7 +931,7 @@ impl YuvQuad {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         config: &wgpu::SurfaceConfiguration,
-        image: &YuvImageData,
+        image: &YuvImageView<'_>,
         pipeline_cache: &mut Option<Arc<YuvPipeline>>,
     ) -> Result<Self, ImageError> {
         let needs_new = match pipeline_cache.as_ref() {
@@ -943,9 +1018,9 @@ impl YuvQuad {
             ],
         });
 
-        upload_plane(queue, &texture_y, image.width, image.height, &image.y)?;
-        upload_plane(queue, &texture_u, uv_width, uv_height, &image.u)?;
-        upload_plane(queue, &texture_v, uv_width, uv_height, &image.v)?;
+        upload_plane(queue, &texture_y, image.width, image.height, image.y)?;
+        upload_plane(queue, &texture_u, uv_width, uv_height, image.u)?;
+        upload_plane(queue, &texture_v, uv_width, uv_height, image.v)?;
 
         Ok(Self {
             pipeline,
@@ -958,7 +1033,7 @@ impl YuvQuad {
         })
     }
 
-    fn update(&self, queue: &wgpu::Queue, image: &YuvImageData) -> Result<(), ImageError> {
+    fn update(&self, queue: &wgpu::Queue, image: &YuvImageView<'_>) -> Result<(), ImageError> {
         if image.width != self.width || image.height != self.height {
             return Err(ImageError::InvalidDimensions {
                 width: image.width,
@@ -967,9 +1042,9 @@ impl YuvQuad {
         }
         let uv_width = image.width.div_ceil(2);
         let uv_height = image.height.div_ceil(2);
-        upload_plane(queue, &self.texture_y, image.width, image.height, &image.y)?;
-        upload_plane(queue, &self.texture_u, uv_width, uv_height, &image.u)?;
-        upload_plane(queue, &self.texture_v, uv_width, uv_height, &image.v)?;
+        upload_plane(queue, &self.texture_y, image.width, image.height, image.y)?;
+        upload_plane(queue, &self.texture_u, uv_width, uv_height, image.u)?;
+        upload_plane(queue, &self.texture_v, uv_width, uv_height, image.v)?;
         Ok(())
     }
 
