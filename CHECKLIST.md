@@ -224,12 +224,12 @@ Note: Renet integration is deferred to a later networking checklist to reduce fr
 ---
 
 ## M9 — Theora video (later / optional)
-- [ ] Ogg container parsing for `.ogv`.
-- [ ] Theora decode.
-- [ ] Upload frames to GPU and render.
+- [x] Ogg container parsing for `.ogv`.
+- [x] Theora decode.
+- [x] Upload frames to GPU and render.
 
 **DoD evidence**
-- [ ] `--play-movie <file>` renders frames smoothly with sound.
+- [x] `--play-movie <file>` renders frames smoothly with sound.
 
 ---
 
@@ -254,6 +254,8 @@ See `MODERN_ENGINE_FEATURES.md` for detail. At minimum, plan for:
 - input action mapping + gamepad support
 - replay artifacts in CI
 - shader workflow and (later) hot reload
+
+
 
 
 
