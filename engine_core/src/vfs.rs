@@ -91,11 +91,13 @@ impl Vfs {
         let candidates = self.resolve_candidates(virtual_path)?;
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
+        let mut found_dir = false;
 
         for base in candidates {
             let Ok(read_dir) = fs::read_dir(&base) else {
                 continue;
             };
+            found_dir = true;
             for entry in read_dir.flatten() {
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
@@ -111,7 +113,7 @@ impl Vfs {
             }
         }
 
-        if entries.is_empty() {
+        if !found_dir {
             return Err(VfsError::NotFound(virtual_path.to_string()));
         }
 

@@ -136,11 +136,22 @@ impl PcmWriter {
                 } else {
                     Vec::new()
                 };
-                let _ = self.tx.send(samples);
-                if remainder.is_empty() {
-                    return Ok(());
+                match self.tx.send(samples) {
+                    Ok(()) => {
+                        if remainder.is_empty() {
+                            return Ok(());
+                        }
+                        return Err(remainder);
+                    }
+                    Err(err) => {
+                        self.queued.fetch_sub(write_len, Ordering::AcqRel);
+                        let mut failed = err.0;
+                        if !remainder.is_empty() {
+                            failed.extend(remainder);
+                        }
+                        return Err(failed);
+                    }
                 }
-                return Err(remainder);
             }
         }
     }

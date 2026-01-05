@@ -6,7 +6,10 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
+pub use text_overlay::{TextBounds, TextLayer, TextOverlay, TextPosition, TextStyle, TextViewport};
 pub use wgpu::SurfaceError as RenderError;
+
+mod text_overlay;
 
 #[derive(Debug)]
 pub enum RenderInitError {

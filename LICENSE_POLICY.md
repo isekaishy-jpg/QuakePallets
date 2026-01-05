@@ -14,3 +14,7 @@ All first-party code is intended to be licensed under **MIT OR Apache-2.0** (dua
 ## Clean-room policy (summary)
 - No Quake source code consultation.
 - No decompilation for implementation details.
+
+
+## Font assets
+- Fonts may be shipped under **SIL Open Font License 1.1 (OFL-1.1)**, provided the license text is included alongside the font files.

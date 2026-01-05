@@ -985,7 +985,8 @@ impl AudioConverter {
         let expected_out_frames =
             self.converter.expected_output_frame_count(in_frames as u64) as usize;
         if expected_out_frames == 0 {
-            self.pending = tail;
+            samples.extend(tail);
+            self.pending = samples;
             return Vec::new();
         }
 

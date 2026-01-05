@@ -28,6 +28,9 @@ use video::{
     VIDEO_PREDECODE_WARM_MS, VIDEO_START_MIN_FRAMES,
 };
 
+use ui::{ResolutionModel, Settings, UiFacade, UiFrameInput, UiState};
+
+mod ui;
 mod video;
 
 const EXIT_USAGE: i32 = 2;
@@ -89,6 +92,7 @@ impl ExitError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enter_map_scene(
     renderer: &mut render_wgpu::Renderer,
     window: &Window,
@@ -1198,6 +1202,9 @@ fn main() {
 
     let mut input = InputState::default();
     let mut console = ConsoleState::default();
+    let mut ui_facade = UiFacade::new();
+    let mut ui_state = UiState::default();
+    let mut settings = Settings::default();
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
     let mut fly_mode = false;
@@ -1490,6 +1497,29 @@ fn main() {
                     let now = Instant::now();
                     let dt = (now - last_frame).as_secs_f32().min(0.1);
                     last_frame = now;
+                    let resolution = ResolutionModel::new(
+                        renderer.size(),
+                        window.scale_factor(),
+                        settings.ui_scale,
+                    );
+                    println!(
+                        "resolution: physical={}x{} dpi_scale={:.3} ui_scale={:.3} logical={:.2}x{:.2} ui_points={:.2}x{:.2}",
+                        resolution.physical_px[0],
+                        resolution.physical_px[1],
+                        resolution.dpi_scale,
+                        resolution.ui_scale,
+                        resolution.logical_px[0],
+                        resolution.logical_px[1],
+                        resolution.ui_points[0],
+                        resolution.ui_points[1]
+                    );
+                    let frame_input = UiFrameInput {
+                        dt_seconds: dt,
+                        resolution,
+                    };
+                    let mut ui_ctx = ui_facade.begin_frame(frame_input);
+                    ui_facade.build_ui(&mut ui_ctx, &mut ui_state, &mut settings);
+                    let _ui_draw = ui_facade.end_frame(ui_ctx);
                     if let Some(until) = video_start_delay_until {
                         if now >= until {
                             video_start_delay_until = None;

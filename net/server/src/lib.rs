@@ -142,7 +142,9 @@ impl Server {
                             })
                         }
                     };
-                    if cmd.client_seq >= client.last_seq {
+                    if cmd.client_seq == client.last_seq
+                        || seq_more_recent(cmd.client_seq, client.last_seq)
+                    {
                         client.last_seq = cmd.client_seq;
                         client.last_input = Some(cmd);
                     }
@@ -237,6 +239,11 @@ impl Server {
     fn unregister_client(&mut self, addr: SocketAddr, _disconnect: Disconnect) {
         self.clients.remove(&addr);
     }
+}
+
+fn seq_more_recent(a: u32, b: u32) -> bool {
+    let diff = a.wrapping_sub(b);
+    diff != 0 && diff < 0x8000_0000
 }
 
 fn delta_entities(
