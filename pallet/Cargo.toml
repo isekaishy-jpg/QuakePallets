@@ -16,3 +16,7 @@ platform_winit = { path = "../platform_winit", version = "0.1.0" }
 render_wgpu = { path = "../render_wgpu", version = "0.1.0" }
 script_lua = { path = "../script_lua", version = "0.1.0" }
 video_theora = { path = "../video_theora", version = "0.1.0" }
+egui = "0.28"
+egui-wgpu = "0.28"
+egui-winit = "0.28"
+wgpu = "0.20"

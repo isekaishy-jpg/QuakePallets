@@ -49,6 +49,7 @@ struct AudioState {
     pcm_underrun_frames: Arc<AtomicU64>,
     scratch: Vec<f32>,
     mix_buffer: Vec<f32>,
+    master_volume: f32,
 }
 
 struct MixInputs<'a> {
@@ -60,6 +61,7 @@ struct MixInputs<'a> {
     pcm_underrun_frames: &'a Arc<AtomicU64>,
     scratch: &'a mut Vec<f32>,
     channels: usize,
+    master_volume: f32,
 }
 
 struct ActiveSound {
@@ -270,6 +272,12 @@ impl AudioEngine {
         self.pcm_underrun_frames.load(Ordering::Acquire)
     }
 
+    pub fn set_master_volume(&self, volume: f32) {
+        if let Ok(mut state) = self.state.lock() {
+            state.set_master_volume(volume);
+        }
+    }
+
     pub fn play_wav(&self, data: Vec<u8>) -> Result<(), AudioError> {
         let decoder = self.decode(data)?;
         let mut state = self.state.lock().expect("audio state poisoned");
@@ -311,6 +319,7 @@ impl AudioState {
             pcm_underrun_frames,
             scratch: Vec::new(),
             mix_buffer: Vec::new(),
+            master_volume: 1.0,
         }
     }
 
@@ -333,6 +342,7 @@ impl AudioState {
             pcm_underrun_frames,
             scratch,
             mix_buffer,
+            master_volume,
         } = self;
 
         if format == OUTPUT_FORMAT {
@@ -346,6 +356,7 @@ impl AudioState {
                 pcm_underrun_frames,
                 scratch,
                 channels,
+                master_volume: *master_volume,
             };
             Self::mix_into_samples(&mut inputs, samples);
             return;
@@ -369,6 +380,7 @@ impl AudioState {
             pcm_underrun_frames,
             scratch,
             channels,
+            master_volume: *master_volume,
         };
         Self::mix_into_samples(&mut inputs, mix_samples);
 
@@ -405,6 +417,12 @@ impl AudioState {
             channels,
         );
 
+        let master_volume = inputs.master_volume;
+        if (master_volume - 1.0).abs() > f32::EPSILON {
+            for sample in output.iter_mut() {
+                *sample *= master_volume;
+            }
+        }
         for sample in output.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
         }
@@ -456,6 +474,10 @@ impl AudioState {
     fn clear_pcm(&mut self) {
         self.pcm_stream.clear();
         while self.pcm_rx.try_recv().is_ok() {}
+    }
+
+    fn set_master_volume(&mut self, volume: f32) {
+        self.master_volume = volume.clamp(0.0, 1.0);
     }
 }
 

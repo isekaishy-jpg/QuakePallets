@@ -56,25 +56,27 @@ This checklist is intentionally a single vertical slice to avoid coupling with l
 ---
 
 ## D1 — Integrate egui for menus/options and general UI widgets
-- [ ] Integrate `egui` with winit + wgpu (`egui-winit` + `egui-wgpu` or equivalent backend).
-- [ ] Render ordering is fixed:
+- [x] Integrate `egui` with winit + wgpu (`egui-winit` + `egui-wgpu` or equivalent backend).
+- [x] Render ordering is fixed:
   1) 3D scene (or placeholder clear)
   2) glyphon text overlays (HUD/console)
   3) egui UI (menus/options)
-- [ ] Implement menu skeleton:
+- [x] Implement menu skeleton:
   - Main menu: Start, Options, Quit
   - Options:
     - UI Scale (0.75–2.0)
     - VSync toggle (or placeholder if swapchain recreate not ready)
     - Master volume slider (must be wired if audio exists)
-- [ ] Implement persistent settings:
+    - Display mode (windowed/borderless/fullscreen) with resolution selection
+- [x] Implement persistent settings:
   - load on startup
   - save on change or on “Apply”
   - versioned settings struct with defaulting
 
 **DoD**
-- [ ] UI scale changes take effect immediately and persist across restart.
-- [ ] Options menu is usable at 720p, 1080p, 4K without overlap/clipping.
+- [x] UI scale changes take effect immediately and persist across restart.
+- [x] Display mode/resolution changes apply immediately and persist across restart.
+- [x] Options menu is usable at 720p, 1080p, 4K without overlap/clipping.
 
 ---
 

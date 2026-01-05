@@ -13,10 +13,12 @@ use compat_quake::pak::{self, PakFile};
 use engine_core::vfs::{Vfs, VfsError};
 use net_transport::{LoopbackTransport, Transport, TransportConfig};
 use platform_winit::{
-    create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Ime, KeyCode,
-    MouseButton, PhysicalKey, PhysicalPosition, PhysicalSize, Window, WindowEvent,
+    create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Fullscreen, Ime,
+    KeyCode, MouseButton, PhysicalKey, PhysicalPosition, PhysicalSize, Window, WindowEvent,
 };
-use render_wgpu::{ImageData, MeshData, MeshVertex, RenderError, YuvImageView};
+use render_wgpu::{
+    ImageData, MeshData, MeshVertex, RenderError, TextOverlay, TextViewport, YuvImageView,
+};
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
 use video::{
@@ -28,8 +30,10 @@ use video::{
     VIDEO_PREDECODE_WARM_MS, VIDEO_START_MIN_FRAMES,
 };
 
-use ui::{ResolutionModel, Settings, UiFacade, UiFrameInput, UiState};
+use settings::{Settings, WindowMode};
+use ui::{MenuMode, ResolutionModel, UiFacade, UiFrameInput, UiState};
 
+mod settings;
 mod ui;
 mod video;
 
@@ -1058,14 +1062,17 @@ fn main() {
         }
     };
 
-    let (event_loop, window) = match create_window("Pallet", 1280, 720) {
-        Ok(result) => result,
-        Err(err) => {
-            eprintln!("window init failed: {}", err);
-            std::process::exit(1);
-        }
-    };
+    let mut settings = Settings::load();
+    let (event_loop, window) =
+        match create_window("Pallet", settings.resolution[0], settings.resolution[1]) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("window init failed: {}", err);
+                std::process::exit(1);
+            }
+        };
     let window: &'static Window = Box::leak(Box::new(window));
+    apply_window_settings(window, &settings);
 
     let mut renderer = match render_wgpu::Renderer::new(window) {
         Ok(renderer) => renderer,
@@ -1074,6 +1081,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    renderer.resize(renderer.window_inner_size());
     if args.play_movie.is_some() || args.playlist.is_some() {
         renderer.set_clear_color_rgba(0.0, 0.0, 0.0, 1.0);
         renderer.prewarm_yuv_pipeline();
@@ -1093,6 +1101,9 @@ fn main() {
             Ok(data) => sfx_data = Some(data),
             Err(err) => eprintln!("{}", err.message),
         }
+    }
+    if let Some(audio) = audio.as_ref() {
+        audio.set_master_volume(settings.master_volume);
     }
 
     let mut video: Option<VideoPlayback> = None;
@@ -1202,9 +1213,9 @@ fn main() {
 
     let mut input = InputState::default();
     let mut console = ConsoleState::default();
-    let mut ui_facade = UiFacade::new();
+    let mut ui_facade = UiFacade::new(window, renderer.device(), renderer.surface_format());
     let mut ui_state = UiState::default();
-    let mut settings = Settings::default();
+    let mut text_overlay = TextOverlay::new();
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
     let mut fly_mode = false;
@@ -1213,6 +1224,7 @@ fn main() {
     let mut mouse_look = false;
     let mut mouse_grabbed = false;
     let mut ignore_cursor_move = false;
+    let mut was_mouse_look = false;
     let mut pending_map: Option<(PathBuf, String)> = None;
 
     if let Some(asset) = args.show_image.as_deref() {
@@ -1248,24 +1260,13 @@ fn main() {
                 std::process::exit(EXIT_USAGE);
             }
         };
-        if video.is_some() {
-            pending_map = Some((quake_dir.to_path_buf(), map.to_string()));
-        } else if let Err(err) = enter_map_scene(
-            &mut renderer,
-            window,
-            quake_dir,
-            map,
-            audio.as_ref(),
-            &mut camera,
-            &mut collision,
-            &mut scene_active,
-            &mut mouse_look,
-            &mut mouse_grabbed,
-            &mut loopback,
-        ) {
-            eprintln!("{}", err.message);
-            std::process::exit(err.code);
-        }
+        pending_map = Some((quake_dir.to_path_buf(), map.to_string()));
+    }
+
+    if video.is_none() && args.show_image.is_none() {
+        ui_state.open_title();
+    } else {
+        ui_state.menu_open = false;
     }
 
     let mut last_frame = Instant::now();
@@ -1273,7 +1274,9 @@ fn main() {
     if let Err(err) = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
         match event {
-            Event::WindowEvent { event, window_id } if window_id == main_window_id => match event {
+            Event::WindowEvent { event, window_id } if window_id == main_window_id => {
+                let _ = ui_facade.handle_window_event(&event);
+                match event {
                 WindowEvent::CloseRequested => elwt.exit(),
                 WindowEvent::Resized(size) => renderer.resize(size),
                 WindowEvent::ScaleFactorChanged { .. } => {
@@ -1295,31 +1298,15 @@ fn main() {
                                 true,
                             );
                             if !advanced {
-                                if let Some((quake_dir, map)) = pending_map.take() {
-                                    if let Err(err) = enter_map_scene(
-                                        &mut renderer,
-                                        window,
-                                        &quake_dir,
-                                        &map,
-                                        audio.as_ref(),
-                                        &mut camera,
-                                        &mut collision,
-                                        &mut scene_active,
-                                        &mut mouse_look,
-                                        &mut mouse_grabbed,
-                                        &mut loopback,
-                                    ) {
-                                        eprintln!("{}", err.message);
-                                        elwt.exit();
-                                    }
-                                    video_hold_until = None;
-                                    next_video_entry = None;
-                                    next_video_start_at = None;
-                                    next_video_created_at = None;
-                                    video_start_delay_until = None;
-                                    return;
-                                }
-                                elwt.exit();
+                                video_hold_until = None;
+                                next_video_entry = None;
+                                next_video_start_at = None;
+                                next_video_created_at = None;
+                                video_start_delay_until = None;
+                                video = None;
+                                ui_state.open_title();
+                                renderer.clear_textured_quad();
+                                return;
                             }
                             video_hold_until = None;
                             video_start_delay_until = Some(
@@ -1413,42 +1400,55 @@ fn main() {
                                 }
                             }
                         } else {
-                            match code {
-                                KeyCode::KeyW => input.forward = pressed,
-                                KeyCode::KeyS => input.back = pressed,
-                                KeyCode::KeyA => input.left = pressed,
-                                KeyCode::KeyD => input.right = pressed,
-                                KeyCode::Space => input.jump = pressed,
-                                KeyCode::ShiftLeft => input.down = pressed,
-                                KeyCode::KeyF if pressed => {
-                                    fly_mode = !fly_mode;
-                                    if fly_mode {
-                                        camera.velocity = Vec3::zero();
-                                        camera.vertical_velocity = 0.0;
-                                        camera.on_ground = false;
-                                    } else if let Some(scene) = collision.as_ref() {
-                                        camera.snap_to_floor(scene);
+                            if pressed && !is_repeat && code == KeyCode::Escape {
+                                if ui_state.menu_open {
+                                    if ui_state.menu_mode == MenuMode::Pause {
+                                        ui_state.close_menu();
+                                        mouse_look = was_mouse_look;
+                                        mouse_grabbed = set_cursor_mode(window, mouse_look);
                                     }
-                                }
-                                KeyCode::KeyP if pressed => {
-                                    if let (Some(audio), Some(data)) =
-                                        (audio.as_ref(), sfx_data.as_ref())
-                                    {
-                                        if let Err(err) = audio.play_wav(data.clone()) {
-                                            eprintln!("{}", err);
-                                        }
-                                    }
-                                }
-                                KeyCode::Escape if pressed => {
+                                } else if scene_active {
+                                    was_mouse_look = mouse_look;
+                                    ui_state.open_pause();
                                     mouse_look = false;
                                     mouse_grabbed = set_cursor_mode(window, mouse_look);
                                 }
-                                _ => {}
+                                return;
                             }
-                            if let Some(script) = script.as_mut() {
-                                let key = key_name(code);
-                                if let Err(err) = script.engine.on_key(&key, pressed) {
-                                    eprintln!("lua on_key failed: {}", err);
+                            if !ui_state.menu_open {
+                                match code {
+                                    KeyCode::KeyW => input.forward = pressed,
+                                    KeyCode::KeyS => input.back = pressed,
+                                    KeyCode::KeyA => input.left = pressed,
+                                    KeyCode::KeyD => input.right = pressed,
+                                    KeyCode::Space => input.jump = pressed,
+                                    KeyCode::ShiftLeft => input.down = pressed,
+                                    KeyCode::KeyF if pressed => {
+                                        fly_mode = !fly_mode;
+                                        if fly_mode {
+                                            camera.velocity = Vec3::zero();
+                                            camera.vertical_velocity = 0.0;
+                                            camera.on_ground = false;
+                                        } else if let Some(scene) = collision.as_ref() {
+                                            camera.snap_to_floor(scene);
+                                        }
+                                    }
+                                    KeyCode::KeyP if pressed => {
+                                        if let (Some(audio), Some(data)) =
+                                            (audio.as_ref(), sfx_data.as_ref())
+                                        {
+                                            if let Err(err) = audio.play_wav(data.clone()) {
+                                                eprintln!("{}", err);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                if let Some(script) = script.as_mut() {
+                                    let key = key_name(code);
+                                    if let Err(err) = script.engine.on_key(&key, pressed) {
+                                        eprintln!("lua on_key failed: {}", err);
+                                    }
                                 }
                             }
                         }
@@ -1516,10 +1516,65 @@ fn main() {
                     let frame_input = UiFrameInput {
                         dt_seconds: dt,
                         resolution,
+                        audio_available: audio.is_some(),
                     };
                     let mut ui_ctx = ui_facade.begin_frame(frame_input);
                     ui_facade.build_ui(&mut ui_ctx, &mut ui_state, &mut settings);
-                    let _ui_draw = ui_facade.end_frame(ui_ctx);
+                    let ui_draw = ui_facade.end_frame(ui_ctx);
+                    if ui_draw.output.settings_changed {
+                        if let Err(err) = settings.save() {
+                            eprintln!("settings save failed: {}", err);
+                        }
+                        if let Some(audio) = audio.as_ref() {
+                            audio.set_master_volume(settings.master_volume);
+                        }
+                    }
+                    if ui_draw.output.display_settings_changed {
+                        apply_window_settings(window, &settings);
+                        renderer.resize(renderer.window_inner_size());
+                    }
+                    if ui_draw.output.start_requested {
+                        if let Some((quake_dir, map)) = pending_map.take() {
+                            let result = enter_map_scene(
+                                &mut renderer,
+                                window,
+                                &quake_dir,
+                                &map,
+                                audio.as_ref(),
+                                &mut camera,
+                                &mut collision,
+                                &mut scene_active,
+                                &mut mouse_look,
+                                &mut mouse_grabbed,
+                                &mut loopback,
+                            );
+                            match result {
+                                Ok(()) => {
+                                    ui_state.close_menu();
+                                }
+                                Err(err) => {
+                                    eprintln!("{}", err.message);
+                                    pending_map = Some((quake_dir, map));
+                                }
+                            }
+                        } else {
+                            eprintln!("start requested but no map specified");
+                        }
+                    }
+                    if ui_draw.output.resume_requested {
+                        ui_state.close_menu();
+                        mouse_look = was_mouse_look;
+                        mouse_grabbed = set_cursor_mode(window, mouse_look);
+                    }
+                    if ui_draw.output.quit_requested {
+                        elwt.exit();
+                        return;
+                    }
+                    let text_viewport = TextViewport {
+                        physical_px: resolution.physical_px,
+                        dpi_scale: resolution.dpi_scale,
+                        ui_scale: settings.ui_scale,
+                    };
                     if let Some(until) = video_start_delay_until {
                         if now >= until {
                             video_start_delay_until = None;
@@ -1787,31 +1842,15 @@ fn main() {
                             true,
                         );
                         if !advanced {
-                            if let Some((quake_dir, map)) = pending_map.take() {
-                                if let Err(err) = enter_map_scene(
-                                    &mut renderer,
-                                    window,
-                                    &quake_dir,
-                                    &map,
-                                    audio.as_ref(),
-                                    &mut camera,
-                                    &mut collision,
-                                    &mut scene_active,
-                                    &mut mouse_look,
-                                    &mut mouse_grabbed,
-                                    &mut loopback,
-                                ) {
-                                    eprintln!("{}", err.message);
-                                    elwt.exit();
-                                }
-                                video_hold_until = None;
-                                next_video_entry = None;
-                                next_video_start_at = None;
-                                next_video_created_at = None;
-                                video_start_delay_until = None;
-                                return;
-                            }
-                            elwt.exit();
+                            video_hold_until = None;
+                            next_video_entry = None;
+                            next_video_start_at = None;
+                            next_video_created_at = None;
+                            video_start_delay_until = None;
+                            video = None;
+                            ui_state.open_title();
+                            renderer.clear_textured_quad();
+                            return;
                         }
                         video_hold_until = None;
                         video_start_delay_until = Some(
@@ -1859,7 +1898,26 @@ fn main() {
                         }
                     }
 
-                    match renderer.render() {
+                    match renderer.render_with_overlay(|device, queue, encoder, view, _format| {
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("pallet.text_overlay.pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                occlusion_query_set: None,
+                                timestamp_writes: None,
+                            });
+                            text_overlay.flush(&mut pass, text_viewport);
+                        }
+                        ui_facade.render(device, queue, encoder, view, &ui_draw);
+                    }) {
                         Ok(()) => {}
                         Err(RenderError::Lost | RenderError::Outdated) => {
                             renderer.resize(renderer.size());
@@ -1873,8 +1931,9 @@ fn main() {
                         }
                     }
                 }
-                _ => {}
-            },
+                    _ => {}
+                }
+            }
             Event::DeviceEvent { event, .. } => {
                 if scene_active && mouse_look && mouse_grabbed {
                     if let DeviceEvent::MouseMotion { delta } = event {
@@ -2418,6 +2477,47 @@ fn normalize_map_asset(name: &str) -> String {
         normalized.push_str(".bsp");
     }
     format!("maps/{}", normalized)
+}
+
+fn apply_window_settings(window: &Window, settings: &Settings) {
+    match settings.window_mode {
+        WindowMode::Windowed => {
+            window.set_fullscreen(None);
+            window.set_decorations(true);
+            let _ = window.request_inner_size(PhysicalSize::new(
+                settings.resolution[0],
+                settings.resolution[1],
+            ));
+        }
+        WindowMode::Borderless => {
+            let monitor = window
+                .current_monitor()
+                .or_else(|| window.primary_monitor());
+            window.set_fullscreen(Some(Fullscreen::Borderless(monitor)));
+        }
+        WindowMode::Fullscreen => {
+            let monitor = window
+                .current_monitor()
+                .or_else(|| window.primary_monitor());
+            if let Some(monitor) = monitor {
+                let target = settings.resolution;
+                let best_mode = monitor
+                    .video_modes()
+                    .filter(|mode| {
+                        let size = mode.size();
+                        size.width == target[0] && size.height == target[1]
+                    })
+                    .max_by_key(|mode| mode.refresh_rate_millihertz());
+                if let Some(mode) = best_mode {
+                    window.set_fullscreen(Some(Fullscreen::Exclusive(mode)));
+                } else {
+                    window.set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+                }
+            } else {
+                window.set_fullscreen(None);
+            }
+        }
+    }
 }
 
 fn set_cursor_mode(window: &Window, enabled: bool) -> bool {

@@ -346,6 +346,19 @@ impl<'window> Renderer<'window> {
     }
 
     pub fn render(&mut self) -> Result<(), RenderError> {
+        self.render_with_overlay(|_, _, _, _, _| {})
+    }
+
+    pub fn render_with_overlay<F>(&mut self, overlay: F) -> Result<(), RenderError>
+    where
+        F: FnOnce(
+            &wgpu::Device,
+            &wgpu::Queue,
+            &mut wgpu::CommandEncoder,
+            &wgpu::TextureView,
+            wgpu::TextureFormat,
+        ),
+    {
         let frame = self.surface.get_current_texture()?;
         let view = frame
             .texture
@@ -417,9 +430,28 @@ impl<'window> Renderer<'window> {
                 quad.draw(&mut pass);
             }
         }
+        overlay(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &view,
+            self.config.format,
+        );
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
     }
 
     pub fn set_image(&mut self, image: ImageData) -> Result<(), ImageError> {
