@@ -26,6 +26,7 @@ stamp-h1
 test-driver
 .project
 include/ogg/config_types.h
+!include/ogg/config_types.h
 src/*.o
 src/*.lo
 src/lib*.la
