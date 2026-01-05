@@ -1,19 +1,28 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use audio::AudioEngine;
+use audio::{AudioClock, AudioEngine, PcmWriter};
 use client::{Client, ClientInput};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
 use compat_quake::pak::{self, PakFile};
 use engine_core::vfs::{Vfs, VfsError};
+use miniaudio::{DataConverter, DataConverterConfig, Format, Frames, FramesMut};
 use net_transport::{LoopbackTransport, Transport, TransportConfig};
 use platform_winit::{
-    create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, KeyCode,
+    create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Ime, KeyCode,
     MouseButton, PhysicalKey, PhysicalPosition, PhysicalSize, Window, WindowEvent,
 };
-use render_wgpu::{ImageData, MeshData, MeshVertex, RenderError};
+use render_wgpu::{ImageData, MeshData, MeshVertex, RenderError, YuvImageData};
+use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
+use video_theora::{AudioPacket, VideoFrame, VideoPlayer};
 
 const EXIT_USAGE: i32 = 2;
 const EXIT_QUAKE_DIR: i32 = 10;
@@ -39,6 +48,13 @@ const PLAYER_MAX_DROP: f32 = 256.0;
 const FLOOR_NORMAL_MIN: f32 = 0.7;
 const DIST_EPSILON: f32 = 0.03125;
 const CONTENTS_SOLID: i32 = -2;
+const VIDEO_START_MIN_FRAMES: usize = 3;
+const VIDEO_MAX_QUEUED_FRAMES_PLAYBACK: usize = 120;
+const VIDEO_MAX_QUEUED_FRAMES_PREDECODE: usize = 8;
+const VIDEO_AUDIO_PREBUFFER_MS: u64 = 100;
+const VIDEO_AUDIO_PREBUFFER_MAX_MS: u64 = 500;
+const VIDEO_INTERMISSION_MS: u64 = 150;
+const VIDEO_PREDECODE_MAX_MS: u64 = 1000;
 const OPENGL_TO_WGPU: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],
@@ -50,6 +66,9 @@ struct CliArgs {
     quake_dir: Option<PathBuf>,
     show_image: Option<String>,
     map: Option<String>,
+    play_movie: Option<PathBuf>,
+    playlist: Option<PathBuf>,
+    script: Option<PathBuf>,
 }
 
 enum ArgParseError {
@@ -84,6 +103,79 @@ struct InputState {
     right: bool,
     jump: bool,
     down: bool,
+}
+
+#[derive(Default)]
+struct ConsoleState {
+    active: bool,
+    buffer: String,
+}
+
+struct ScriptEntity {
+    id: u32,
+    position: Vec3,
+    yaw: f32,
+}
+
+struct ScriptHostState {
+    next_id: u32,
+    entities: Vec<ScriptEntity>,
+    quake_dir: Option<PathBuf>,
+    audio: Option<Rc<AudioEngine>>,
+}
+
+impl ScriptHostState {
+    fn new(quake_dir: Option<PathBuf>, audio: Option<Rc<AudioEngine>>) -> Self {
+        Self {
+            next_id: 1,
+            entities: Vec::new(),
+            quake_dir,
+            audio,
+        }
+    }
+
+    fn spawn_entity(&mut self, request: SpawnRequest) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let entity = ScriptEntity {
+            id,
+            position: Vec3::new(
+                request.position[0],
+                request.position[1],
+                request.position[2],
+            ),
+            yaw: request.yaw,
+        };
+        println!(
+            "lua spawn entity {} at ({:.2}, {:.2}, {:.2}) yaw {:.2}",
+            entity.id, entity.position.x, entity.position.y, entity.position.z, entity.yaw
+        );
+        self.entities.push(entity);
+        let count = self.entities.len();
+        println!("lua entities: {}", count);
+        id
+    }
+
+    fn play_sound(&mut self, asset: String) -> Result<(), String> {
+        let audio = self
+            .audio
+            .as_ref()
+            .ok_or_else(|| "audio disabled".to_string())?;
+        let quake_dir = self
+            .quake_dir
+            .as_ref()
+            .ok_or_else(|| "quake dir is required for play_sound".to_string())?;
+        let data = load_wav_sfx(quake_dir, &asset).map_err(|err| err.message)?;
+        audio
+            .play_wav(data)
+            .map_err(|err| format!("play_sound failed: {}", err))?;
+        Ok(())
+    }
+}
+
+struct ScriptRuntime {
+    engine: ScriptEngine,
+    _host: Rc<RefCell<ScriptHostState>>,
 }
 
 struct LoopbackNet {
@@ -157,6 +249,735 @@ struct CameraState {
     step_height: f32,
     max_drop: f32,
     sensitivity: f32,
+}
+
+enum VideoEvent {
+    Video(VideoFrame),
+    AudioEnded,
+    End,
+    Error(String),
+}
+
+struct VideoDebugStats {
+    audio_packets: AtomicU64,
+    audio_frames_in: AtomicU64,
+    audio_frames_out: AtomicU64,
+    audio_frames_queued: AtomicU64,
+    pending_audio_frames: AtomicU64,
+    audio_sample_rate: AtomicU64,
+    audio_channels: AtomicU64,
+    last_audio_ms: AtomicU64,
+    last_video_ms: AtomicU64,
+}
+
+struct VideoDebugSnapshot {
+    audio_packets: u64,
+    audio_frames_in: u64,
+    audio_frames_out: u64,
+    audio_frames_queued: u64,
+    pending_audio_frames: u64,
+    audio_sample_rate: u64,
+    audio_channels: u64,
+    last_audio_ms: u64,
+    last_video_ms: u64,
+}
+
+impl VideoDebugStats {
+    fn new() -> Self {
+        Self {
+            audio_packets: AtomicU64::new(0),
+            audio_frames_in: AtomicU64::new(0),
+            audio_frames_out: AtomicU64::new(0),
+            audio_frames_queued: AtomicU64::new(0),
+            pending_audio_frames: AtomicU64::new(0),
+            audio_sample_rate: AtomicU64::new(0),
+            audio_channels: AtomicU64::new(0),
+            last_audio_ms: AtomicU64::new(0),
+            last_video_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.audio_packets.store(0, Ordering::Release);
+        self.audio_frames_in.store(0, Ordering::Release);
+        self.audio_frames_out.store(0, Ordering::Release);
+        self.audio_frames_queued.store(0, Ordering::Release);
+        self.pending_audio_frames.store(0, Ordering::Release);
+        self.audio_sample_rate.store(0, Ordering::Release);
+        self.audio_channels.store(0, Ordering::Release);
+        self.last_audio_ms.store(0, Ordering::Release);
+        self.last_video_ms.store(0, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> VideoDebugSnapshot {
+        VideoDebugSnapshot {
+            audio_packets: self.audio_packets.load(Ordering::Acquire),
+            audio_frames_in: self.audio_frames_in.load(Ordering::Acquire),
+            audio_frames_out: self.audio_frames_out.load(Ordering::Acquire),
+            audio_frames_queued: self.audio_frames_queued.load(Ordering::Acquire),
+            pending_audio_frames: self.pending_audio_frames.load(Ordering::Acquire),
+            audio_sample_rate: self.audio_sample_rate.load(Ordering::Acquire),
+            audio_channels: self.audio_channels.load(Ordering::Acquire),
+            last_audio_ms: self.last_audio_ms.load(Ordering::Acquire),
+            last_video_ms: self.last_video_ms.load(Ordering::Acquire),
+        }
+    }
+}
+
+struct VideoPlayback {
+    rx: mpsc::Receiver<VideoEvent>,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+    start_clock_ms: Option<u64>,
+    start_clock_shared: Arc<AtomicU64>,
+    start_instant: Option<Instant>,
+    clock: Option<AudioClock>,
+    video_base_ms: Option<u32>,
+    frames: VecDeque<VideoFrame>,
+    queued_frames: Arc<AtomicUsize>,
+    max_queued_frames: Arc<AtomicUsize>,
+    audio_enabled: Arc<AtomicBool>,
+    prebuffered_audio_frames: Arc<AtomicU64>,
+    previewed: bool,
+    first_frame_uploaded: bool,
+    finished: bool,
+    audio_finished: bool,
+    debug: Option<Arc<VideoDebugStats>>,
+}
+
+impl VideoPlayback {
+    fn start(
+        path: PathBuf,
+        audio: Option<(PcmWriter, AudioClock, u32)>,
+        debug: Option<Arc<VideoDebugStats>>,
+        max_queued_frames: usize,
+        audio_enabled: bool,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let clock = audio.as_ref().map(|(_, clock, _)| clock.clone());
+        let stats = debug.as_ref().map(Arc::clone);
+        let start_clock_shared = Arc::new(AtomicU64::new(u64::MAX));
+        let start_clock_thread = Arc::clone(&start_clock_shared);
+        let queued_frames = Arc::new(AtomicUsize::new(0));
+        let queued_frames_thread = Arc::clone(&queued_frames);
+        let max_queued_frames = Arc::new(AtomicUsize::new(max_queued_frames));
+        let max_queued_frames_thread = Arc::clone(&max_queued_frames);
+        let audio_enabled = Arc::new(AtomicBool::new(audio_enabled));
+        let audio_enabled_thread = Arc::clone(&audio_enabled);
+        let prebuffered_audio_frames = Arc::new(AtomicU64::new(0));
+        let prebuffered_audio_frames_thread = Arc::clone(&prebuffered_audio_frames);
+        let worker = thread::spawn(move || {
+            let mut player = match VideoPlayer::open(&path) {
+                Ok(player) => player,
+                Err(err) => {
+                    let _ = tx.send(VideoEvent::Error(format!("video init failed: {:?}", err)));
+                    return;
+                }
+            };
+            let mut converter: Option<AudioConverter> = None;
+            let mut pending_audio: VecDeque<AudioPacket> = VecDeque::new();
+            let mut pending_samples: VecDeque<Vec<f32>> = VecDeque::new();
+            let mut audio_base_ms: Option<u32> = None;
+            let mut last_audio_ms: Option<u64> = None;
+            let mut decoded_audio_frames: u64 = 0;
+            let mut audio_end_sent = false;
+            let mut predecode_video_base_ms: Option<u32> = None;
+            let mut predecode_video_ms: u64 = 0;
+            let mut predecode_audio_ms: u64 = 0;
+            let mut decoder_finished = false;
+            let audio_out_rate = audio
+                .as_ref()
+                .map(|(_, clock, _)| clock.sample_rate())
+                .unwrap_or(0);
+            let prebuffer_max_frames = if audio_out_rate == 0 {
+                0
+            } else {
+                (audio_out_rate as u64).saturating_mul(VIDEO_AUDIO_PREBUFFER_MAX_MS) / 1000
+            } as usize;
+            let prebuffer_min_frames = if audio_out_rate == 0 {
+                0
+            } else {
+                (audio_out_rate as u64).saturating_mul(VIDEO_AUDIO_PREBUFFER_MS) / 1000
+            } as usize;
+            loop {
+                if stop_thread.load(Ordering::Relaxed) {
+                    player.stop();
+                    break;
+                }
+
+                let max_frames = max_queued_frames_thread.load(Ordering::Acquire);
+                let queued = queued_frames_thread.load(Ordering::Acquire);
+                let video_queue_full = max_frames > 0 && queued >= max_frames;
+                let audio_started = start_clock_thread.load(Ordering::Acquire) != u64::MAX;
+                let pending_frames =
+                    prebuffered_audio_frames_thread.load(Ordering::Acquire) as usize;
+                let prebuffer_ready =
+                    prebuffer_min_frames == 0 || pending_frames >= prebuffer_min_frames;
+                let predecode_ms = predecode_video_ms.max(predecode_audio_ms);
+                if !audio_started
+                    && predecode_ms >= VIDEO_PREDECODE_MAX_MS
+                    && prebuffer_ready
+                    && queued >= VIDEO_START_MIN_FRAMES
+                {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                if video_queue_full
+                    && !audio_started
+                    && prebuffer_max_frames > 0
+                    && pending_frames >= prebuffer_max_frames
+                {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+
+                let mut did_work = false;
+                if !decoder_finished {
+                    player.pump();
+
+                    match player.take_video() {
+                        Ok(frames) => {
+                            if !frames.is_empty() {
+                                did_work = true;
+                            }
+                            for frame in frames {
+                                if predecode_video_base_ms.is_none() {
+                                    predecode_video_base_ms = Some(frame.play_ms);
+                                }
+                                if let Some(base_ms) = predecode_video_base_ms {
+                                    let frame_ms = frame.play_ms.saturating_sub(base_ms) as u64;
+                                    if frame_ms > predecode_video_ms {
+                                        predecode_video_ms = frame_ms;
+                                    }
+                                }
+                                if let Some(stats) = stats.as_ref() {
+                                    stats
+                                        .last_video_ms
+                                        .store(frame.play_ms as u64, Ordering::Release);
+                                }
+                                if tx.send(VideoEvent::Video(frame)).is_err() {
+                                    return;
+                                }
+                                queued_frames_thread.fetch_add(1, Ordering::AcqRel);
+                            }
+                        }
+                        Err(_) => {
+                            let _ = tx.send(VideoEvent::Error("video decode failed".into()));
+                            return;
+                        }
+                    }
+
+                    if audio_enabled_thread.load(Ordering::Acquire) {
+                        let audio_started = start_clock_thread.load(Ordering::Acquire) != u64::MAX;
+                        let mut allow_decode = true;
+                        if !audio_started && prebuffer_max_frames > 0 {
+                            let pending_frames =
+                                prebuffered_audio_frames_thread.load(Ordering::Acquire) as usize;
+                            if pending_frames >= prebuffer_max_frames {
+                                allow_decode = false;
+                            }
+                        }
+                        if allow_decode {
+                            match player.take_audio() {
+                                Ok(packets) => {
+                                    if let Some((_writer, _clock, _out_channels)) = audio.as_ref() {
+                                        if !packets.is_empty() {
+                                            did_work = true;
+                                            if let Some(stats) = stats.as_ref() {
+                                                if stats.audio_sample_rate.load(Ordering::Acquire)
+                                                    == 0
+                                                {
+                                                    let sample_rate = packets[0].sample_rate as u64;
+                                                    let channels =
+                                                        packets[0].channels.max(1) as u64;
+                                                    stats
+                                                        .audio_sample_rate
+                                                        .compare_exchange(
+                                                            0,
+                                                            sample_rate,
+                                                            Ordering::AcqRel,
+                                                            Ordering::Relaxed,
+                                                        )
+                                                        .ok();
+                                                    stats
+                                                        .audio_channels
+                                                        .compare_exchange(
+                                                            0,
+                                                            channels,
+                                                            Ordering::AcqRel,
+                                                            Ordering::Relaxed,
+                                                        )
+                                                        .ok();
+                                                }
+                                                let mut frames = 0u64;
+                                                for packet in packets.iter() {
+                                                    let channels = packet.channels.max(1) as usize;
+                                                    if channels > 0 {
+                                                        frames += (packet.samples.len() / channels)
+                                                            as u64;
+                                                    }
+                                                }
+                                                stats.audio_packets.fetch_add(
+                                                    packets.len() as u64,
+                                                    Ordering::AcqRel,
+                                                );
+                                                stats
+                                                    .audio_frames_in
+                                                    .fetch_add(frames, Ordering::AcqRel);
+                                            }
+                                            pending_audio.extend(packets);
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    let _ =
+                                        tx.send(VideoEvent::Error("audio decode failed".into()));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some((writer, clock, out_channels)) = audio.as_ref() {
+                    let start_clock_ms = start_clock_thread.load(Ordering::Acquire);
+                    let audio_started = start_clock_ms != u64::MAX;
+                    let audio_now_ms = if audio_started {
+                        Some(clock.time_ms().saturating_sub(start_clock_ms))
+                    } else {
+                        None
+                    };
+                    let out_rate = clock.sample_rate();
+                    let out_channels = (*out_channels).max(1);
+                    let out_channels_usize = out_channels as usize;
+                    let mut released_any = false;
+                    if audio_started {
+                        while let Some(samples) = pending_samples.pop_front() {
+                            let samples_len = samples.len();
+                            match writer.try_push(samples) {
+                                Ok(()) => {
+                                    released_any = true;
+                                    did_work = true;
+                                }
+                                Err(samples) => {
+                                    if samples.len() < samples_len {
+                                        released_any = true;
+                                        did_work = true;
+                                    }
+                                    pending_samples.push_front(samples);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if pending_samples.is_empty() || !audio_started {
+                        while let Some(packet) = pending_audio.pop_front() {
+                            if !audio_started {
+                                let pending_frames = pending_samples
+                                    .iter()
+                                    .map(|chunk| chunk.len())
+                                    .sum::<usize>()
+                                    / out_channels_usize;
+                                if prebuffer_max_frames > 0
+                                    && pending_frames >= prebuffer_max_frames
+                                {
+                                    pending_audio.push_front(packet);
+                                    break;
+                                }
+                            }
+                            let base_ms = audio_base_ms.get_or_insert(packet.play_ms);
+                            let packet_ms = packet.play_ms.saturating_sub(*base_ms) as u64;
+                            if let Some(now_ms) = audio_now_ms {
+                                const AUDIO_MAX_AHEAD_MS: u64 = 2000;
+                                if packet_ms > now_ms + AUDIO_MAX_AHEAD_MS {
+                                    pending_audio.push_front(packet);
+                                    break;
+                                }
+                            }
+                            let in_channels = packet.channels.max(1);
+                            let mut samples = packet.samples;
+                            let packet_frames = samples.len() / in_channels.max(1) as usize;
+                            let packet_duration_ms = if packet.sample_rate > 0 {
+                                (packet_frames as u64).saturating_mul(1000)
+                                    / packet.sample_rate as u64
+                            } else {
+                                0
+                            };
+                            let packet_end_ms = packet_ms.saturating_add(packet_duration_ms);
+                            if packet_end_ms > predecode_audio_ms {
+                                predecode_audio_ms = packet_end_ms;
+                            }
+
+                            if packet.sample_rate == out_rate && in_channels == out_channels {
+                                if !samples.is_empty() {
+                                    if let Some(stats) = stats.as_ref() {
+                                        let out_frames = samples.len() / out_channels_usize;
+                                        stats
+                                            .audio_frames_out
+                                            .fetch_add(out_frames as u64, Ordering::AcqRel);
+                                    }
+                                    if out_rate > 0 {
+                                        let out_frames = samples.len() / out_channels_usize;
+                                        decoded_audio_frames =
+                                            decoded_audio_frames.saturating_add(out_frames as u64);
+                                        let decoded_ms = decoded_audio_frames.saturating_mul(1000)
+                                            / out_rate as u64;
+                                        last_audio_ms = Some(decoded_ms);
+                                        if let Some(stats) = stats.as_ref() {
+                                            stats
+                                                .last_audio_ms
+                                                .store(decoded_ms, Ordering::Release);
+                                        }
+                                    }
+                                    if audio_started {
+                                        let total_frames = samples.len() / out_channels_usize;
+                                        let samples_len = samples.len();
+                                        match writer.try_push(samples) {
+                                            Ok(()) => {
+                                                if let Some(stats) = stats.as_ref() {
+                                                    let queued_frames = total_frames;
+                                                    stats.audio_frames_queued.fetch_add(
+                                                        queued_frames as u64,
+                                                        Ordering::AcqRel,
+                                                    );
+                                                }
+                                                released_any = true;
+                                            }
+                                            Err(samples) => {
+                                                if let Some(stats) = stats.as_ref() {
+                                                    let remaining_frames =
+                                                        samples.len() / out_channels_usize;
+                                                    let queued_frames = total_frames
+                                                        .saturating_sub(remaining_frames);
+                                                    stats.audio_frames_queued.fetch_add(
+                                                        queued_frames as u64,
+                                                        Ordering::AcqRel,
+                                                    );
+                                                }
+                                                if samples.len() < samples_len {
+                                                    released_any = true;
+                                                }
+                                                pending_samples.push_front(samples);
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        pending_samples.push_back(samples);
+                                    }
+                                }
+                                continue;
+                            }
+
+                            let converter_ref = match converter.as_mut() {
+                                Some(existing)
+                                    if existing.matches(
+                                        packet.sample_rate,
+                                        out_rate,
+                                        in_channels,
+                                        out_channels,
+                                    ) =>
+                                {
+                                    existing
+                                }
+                                _ => {
+                                    match AudioConverter::new(
+                                        packet.sample_rate,
+                                        out_rate,
+                                        in_channels,
+                                        out_channels,
+                                    ) {
+                                        Ok(new_converter) => {
+                                            converter = Some(new_converter);
+                                            converter.as_mut().unwrap()
+                                        }
+                                        Err(err) => {
+                                            let _ = tx.send(VideoEvent::Error(err));
+                                            return;
+                                        }
+                                    }
+                                }
+                            };
+                            samples = converter_ref.process(samples);
+                            if !samples.is_empty() {
+                                if let Some(stats) = stats.as_ref() {
+                                    let out_frames = samples.len() / out_channels_usize;
+                                    stats
+                                        .audio_frames_out
+                                        .fetch_add(out_frames as u64, Ordering::AcqRel);
+                                }
+                                if out_rate > 0 {
+                                    let out_frames = samples.len() / out_channels_usize;
+                                    decoded_audio_frames =
+                                        decoded_audio_frames.saturating_add(out_frames as u64);
+                                    let decoded_ms =
+                                        decoded_audio_frames.saturating_mul(1000) / out_rate as u64;
+                                    last_audio_ms = Some(decoded_ms);
+                                    if let Some(stats) = stats.as_ref() {
+                                        stats.last_audio_ms.store(decoded_ms, Ordering::Release);
+                                    }
+                                }
+                                if audio_started {
+                                    let total_frames = samples.len() / out_channels_usize;
+                                    let samples_len = samples.len();
+                                    match writer.try_push(samples) {
+                                        Ok(()) => {
+                                            if let Some(stats) = stats.as_ref() {
+                                                let queued_frames = total_frames;
+                                                stats.audio_frames_queued.fetch_add(
+                                                    queued_frames as u64,
+                                                    Ordering::AcqRel,
+                                                );
+                                            }
+                                            released_any = true;
+                                        }
+                                        Err(samples) => {
+                                            if let Some(stats) = stats.as_ref() {
+                                                let remaining_frames =
+                                                    samples.len() / out_channels_usize;
+                                                let queued_frames =
+                                                    total_frames.saturating_sub(remaining_frames);
+                                                stats.audio_frames_queued.fetch_add(
+                                                    queued_frames as u64,
+                                                    Ordering::AcqRel,
+                                                );
+                                            }
+                                            if samples.len() < samples_len {
+                                                released_any = true;
+                                            }
+                                            pending_samples.push_front(samples);
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    pending_samples.push_back(samples);
+                                }
+                            }
+                        }
+                    }
+                    if let (Some(now_ms), Some(last_ms)) = (audio_now_ms, last_audio_ms) {
+                        if !audio_end_sent
+                            && pending_audio.is_empty()
+                            && pending_samples.is_empty()
+                            && now_ms > last_ms.saturating_add(500)
+                        {
+                            let _ = tx.send(VideoEvent::AudioEnded);
+                            audio_end_sent = true;
+                        }
+                    }
+                    if released_any {
+                        did_work = true;
+                    }
+                    let pending_frames = pending_samples
+                        .iter()
+                        .map(|chunk| chunk.len())
+                        .sum::<usize>()
+                        / out_channels_usize;
+                    prebuffered_audio_frames_thread.store(pending_frames as u64, Ordering::Release);
+                    if let Some(stats) = stats.as_ref() {
+                        stats
+                            .pending_audio_frames
+                            .store(pending_frames as u64, Ordering::Release);
+                    }
+                }
+
+                if !decoder_finished && player.is_finished() {
+                    decoder_finished = true;
+                    let _ = tx.send(VideoEvent::End);
+                }
+                if decoder_finished
+                    && pending_audio.is_empty()
+                    && pending_samples.is_empty()
+                    && (!audio_enabled_thread.load(Ordering::Acquire) || audio_end_sent)
+                {
+                    return;
+                }
+
+                if !did_work {
+                    thread::sleep(Duration::from_millis(5));
+                } else {
+                    thread::yield_now();
+                }
+            }
+        });
+
+        Self {
+            rx,
+            stop,
+            worker: Some(worker),
+            start_clock_ms: None,
+            start_clock_shared,
+            start_instant: None,
+            clock,
+            video_base_ms: None,
+            frames: VecDeque::new(),
+            queued_frames,
+            max_queued_frames,
+            audio_enabled,
+            prebuffered_audio_frames,
+            previewed: false,
+            first_frame_uploaded: false,
+            finished: false,
+            audio_finished: false,
+            debug,
+        }
+    }
+
+    fn drain_events(&mut self) -> Result<(), String> {
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                VideoEvent::Video(frame) => {
+                    if self.clock.is_none() && self.start_instant.is_none() {
+                        self.start_instant = Some(Instant::now());
+                    }
+                    if self.video_base_ms.is_none() {
+                        self.video_base_ms = Some(frame.play_ms);
+                    }
+                    self.frames.push_back(frame);
+                }
+                VideoEvent::AudioEnded => self.audio_finished = true,
+                VideoEvent::End => self.finished = true,
+                VideoEvent::Error(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        if let (Some(clock), Some(start_ms)) = (&self.clock, self.start_clock_ms) {
+            return clock.time_ms().saturating_sub(start_ms);
+        }
+        self.start_instant
+            .map(|start| start.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn is_started(&self) -> bool {
+        if self.clock.is_some() {
+            self.start_clock_ms.is_some()
+        } else {
+            self.start_instant.is_some()
+        }
+    }
+
+    fn has_frames(&self) -> bool {
+        !self.frames.is_empty()
+    }
+
+    fn prebuffered_audio_ms(&self) -> u64 {
+        let rate = self
+            .clock
+            .as_ref()
+            .map(|clock| clock.sample_rate())
+            .unwrap_or(0);
+        if rate == 0 {
+            return 0;
+        }
+        let frames = self.prebuffered_audio_frames.load(Ordering::Acquire);
+        frames.saturating_mul(1000) / rate as u64
+    }
+
+    fn preview_frame(&mut self) -> Option<VideoFrame> {
+        if self.previewed || self.frames.is_empty() {
+            return None;
+        }
+        self.previewed = true;
+        self.frames.front().cloned()
+    }
+
+    fn mark_frame_uploaded(&mut self) {
+        if !self.first_frame_uploaded {
+            self.first_frame_uploaded = true;
+        }
+    }
+
+    fn is_ready_to_start(&self) -> bool {
+        self.first_frame_uploaded
+    }
+
+    fn set_max_queued_frames(&self, max_frames: usize) {
+        self.max_queued_frames.store(max_frames, Ordering::Release);
+    }
+
+    fn set_audio_enabled(&self, enabled: bool) {
+        self.audio_enabled.store(enabled, Ordering::Release);
+    }
+
+    fn start_with_clock(&mut self, clock_ms: u64) {
+        if self.start_clock_ms.is_none() {
+            self.start_clock_ms = Some(clock_ms);
+            self.start_clock_shared.store(clock_ms, Ordering::Release);
+        }
+    }
+
+    fn start_now(&mut self) {
+        if self.start_instant.is_none() {
+            self.start_instant = Some(Instant::now());
+        }
+    }
+
+    fn next_frame(&mut self, elapsed_ms: u64) -> Option<VideoFrame> {
+        if self.clock.is_some() {
+            self.start_clock_ms?;
+        } else {
+            self.start_instant?;
+        }
+        const LATE_FRAME_MS: u64 = 50;
+        let base_ms = self.video_base_ms.unwrap_or(0);
+        while let Some(frame) = self.frames.front() {
+            let frame_ms = frame.play_ms.saturating_sub(base_ms) as u64;
+            if frame_ms + LATE_FRAME_MS < elapsed_ms {
+                self.frames.pop_front();
+                self.queued_frames.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            break;
+        }
+        if let Some(frame) = self.frames.front() {
+            let frame_ms = frame.play_ms.saturating_sub(base_ms) as u64;
+            if frame_ms <= elapsed_ms {
+                let frame = self.frames.pop_front();
+                if frame.is_some() {
+                    self.queued_frames.fetch_sub(1, Ordering::AcqRel);
+                }
+                return frame;
+            }
+        }
+        None
+    }
+
+    fn frame_queue_len(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn debug_snapshot(&self) -> Option<VideoDebugSnapshot> {
+        self.debug.as_ref().map(|stats| stats.snapshot())
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished && self.frames.is_empty()
+    }
+
+    fn take_audio_finished(&mut self) -> bool {
+        if self.audio_finished {
+            self.audio_finished = false;
+            return true;
+        }
+        false
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.frames.clear();
+        self.queued_frames.store(0, Ordering::Release);
+        self.prebuffered_audio_frames.store(0, Ordering::Release);
+        self.finished = true;
+    }
 }
 
 impl CameraState {
@@ -914,10 +1735,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if args.play_movie.is_some() || args.playlist.is_some() {
+        renderer.set_clear_color_rgba(0.0, 0.0, 0.0, 1.0);
+        renderer.prewarm_yuv_pipeline();
+    }
     let main_window_id = renderer.window_id();
 
     let audio = match AudioEngine::new() {
-        Ok(audio) => Some(audio),
+        Ok(audio) => Some(Rc::new(audio)),
         Err(err) => {
             eprintln!("{}", err);
             None
@@ -931,7 +1756,107 @@ fn main() {
         }
     }
 
+    let mut video: Option<VideoPlayback> = None;
+    let mut next_video: Option<VideoPlayback> = None;
+    let mut video_start_delay_until: Option<Instant> = None;
+    let video_debug = std::env::var_os("CRUSTQUAKE_VIDEO_DEBUG").is_some();
+    let video_debug_stats = if video_debug {
+        Some(Arc::new(VideoDebugStats::new()))
+    } else {
+        None
+    };
+    let mut last_video_debug = Instant::now();
+    let mut last_underrun_frames = 0u64;
+    let mut last_output_frames = 0u64;
+    let mut last_video_stats = VideoDebugSnapshot {
+        audio_packets: 0,
+        audio_frames_in: 0,
+        audio_frames_out: 0,
+        audio_frames_queued: 0,
+        pending_audio_frames: 0,
+        audio_sample_rate: 0,
+        audio_channels: 0,
+        last_audio_ms: 0,
+        last_video_ms: 0,
+    };
+    let mut playlist_paths = if let Some(playlist_path) = args.playlist.as_ref() {
+        match load_playlist(playlist_path) {
+            Ok(list) => list,
+            Err(err) => {
+                eprintln!("{}", err.message);
+                std::process::exit(err.code);
+            }
+        }
+    } else {
+        let mut list = VecDeque::new();
+        if let Some(movie_path) = args.play_movie.as_ref() {
+            list.push_back(movie_path.clone());
+        }
+        list
+    };
+    if !playlist_paths.is_empty() {
+        if let Some(audio) = audio.as_ref() {
+            audio.clear_pcm();
+        }
+        if let Some(path) = playlist_paths.pop_front() {
+            video = Some(start_video_playback(
+                path,
+                audio.as_ref(),
+                video_debug_stats.clone(),
+                VIDEO_MAX_QUEUED_FRAMES_PLAYBACK,
+                true,
+            ));
+        }
+        if let Some(path) = playlist_paths.pop_front() {
+            next_video = Some(start_video_playback(
+                path,
+                audio.as_ref(),
+                video_debug_stats.clone(),
+                VIDEO_MAX_QUEUED_FRAMES_PREDECODE,
+                true,
+            ));
+        }
+        if video.is_some() {
+            video_start_delay_until =
+                Some(Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS));
+            renderer.clear_textured_quad();
+        }
+    }
+
+    let mut script: Option<ScriptRuntime> = None;
+    if let Some(script_path) = args.script.as_ref() {
+        let host_state = Rc::new(RefCell::new(ScriptHostState::new(
+            args.quake_dir.clone(),
+            audio.clone(),
+        )));
+        let spawn_state = Rc::clone(&host_state);
+        let sound_state = Rc::clone(&host_state);
+        let callbacks = HostCallbacks {
+            spawn_entity: Box::new(move |request| spawn_state.borrow_mut().spawn_entity(request)),
+            play_sound: Box::new(move |asset| sound_state.borrow_mut().play_sound(asset)),
+            log: Box::new(move |msg| {
+                println!("[lua] {}", msg);
+            }),
+        };
+        let mut engine = match ScriptEngine::new(ScriptConfig::default(), callbacks) {
+            Ok(engine) => engine,
+            Err(err) => {
+                eprintln!("script init failed: {}", err);
+                std::process::exit(EXIT_USAGE);
+            }
+        };
+        if let Err(err) = engine.load_file(script_path) {
+            eprintln!("script load failed: {}", err);
+            std::process::exit(EXIT_USAGE);
+        }
+        script = Some(ScriptRuntime {
+            engine,
+            _host: host_state,
+        });
+    }
+
     let mut input = InputState::default();
+    let mut console = ConsoleState::default();
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
     let mut fly_mode = false;
@@ -1045,40 +1970,150 @@ fn main() {
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let pressed = event.state == ElementState::Pressed;
-                        match code {
-                            KeyCode::KeyW => input.forward = pressed,
-                            KeyCode::KeyS => input.back = pressed,
-                            KeyCode::KeyA => input.left = pressed,
-                            KeyCode::KeyD => input.right = pressed,
-                            KeyCode::Space => input.jump = pressed,
-                            KeyCode::ShiftLeft => input.down = pressed,
-                            KeyCode::KeyF if pressed => {
-                                fly_mode = !fly_mode;
-                                if fly_mode {
-                                    camera.velocity = Vec3::zero();
-                                    camera.vertical_velocity = 0.0;
-                                    camera.on_ground = false;
-                                } else if let Some(scene) = collision.as_ref() {
-                                    camera.snap_to_floor(scene);
-                                }
+                        let is_repeat = event.repeat;
+                        if pressed && code == KeyCode::Space && video.is_some() {
+                            let advanced = advance_playlist(
+                                &mut video,
+                                &mut next_video,
+                                &mut playlist_paths,
+                                audio.as_ref(),
+                                video_debug_stats.clone(),
+                            );
+                            if !advanced {
+                                elwt.exit();
                             }
-                            KeyCode::KeyP if pressed => {
-                                if let (Some(audio), Some(data)) =
-                                    (audio.as_ref(), sfx_data.as_ref())
-                                {
-                                    if let Err(err) = audio.play_wav(data.clone()) {
-                                        eprintln!("{}", err);
-                                    }
-                                }
+                            video_start_delay_until = Some(
+                                Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS),
+                            );
+                            renderer.clear_textured_quad();
+                            if video_debug {
+                                last_underrun_frames = audio
+                                    .as_ref()
+                                    .map(|engine| engine.pcm_underrun_frames())
+                                    .unwrap_or(0);
+                                last_output_frames = audio
+                                    .as_ref()
+                                    .map(|engine| engine.output_frames())
+                                    .unwrap_or(0);
+                                last_video_stats = VideoDebugSnapshot {
+                                    audio_packets: 0,
+                                    audio_frames_in: 0,
+                                    audio_frames_out: 0,
+                                    audio_frames_queued: 0,
+                                    pending_audio_frames: 0,
+                                    audio_sample_rate: 0,
+                                    audio_channels: 0,
+                                    last_audio_ms: 0,
+                                    last_video_ms: 0,
+                                };
                             }
-                            KeyCode::Escape if pressed => {
+                            return;
+                        }
+                        if pressed && !is_repeat && code == KeyCode::Backquote {
+                            console.active = !console.active;
+                            window.set_ime_allowed(console.active);
+                            if console.active {
+                                console.buffer.clear();
+                                input = InputState::default();
                                 mouse_look = false;
                                 mouse_grabbed = set_cursor_mode(window, mouse_look);
+                                println!("console: open");
+                            } else {
+                                println!("console: closed");
                             }
-                            _ => {}
+                        } else if console.active {
+                            if pressed {
+                                match code {
+                                    KeyCode::Enter | KeyCode::NumpadEnter => {
+                                        let line = console.buffer.trim().to_string();
+                                        console.buffer.clear();
+                                        if !line.is_empty() {
+                                            println!("> {}", line);
+                                            if let Some((command, args)) = parse_command_line(&line)
+                                            {
+                                                if let Some(script) = script.as_mut() {
+                                                    match script.engine.run_command(&command, &args)
+                                                    {
+                                                        Ok(true) => {}
+                                                        Ok(false) => {
+                                                            eprintln!(
+                                                                "unknown script command: {}",
+                                                                command
+                                                            );
+                                                        }
+                                                        Err(err) => {
+                                                            eprintln!(
+                                                                "lua command failed: {}",
+                                                                err
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    eprintln!("no script loaded");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Backspace => {
+                                        console.buffer.pop();
+                                    }
+                                    KeyCode::Escape => {
+                                        console.active = false;
+                                        console.buffer.clear();
+                                        window.set_ime_allowed(false);
+                                        println!("console: closed");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            match code {
+                                KeyCode::KeyW => input.forward = pressed,
+                                KeyCode::KeyS => input.back = pressed,
+                                KeyCode::KeyA => input.left = pressed,
+                                KeyCode::KeyD => input.right = pressed,
+                                KeyCode::Space => input.jump = pressed,
+                                KeyCode::ShiftLeft => input.down = pressed,
+                                KeyCode::KeyF if pressed => {
+                                    fly_mode = !fly_mode;
+                                    if fly_mode {
+                                        camera.velocity = Vec3::zero();
+                                        camera.vertical_velocity = 0.0;
+                                        camera.on_ground = false;
+                                    } else if let Some(scene) = collision.as_ref() {
+                                        camera.snap_to_floor(scene);
+                                    }
+                                }
+                                KeyCode::KeyP if pressed => {
+                                    if let (Some(audio), Some(data)) =
+                                        (audio.as_ref(), sfx_data.as_ref())
+                                    {
+                                        if let Err(err) = audio.play_wav(data.clone()) {
+                                            eprintln!("{}", err);
+                                        }
+                                    }
+                                }
+                                KeyCode::Escape if pressed => {
+                                    mouse_look = false;
+                                    mouse_grabbed = set_cursor_mode(window, mouse_look);
+                                }
+                                _ => {}
+                            }
+                            if let Some(script) = script.as_mut() {
+                                let key = key_name(code);
+                                if let Err(err) = script.engine.on_key(&key, pressed) {
+                                    eprintln!("lua on_key failed: {}", err);
+                                }
+                            }
                         }
                     }
                 }
+                WindowEvent::Ime(Ime::Commit(text)) => {
+                    if console.active {
+                        console.buffer.push_str(&text);
+                    }
+                }
+                WindowEvent::Ime(_) => {}
                 WindowEvent::MouseInput { state, button, .. } => {
                     if button == MouseButton::Right && state == ElementState::Pressed {
                         mouse_look = !mouse_look;
@@ -1106,11 +2141,221 @@ fn main() {
                 WindowEvent::Focused(false) => {
                     mouse_look = false;
                     mouse_grabbed = set_cursor_mode(window, mouse_look);
+                    if console.active {
+                        console.active = false;
+                        console.buffer.clear();
+                        window.set_ime_allowed(false);
+                    }
                 }
                 WindowEvent::RedrawRequested => {
                     let now = Instant::now();
                     let dt = (now - last_frame).as_secs_f32().min(0.1);
                     last_frame = now;
+                    if let Some(until) = video_start_delay_until {
+                        if now >= until {
+                            video_start_delay_until = None;
+                        }
+                    }
+
+                    if let Some(script) = script.as_mut() {
+                        if let Err(err) = script.engine.on_tick(dt) {
+                            eprintln!("lua on_tick failed: {}", err);
+                        }
+                    }
+
+                    if let Some(preload) = next_video.as_mut() {
+                        if let Err(err) = preload.drain_events() {
+                            eprintln!("video preload failed: {}", err);
+                            preload.stop();
+                            next_video = None;
+                        }
+                    }
+
+                    let delay_active = video_start_delay_until.is_some();
+                    let mut advance_video = false;
+                    if let Some(video) = video.as_mut() {
+                        if let Err(err) = video.drain_events() {
+                            eprintln!("{}", err);
+                            video.stop();
+                            if let Some(audio) = audio.as_ref() {
+                                audio.clear_pcm();
+                            }
+                        }
+                        if let Some(audio) = audio.as_ref() {
+                            if video.take_audio_finished() {
+                                audio.clear_pcm();
+                            }
+                        }
+                        if video_debug {
+                            let now = Instant::now();
+                            if now.duration_since(last_video_debug) >= Duration::from_secs(1) {
+                                let buffered_ms = audio
+                                    .as_ref()
+                                    .map(|engine| engine.pcm_buffered_ms())
+                                    .unwrap_or(0);
+                                let underrun_frames = audio
+                                    .as_ref()
+                                    .map(|engine| engine.pcm_underrun_frames())
+                                    .unwrap_or(0);
+                                let output_frames = audio
+                                    .as_ref()
+                                    .map(|engine| engine.output_frames())
+                                    .unwrap_or(0);
+                                let delta_output_frames =
+                                    output_frames.saturating_sub(last_output_frames);
+                                last_output_frames = output_frames;
+                                let delta_underrun =
+                                    underrun_frames.saturating_sub(last_underrun_frames);
+                                last_underrun_frames = underrun_frames;
+                                if let Some(snapshot) = video.debug_snapshot() {
+                                    let delta_packets = snapshot
+                                        .audio_packets
+                                        .saturating_sub(last_video_stats.audio_packets);
+                                    let delta_in = snapshot
+                                        .audio_frames_in
+                                        .saturating_sub(last_video_stats.audio_frames_in);
+                                    let delta_out = snapshot
+                                        .audio_frames_out
+                                        .saturating_sub(last_video_stats.audio_frames_out);
+                                    let delta_queued = snapshot
+                                        .audio_frames_queued
+                                        .saturating_sub(last_video_stats.audio_frames_queued);
+                                    last_video_stats = snapshot;
+                                    let device_rate = audio
+                                        .as_ref()
+                                        .map(|engine| engine.output_sample_rate())
+                                        .unwrap_or(0);
+                                    let device_channels = audio
+                                        .as_ref()
+                                        .map(|engine| engine.output_channels())
+                                        .unwrap_or(0);
+                                    println!(
+                                        "video dbg: elapsed={}ms frames={} buffered={}ms underrun_frames+={} total_underrun_frames={} device_frames+={} device_rate={} device_channels={} audio_packets+={} audio_frames_in+={} audio_frames_out+={} audio_frames_queued+={} pending_frames={} packet_rate={} packet_channels={} last_audio_ms={} last_video_ms={}",
+                                        video.elapsed_ms(),
+                                        video.frame_queue_len(),
+                                        buffered_ms,
+                                        delta_underrun,
+                                        underrun_frames,
+                                        delta_output_frames,
+                                        device_rate,
+                                        device_channels,
+                                        delta_packets,
+                                        delta_in,
+                                        delta_out,
+                                        delta_queued,
+                                        last_video_stats.pending_audio_frames,
+                                        last_video_stats.audio_sample_rate,
+                                        last_video_stats.audio_channels,
+                                        last_video_stats.last_audio_ms,
+                                        last_video_stats.last_video_ms
+                                    );
+                                } else {
+                                    println!(
+                                        "video dbg: elapsed={}ms frames={} buffered={}ms underrun_frames+={} total_underrun_frames={} device_frames+={}",
+                                        video.elapsed_ms(),
+                                        video.frame_queue_len(),
+                                        buffered_ms,
+                                        delta_underrun,
+                                        underrun_frames,
+                                        delta_output_frames
+                                    );
+                                }
+                                last_video_debug = now;
+                            }
+                        }
+                        if !delay_active {
+                            if !video.is_started() {
+                                if let Some(frame) = video.preview_frame() {
+                                    if let Ok(image) = YuvImageData::new(
+                                        frame.width,
+                                        frame.height,
+                                        frame.y,
+                                        frame.u,
+                                        frame.v,
+                                    ) {
+                                        if let Err(err) = renderer.update_yuv_image(&image) {
+                                            eprintln!("video frame upload failed: {}", err);
+                                        } else {
+                                            video.mark_frame_uploaded();
+                                        }
+                                    }
+                                }
+                            }
+                            if !video.is_started() {
+                                if let Some(audio) = audio.as_ref() {
+                                    if video.has_frames()
+                                        && video.frame_queue_len() >= VIDEO_START_MIN_FRAMES
+                                        && video.is_ready_to_start()
+                                        && video.prebuffered_audio_ms()
+                                            >= VIDEO_AUDIO_PREBUFFER_MS
+                                    {
+                                        video.start_with_clock(audio.clock().time_ms());
+                                    }
+                                } else if video.has_frames()
+                                    && video.is_ready_to_start()
+                                    && video.frame_queue_len() >= VIDEO_START_MIN_FRAMES
+                                {
+                                    video.start_now();
+                                }
+                            }
+                            let elapsed_ms = video.elapsed_ms();
+                            if let Some(frame) = video.next_frame(elapsed_ms) {
+                                if let Ok(image) = YuvImageData::new(
+                                    frame.width,
+                                    frame.height,
+                                    frame.y,
+                                    frame.u,
+                                    frame.v,
+                                ) {
+                                    if let Err(err) = renderer.update_yuv_image(&image) {
+                                        eprintln!("video frame upload failed: {}", err);
+                                    } else {
+                                        video.mark_frame_uploaded();
+                                    }
+                                }
+                            }
+                        }
+                        if video.is_finished() {
+                            advance_video = true;
+                        }
+                    }
+                    if advance_video {
+                        let advanced = advance_playlist(
+                            &mut video,
+                            &mut next_video,
+                            &mut playlist_paths,
+                            audio.as_ref(),
+                            video_debug_stats.clone(),
+                        );
+                        if !advanced {
+                            elwt.exit();
+                        }
+                        video_start_delay_until = Some(
+                            Instant::now() + Duration::from_millis(VIDEO_INTERMISSION_MS),
+                        );
+                        renderer.clear_textured_quad();
+                        if video_debug {
+                            last_underrun_frames = audio
+                                .as_ref()
+                                .map(|engine| engine.pcm_underrun_frames())
+                                .unwrap_or(0);
+                            last_output_frames = audio
+                                .as_ref()
+                                .map(|engine| engine.output_frames())
+                                .unwrap_or(0);
+                            last_video_stats = VideoDebugSnapshot {
+                                audio_packets: 0,
+                                audio_frames_in: 0,
+                                audio_frames_out: 0,
+                                audio_frames_queued: 0,
+                                pending_audio_frames: 0,
+                                audio_sample_rate: 0,
+                                audio_channels: 0,
+                                last_audio_ms: 0,
+                                last_video_ms: 0,
+                            };
+                        }
+                    }
 
                     if scene_active {
                         camera.update(&input, dt, collision.as_ref(), fly_mode);
@@ -1161,6 +2406,9 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
     let mut quake_dir = None;
     let mut show_image = None;
     let mut map = None;
+    let mut play_movie = None;
+    let mut playlist = None;
+    let mut script = None;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -1183,6 +2431,24 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
                     .ok_or_else(|| ArgParseError::Message("--map expects a name".into()))?;
                 map = Some(value);
             }
+            "--play-movie" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--play-movie expects a path".into()))?;
+                play_movie = Some(PathBuf::from(value));
+            }
+            "--playlist" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--playlist expects a path".into()))?;
+                playlist = Some(PathBuf::from(value));
+            }
+            "--script" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--script expects a path".into()))?;
+                script = Some(PathBuf::from(value));
+            }
             "-h" | "--help" => return Err(ArgParseError::Help),
             _ => {
                 return Err(ArgParseError::Message(format!(
@@ -1198,18 +2464,267 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
             "--show-image and --map cannot be used together".into(),
         ));
     }
+    if play_movie.is_some() && playlist.is_some() {
+        return Err(ArgParseError::Message(
+            "--play-movie cannot be used with --playlist".into(),
+        ));
+    }
+    if play_movie.is_some() && (show_image.is_some() || map.is_some()) {
+        return Err(ArgParseError::Message(
+            "--play-movie cannot be used with --show-image or --map".into(),
+        ));
+    }
+    if playlist.is_some() && (show_image.is_some() || map.is_some()) {
+        return Err(ArgParseError::Message(
+            "--playlist cannot be used with --show-image or --map".into(),
+        ));
+    }
 
     Ok(CliArgs {
         quake_dir,
         show_image,
         map,
+        play_movie,
+        playlist,
+        script,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>]");
+    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <file>] [--script <path>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
+    eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script scripts/demo.lua");
+    eprintln!("example: pallet --play-movie intro.ogv");
+    eprintln!("example: pallet --playlist movies_playlist.txt");
+}
+
+fn build_audio_config(audio: Option<&Rc<AudioEngine>>) -> Option<(PcmWriter, AudioClock, u32)> {
+    audio.map(|engine| {
+        (
+            engine.pcm_writer(),
+            engine.clock(),
+            engine.output_channels(),
+        )
+    })
+}
+
+fn start_video_playback(
+    path: PathBuf,
+    audio: Option<&Rc<AudioEngine>>,
+    debug: Option<Arc<VideoDebugStats>>,
+    max_queued_frames: usize,
+    audio_enabled: bool,
+) -> VideoPlayback {
+    let audio_config = build_audio_config(audio);
+    VideoPlayback::start(path, audio_config, debug, max_queued_frames, audio_enabled)
+}
+
+fn load_playlist(path: &Path) -> Result<VecDeque<PathBuf>, ExitError> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| ExitError::new(EXIT_USAGE, format!("playlist read failed: {}", err)))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut entries = VecDeque::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let entry = PathBuf::from(line);
+        let entry = if entry.is_relative() {
+            base.join(entry)
+        } else {
+            entry
+        };
+        entries.push_back(entry);
+    }
+    if entries.is_empty() {
+        return Err(ExitError::new(EXIT_USAGE, "playlist is empty".to_string()));
+    }
+    Ok(entries)
+}
+
+fn advance_playlist(
+    current: &mut Option<VideoPlayback>,
+    next: &mut Option<VideoPlayback>,
+    remaining: &mut VecDeque<PathBuf>,
+    audio: Option<&Rc<AudioEngine>>,
+    debug: Option<Arc<VideoDebugStats>>,
+) -> bool {
+    if let Some(stats) = debug.as_ref() {
+        stats.reset();
+    }
+    if let Some(video) = current.as_mut() {
+        video.stop();
+    }
+    *current = None;
+    if let Some(audio) = audio {
+        audio.clear_pcm();
+    }
+
+    if let Some(video) = next.take() {
+        video.set_audio_enabled(true);
+        video.set_max_queued_frames(VIDEO_MAX_QUEUED_FRAMES_PLAYBACK);
+        *current = Some(video);
+    } else if let Some(path) = remaining.pop_front() {
+        *current = Some(start_video_playback(
+            path,
+            audio,
+            debug.clone(),
+            VIDEO_MAX_QUEUED_FRAMES_PLAYBACK,
+            true,
+        ));
+    }
+
+    if current.is_none() {
+        return false;
+    }
+
+    if let Some(path) = remaining.pop_front() {
+        *next = Some(start_video_playback(
+            path,
+            audio,
+            debug.clone(),
+            VIDEO_MAX_QUEUED_FRAMES_PREDECODE,
+            true,
+        ));
+    } else {
+        *next = None;
+    }
+    true
+}
+
+fn key_name(code: KeyCode) -> String {
+    match code {
+        KeyCode::KeyW => "W".to_string(),
+        KeyCode::KeyA => "A".to_string(),
+        KeyCode::KeyS => "S".to_string(),
+        KeyCode::KeyD => "D".to_string(),
+        KeyCode::KeyF => "F".to_string(),
+        KeyCode::KeyK => "K".to_string(),
+        KeyCode::KeyP => "P".to_string(),
+        KeyCode::Space => "Space".to_string(),
+        KeyCode::ShiftLeft => "ShiftLeft".to_string(),
+        KeyCode::Escape => "Escape".to_string(),
+        _ => format!("{:?}", code),
+    }
+}
+
+fn parse_command_line(line: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = line.split_whitespace();
+    let command = parts.next()?.to_string();
+    let args = parts.map(|part| part.to_string()).collect();
+    Some((command, args))
+}
+
+struct AudioConverter {
+    converter: DataConverter,
+    in_rate: u32,
+    out_rate: u32,
+    in_channels: u32,
+    out_channels: u32,
+    pending: Vec<f32>,
+}
+
+impl AudioConverter {
+    fn new(
+        in_rate: u32,
+        out_rate: u32,
+        in_channels: u32,
+        out_channels: u32,
+    ) -> Result<Self, String> {
+        let converter = Self::build_converter(in_rate, out_rate, in_channels, out_channels)?;
+        Ok(Self {
+            converter,
+            in_rate,
+            out_rate,
+            in_channels,
+            out_channels,
+            pending: Vec::new(),
+        })
+    }
+
+    fn matches(&self, in_rate: u32, out_rate: u32, in_channels: u32, out_channels: u32) -> bool {
+        self.in_rate == in_rate
+            && self.out_rate == out_rate
+            && self.in_channels == in_channels
+            && self.out_channels == out_channels
+    }
+
+    fn build_converter(
+        in_rate: u32,
+        out_rate: u32,
+        in_channels: u32,
+        out_channels: u32,
+    ) -> Result<DataConverter, String> {
+        let config = DataConverterConfig::new(
+            Format::F32,
+            Format::F32,
+            in_channels,
+            out_channels,
+            in_rate,
+            out_rate,
+        );
+        DataConverter::new(&config).map_err(|err| format!("audio converter init failed: {}", err))
+    }
+
+    fn process(&mut self, samples: Vec<f32>) -> Vec<f32> {
+        if samples.is_empty() || self.in_channels == 0 || self.out_channels == 0 {
+            return Vec::new();
+        }
+
+        let mut samples = if self.pending.is_empty() {
+            samples
+        } else {
+            let mut combined = std::mem::take(&mut self.pending);
+            combined.extend_from_slice(&samples);
+            combined
+        };
+
+        let in_channels = self.in_channels as usize;
+        let aligned_len = samples.len() / in_channels * in_channels;
+        if aligned_len == 0 {
+            self.pending = samples;
+            return Vec::new();
+        }
+
+        let mut tail = Vec::new();
+        if aligned_len < samples.len() {
+            tail = samples.split_off(aligned_len);
+        }
+
+        let in_frames = aligned_len / in_channels;
+        let expected_out_frames =
+            self.converter.expected_output_frame_count(in_frames as u64) as usize;
+        if expected_out_frames == 0 {
+            self.pending = tail;
+            return Vec::new();
+        }
+
+        let mut out = vec![0.0f32; expected_out_frames * self.out_channels as usize];
+        let input = Frames::wrap::<f32>(&samples, Format::F32, self.in_channels);
+        let mut output = FramesMut::wrap::<f32>(&mut out, Format::F32, self.out_channels);
+        let (out_frames, in_frames_used) =
+            match self.converter.process_pcm_frames(&mut output, &input) {
+                Ok(result) => result,
+                Err(_) => {
+                    self.pending = tail;
+                    return Vec::new();
+                }
+            };
+
+        let used_samples = in_frames_used as usize * in_channels;
+        if used_samples < samples.len() {
+            let mut remainder = samples.split_off(used_samples);
+            remainder.extend_from_slice(&tail);
+            self.pending = remainder;
+        } else {
+            self.pending = tail;
+        }
+
+        out.truncate(out_frames as usize * self.out_channels as usize);
+        out
+    }
 }
 
 fn load_wav_sfx(quake_dir: &Path, asset: &str) -> Result<Vec<u8>, ExitError> {

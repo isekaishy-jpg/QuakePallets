@@ -208,18 +208,18 @@ Note: Renet integration is deferred to a later networking checklist to reduce fr
 ---
 
 ## M8 — Lua scripting hooks (game glue, not QuakeC emulation)
-- [ ] Lua VM + sandbox:
+- [x] Lua VM + sandbox:
   - no filesystem by default
   - no OS calls
   - CPU budget per frame
-- [ ] Expose:
+- [x] Expose:
   - console commands
   - spawn entity + transform
   - play sound
   - callbacks (on_tick, on_key, on_spawn)
 
 **DoD evidence**
-- [ ] Script spawns an entity and binds a key to play sound.
+- [x] Script spawns an entity and binds a key to play sound.
 
 ---
 

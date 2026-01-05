@@ -21,7 +21,7 @@ include = [
 [lib]
 name = "miniaudio"
 path = "src/lib.rs"
-crate_type = ["lib"]
+crate-type = ["lib"] # NOTE: keep in sync with upstream if this vendored copy is refreshed.
 
 [features]
 default = ["ma-log-level-error"]

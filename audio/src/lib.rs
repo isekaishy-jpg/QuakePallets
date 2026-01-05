@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use miniaudio::{
     DecoderConfig, Device, DeviceConfig, DeviceType, DitherMode, Format, Frames, FramesMut,
@@ -10,19 +12,54 @@ use miniaudio::{
 
 const OUTPUT_FORMAT: Format = Format::F32;
 const OUTPUT_CHANNELS: u32 = 2;
+const MAX_PCM_BUFFER_SECONDS: f32 = 4.0;
 
 pub struct AudioEngine {
     _device: Device,
     state: Arc<Mutex<AudioState>>,
     sample_rate: u32,
     channels: u32,
+    pcm_tx: mpsc::Sender<Vec<f32>>,
+    pcm_queued: Arc<AtomicUsize>,
+    pcm_max_samples: usize,
+    output_frames: Arc<AtomicU64>,
+    pcm_underrun_frames: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+pub struct PcmWriter {
+    tx: mpsc::Sender<Vec<f32>>,
+    queued: Arc<AtomicUsize>,
+    max_samples: usize,
+    channels: usize,
+}
+
+#[derive(Clone)]
+pub struct AudioClock {
+    frames: Arc<AtomicU64>,
+    sample_rate: u32,
 }
 
 struct AudioState {
     sfx: Vec<ActiveSound>,
     music: Option<ActiveSound>,
+    pcm_stream: PcmStream,
+    pcm_rx: mpsc::Receiver<Vec<f32>>,
+    pcm_queued: Arc<AtomicUsize>,
+    pcm_underrun_frames: Arc<AtomicU64>,
     scratch: Vec<f32>,
     mix_buffer: Vec<f32>,
+}
+
+struct MixInputs<'a> {
+    music: &'a mut Option<ActiveSound>,
+    sfx: &'a mut Vec<ActiveSound>,
+    pcm_stream: &'a mut PcmStream,
+    pcm_rx: &'a mpsc::Receiver<Vec<f32>>,
+    pcm_queued: &'a Arc<AtomicUsize>,
+    pcm_underrun_frames: &'a Arc<AtomicU64>,
+    scratch: &'a mut Vec<f32>,
+    channels: usize,
 }
 
 struct ActiveSound {
@@ -30,6 +67,14 @@ struct ActiveSound {
     volume: f32,
     looping: bool,
     finished: bool,
+}
+
+struct PcmStream {
+    chunks: VecDeque<Vec<f32>>,
+    offset: usize,
+    queued_samples: usize,
+    volume: f32,
+    active: bool,
 }
 
 #[derive(Debug)]
@@ -49,16 +94,95 @@ impl fmt::Display for AudioError {
 
 impl std::error::Error for AudioError {}
 
+impl PcmWriter {
+    pub fn push(&self, samples: Vec<f32>) {
+        let _ = self.try_push(samples);
+    }
+
+    pub fn try_push(&self, samples: Vec<f32>) -> Result<(), Vec<f32>> {
+        if samples.is_empty() || self.max_samples == 0 || self.channels == 0 {
+            return Ok(());
+        }
+        let mut samples = samples;
+        let aligned_len = samples.len() / self.channels * self.channels;
+        if aligned_len == 0 {
+            return Ok(());
+        }
+        if aligned_len < samples.len() {
+            samples.truncate(aligned_len);
+        }
+        let in_frames = samples.len() / self.channels;
+        loop {
+            let current = self.queued.load(Ordering::Acquire);
+            let available_samples = self.max_samples.saturating_sub(current);
+            let available_frames = available_samples / self.channels;
+            if available_frames == 0 {
+                return Err(samples);
+            }
+            let write_frames = available_frames.min(in_frames);
+            let write_len = write_frames * self.channels;
+            if self
+                .queued
+                .compare_exchange(
+                    current,
+                    current + write_len,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                let remainder = if write_len < samples.len() {
+                    samples.split_off(write_len)
+                } else {
+                    Vec::new()
+                };
+                let _ = self.tx.send(samples);
+                if remainder.is_empty() {
+                    return Ok(());
+                }
+                return Err(remainder);
+            }
+        }
+    }
+}
+
+impl AudioClock {
+    pub fn time_ms(&self) -> u64 {
+        let frames = self.frames.load(Ordering::Acquire);
+        if self.sample_rate == 0 {
+            return 0;
+        }
+        frames.saturating_mul(1000) / self.sample_rate as u64
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
 impl AudioEngine {
     pub fn new() -> Result<Self, AudioError> {
-        let state = Arc::new(Mutex::new(AudioState::new()));
+        let (pcm_tx, pcm_rx) = mpsc::channel();
+        let pcm_queued = Arc::new(AtomicUsize::new(0));
+        let output_frames = Arc::new(AtomicU64::new(0));
+        let pcm_underrun_frames = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(Mutex::new(AudioState::new(
+            pcm_rx,
+            Arc::clone(&pcm_queued),
+            Arc::clone(&pcm_underrun_frames),
+        )));
         let state_for_cb = Arc::clone(&state);
+        let frames_for_cb = Arc::clone(&output_frames);
 
         let mut config = DeviceConfig::new(DeviceType::Playback);
         config.playback_mut().set_format(OUTPUT_FORMAT);
         config.playback_mut().set_channels(OUTPUT_CHANNELS);
+        config.set_performance_profile(miniaudio::PerformanceProfile::Conservative);
+        config.set_period_size_in_milliseconds(20);
+        config.set_periods(4);
         config.set_data_callback(move |_device, output, _input| {
             mix_callback(&state_for_cb, output);
+            frames_for_cb.fetch_add(output.frame_count() as u64, Ordering::AcqRel);
         });
 
         let device = Device::new(None, &config).map_err(AudioError::DeviceInit)?;
@@ -66,13 +190,73 @@ impl AudioEngine {
 
         let sample_rate = device.sample_rate();
         let channels = device.playback().channels();
+        let pcm_max_samples =
+            (sample_rate as f32 * channels as f32 * MAX_PCM_BUFFER_SECONDS) as usize;
 
         Ok(Self {
             _device: device,
             state,
             sample_rate,
             channels,
+            pcm_tx,
+            pcm_queued,
+            pcm_max_samples,
+            output_frames,
+            pcm_underrun_frames,
         })
+    }
+
+    pub fn output_sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn output_channels(&self) -> u32 {
+        self.channels
+    }
+
+    pub fn queue_pcm(&self, samples: Vec<f32>) {
+        self.pcm_writer().push(samples);
+    }
+
+    pub fn clear_pcm(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.clear_pcm();
+        }
+        self.pcm_queued.store(0, Ordering::Release);
+        self.pcm_underrun_frames.store(0, Ordering::Release);
+    }
+
+    pub fn pcm_writer(&self) -> PcmWriter {
+        PcmWriter {
+            tx: self.pcm_tx.clone(),
+            queued: Arc::clone(&self.pcm_queued),
+            max_samples: self.pcm_max_samples,
+            channels: self.channels as usize,
+        }
+    }
+
+    pub fn clock(&self) -> AudioClock {
+        AudioClock {
+            frames: Arc::clone(&self.output_frames),
+            sample_rate: self.sample_rate,
+        }
+    }
+
+    pub fn output_frames(&self) -> u64 {
+        self.output_frames.load(Ordering::Acquire)
+    }
+
+    pub fn pcm_buffered_ms(&self) -> u64 {
+        if self.sample_rate == 0 || self.channels == 0 {
+            return 0;
+        }
+        let samples = self.pcm_queued.load(Ordering::Acquire) as u64;
+        let frames = samples / self.channels as u64;
+        frames.saturating_mul(1000) / self.sample_rate as u64
+    }
+
+    pub fn pcm_underrun_frames(&self) -> u64 {
+        self.pcm_underrun_frames.load(Ordering::Acquire)
     }
 
     pub fn play_wav(&self, data: Vec<u8>) -> Result<(), AudioError> {
@@ -102,10 +286,18 @@ impl AudioEngine {
 }
 
 impl AudioState {
-    fn new() -> Self {
+    fn new(
+        pcm_rx: mpsc::Receiver<Vec<f32>>,
+        pcm_queued: Arc<AtomicUsize>,
+        pcm_underrun_frames: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             sfx: Vec::new(),
             music: None,
+            pcm_stream: PcmStream::new(1.0),
+            pcm_rx,
+            pcm_queued,
+            pcm_underrun_frames,
             scratch: Vec::new(),
             mix_buffer: Vec::new(),
         }
@@ -124,13 +316,27 @@ impl AudioState {
         let AudioState {
             music,
             sfx,
+            pcm_stream,
+            pcm_rx,
+            pcm_queued,
+            pcm_underrun_frames,
             scratch,
             mix_buffer,
         } = self;
 
         if format == OUTPUT_FORMAT {
             let samples = output.as_samples_mut::<f32>();
-            Self::mix_into_samples(music, sfx, scratch, samples, channels);
+            let mut inputs = MixInputs {
+                music,
+                sfx,
+                pcm_stream,
+                pcm_rx,
+                pcm_queued,
+                pcm_underrun_frames,
+                scratch,
+                channels,
+            };
+            Self::mix_into_samples(&mut inputs, samples);
             return;
         }
 
@@ -143,37 +349,50 @@ impl AudioState {
             mix_buffer.resize(sample_count, 0.0);
         }
         let mix_samples = &mut mix_buffer[..sample_count];
-        Self::mix_into_samples(music, sfx, scratch, mix_samples, channels);
+        let mut inputs = MixInputs {
+            music,
+            sfx,
+            pcm_stream,
+            pcm_rx,
+            pcm_queued,
+            pcm_underrun_frames,
+            scratch,
+            channels,
+        };
+        Self::mix_into_samples(&mut inputs, mix_samples);
 
         let frames = Frames::wrap::<f32>(mix_samples, OUTPUT_FORMAT, channels as u32);
         frames.convert(output, DitherMode::None);
     }
 
-    fn mix_into_samples(
-        music: &mut Option<ActiveSound>,
-        sfx: &mut Vec<ActiveSound>,
-        scratch: &mut Vec<f32>,
-        output: &mut [f32],
-        channels: usize,
-    ) {
+    fn mix_into_samples(inputs: &mut MixInputs<'_>, output: &mut [f32]) {
+        let channels = inputs.channels;
         output.fill(0.0);
         if output.is_empty() {
             return;
         }
 
-        Self::ensure_scratch(scratch, output.len());
-        let scratch = &mut scratch[..output.len()];
-        if let Some(sound) = music.as_mut() {
+        Self::ensure_scratch(inputs.scratch, output.len());
+        let scratch = &mut inputs.scratch[..output.len()];
+        if let Some(sound) = inputs.music.as_mut() {
             Self::mix_sound(sound, output, channels, scratch);
             if sound.finished {
-                *music = None;
+                *inputs.music = None;
             }
         }
 
-        for sound in sfx.iter_mut() {
+        for sound in inputs.sfx.iter_mut() {
             Self::mix_sound(sound, output, channels, scratch);
         }
-        sfx.retain(|sound| !sound.finished);
+        inputs.sfx.retain(|sound| !sound.finished);
+
+        inputs.pcm_stream.drain_rx(inputs.pcm_rx);
+        inputs.pcm_stream.mix_into(
+            output,
+            inputs.pcm_queued,
+            inputs.pcm_underrun_frames,
+            channels,
+        );
 
         for sample in output.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
@@ -222,6 +441,11 @@ impl AudioState {
             scratch.resize(len, 0.0);
         }
     }
+
+    fn clear_pcm(&mut self) {
+        self.pcm_stream.clear();
+        while self.pcm_rx.try_recv().is_ok() {}
+    }
 }
 
 impl ActiveSound {
@@ -235,9 +459,85 @@ impl ActiveSound {
     }
 }
 
-fn mix_callback(state: &Arc<Mutex<AudioState>>, output: &mut FramesMut) {
-    match state.try_lock() {
-        Ok(mut state) => state.mix_into_output(output),
-        Err(_) => output.as_bytes_mut().fill(0),
+impl PcmStream {
+    fn new(volume: f32) -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            offset: 0,
+            queued_samples: 0,
+            volume,
+            active: false,
+        }
     }
+
+    fn drain_rx(&mut self, rx: &mpsc::Receiver<Vec<f32>>) {
+        while let Ok(samples) = rx.try_recv() {
+            if samples.is_empty() {
+                continue;
+            }
+            self.active = true;
+            self.queued_samples = self.queued_samples.saturating_add(samples.len());
+            self.chunks.push_back(samples);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.offset = 0;
+        self.queued_samples = 0;
+        self.active = false;
+    }
+
+    fn mix_into(
+        &mut self,
+        output: &mut [f32],
+        queued: &AtomicUsize,
+        underruns: &AtomicU64,
+        channels: usize,
+    ) {
+        if output.is_empty() {
+            return;
+        }
+        if self.queued_samples == 0 {
+            if self.active && channels > 0 {
+                let missing_frames = (output.len() / channels) as u64;
+                if missing_frames > 0 {
+                    underruns.fetch_add(missing_frames, Ordering::AcqRel);
+                }
+            }
+            return;
+        }
+        let mut consumed = 0usize;
+        let mut index = 0usize;
+        while index < output.len() {
+            let Some(front) = self.chunks.front() else {
+                break;
+            };
+            if self.offset >= front.len() {
+                self.chunks.pop_front();
+                self.offset = 0;
+                continue;
+            }
+            output[index] += front[self.offset] * self.volume;
+            self.offset += 1;
+            self.queued_samples = self.queued_samples.saturating_sub(1);
+            consumed += 1;
+            index += 1;
+        }
+        if consumed > 0 {
+            queued.fetch_sub(consumed, Ordering::AcqRel);
+        }
+        if self.active && consumed < output.len() && channels > 0 {
+            let missing_samples = output.len() - consumed;
+            let missing_frames = (missing_samples / channels) as u64;
+            if missing_frames > 0 {
+                underruns.fetch_add(missing_frames, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+fn mix_callback(state: &Arc<Mutex<AudioState>>, output: &mut FramesMut) {
+    let mut state = state.lock().expect("audio state poisoned");
+    state.mix_into_output(output);
 }

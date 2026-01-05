@@ -8,8 +8,11 @@ license = "MIT OR Apache-2.0"
 audio = { path = "../audio", version = "0.1.0" }
 compat_quake = { path = "../compat_quake", version = "0.1.0" }
 engine_core = { path = "../engine_core", version = "0.1.0" }
+miniaudio = { path = "../third_party/miniaudio-rs/miniaudio", version = "0.10.0", default-features = false, features = ["bindgen", "ma-enable-vorbis", "ma-log-level-error"] }
 client = { path = "../net/client", version = "0.1.0" }
 server = { path = "../net/server", version = "0.1.0" }
 net_transport = { path = "../net/net_transport", version = "0.1.0" }
 platform_winit = { path = "../platform_winit", version = "0.1.0" }
 render_wgpu = { path = "../render_wgpu", version = "0.1.0" }
+script_lua = { path = "../script_lua", version = "0.1.0" }
+video_theora = { path = "../video_theora", version = "0.1.0" }

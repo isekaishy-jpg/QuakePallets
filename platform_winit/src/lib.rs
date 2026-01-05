@@ -3,7 +3,7 @@
 use std::fmt;
 
 pub use winit::dpi::{PhysicalPosition, PhysicalSize};
-pub use winit::event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent};
+pub use winit::event::{DeviceEvent, ElementState, Event, Ime, MouseButton, WindowEvent};
 pub use winit::event_loop::{ControlFlow, EventLoop};
 pub use winit::keyboard::{KeyCode, PhysicalKey};
 pub use winit::window::CursorGrabMode;

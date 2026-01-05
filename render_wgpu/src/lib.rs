@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
@@ -36,9 +37,20 @@ impl std::error::Error for RenderInitError {
 
 #[derive(Debug)]
 pub enum ImageError {
-    InvalidDimensions { width: u32, height: u32 },
+    InvalidDimensions {
+        width: u32,
+        height: u32,
+    },
     SizeOverflow,
-    DataSizeMismatch { expected: usize, actual: usize },
+    DataSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    PlaneSizeMismatch {
+        plane: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for ImageError {
@@ -52,6 +64,15 @@ impl fmt::Display for ImageError {
                 f,
                 "image data size mismatch: expected {} bytes, got {}",
                 expected, actual
+            ),
+            ImageError::PlaneSizeMismatch {
+                plane,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "image {} plane size mismatch: expected {} bytes, got {}",
+                plane, expected, actual
             ),
         }
     }
@@ -82,6 +103,61 @@ impl ImageData {
             width,
             height,
             rgba,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct YuvImageData {
+    pub width: u32,
+    pub height: u32,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+impl YuvImageData {
+    pub fn new(
+        width: u32,
+        height: u32,
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+    ) -> Result<Self, ImageError> {
+        if width == 0 || height == 0 {
+            return Err(ImageError::InvalidDimensions { width, height });
+        }
+        let y_expected = plane_len(width, height)?;
+        if y.len() != y_expected {
+            return Err(ImageError::PlaneSizeMismatch {
+                plane: "y",
+                expected: y_expected,
+                actual: y.len(),
+            });
+        }
+        let uv_width = width.div_ceil(2);
+        let uv_height = height.div_ceil(2);
+        let uv_expected = plane_len(uv_width, uv_height)?;
+        if u.len() != uv_expected {
+            return Err(ImageError::PlaneSizeMismatch {
+                plane: "u",
+                expected: uv_expected,
+                actual: u.len(),
+            });
+        }
+        if v.len() != uv_expected {
+            return Err(ImageError::PlaneSizeMismatch {
+                plane: "v",
+                expected: uv_expected,
+                actual: v.len(),
+            });
+        }
+        Ok(Self {
+            width,
+            height,
+            y,
+            u,
+            v,
         })
     }
 }
@@ -150,7 +226,8 @@ pub struct Renderer<'window> {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     clear_color: wgpu::Color,
-    textured_quad: Option<TexturedQuad>,
+    textured_quad: Option<Quad>,
+    yuv_pipeline: Option<Arc<YuvPipeline>>,
     scene: Option<SceneRenderer>,
 }
 
@@ -169,6 +246,14 @@ impl<'window> Renderer<'window> {
 
     pub fn request_redraw(&self) {
         self.window.request_redraw();
+    }
+
+    pub fn set_clear_color_rgba(&mut self, r: f64, g: f64, b: f64, a: f64) {
+        self.clear_color = wgpu::Color { r, g, b, a };
+    }
+
+    pub fn clear_textured_quad(&mut self) {
+        self.textured_quad = None;
     }
 
     pub fn window_inner_size(&self) -> PhysicalSize<u32> {
@@ -271,8 +356,50 @@ impl<'window> Renderer<'window> {
 
     pub fn set_image(&mut self, image: ImageData) -> Result<(), ImageError> {
         let quad = TexturedQuad::new(&self.device, &self.queue, &self.config, &image)?;
-        self.textured_quad = Some(quad);
+        self.textured_quad = Some(Quad::Rgba(quad));
         Ok(())
+    }
+
+    pub fn update_image(&mut self, image: &ImageData) -> Result<(), ImageError> {
+        if let Some(Quad::Rgba(quad)) = &self.textured_quad {
+            quad.update(&self.queue, image)?;
+            return Ok(());
+        }
+        let quad = TexturedQuad::new(&self.device, &self.queue, &self.config, image)?;
+        self.textured_quad = Some(Quad::Rgba(quad));
+        Ok(())
+    }
+
+    pub fn set_yuv_image(&mut self, image: YuvImageData) -> Result<(), ImageError> {
+        let quad = YuvQuad::new(
+            &self.device,
+            &self.queue,
+            &self.config,
+            &image,
+            &mut self.yuv_pipeline,
+        )?;
+        self.textured_quad = Some(Quad::Yuv(quad));
+        Ok(())
+    }
+
+    pub fn update_yuv_image(&mut self, image: &YuvImageData) -> Result<(), ImageError> {
+        if let Some(Quad::Yuv(quad)) = &self.textured_quad {
+            quad.update(&self.queue, image)?;
+            return Ok(());
+        }
+        let quad = YuvQuad::new(
+            &self.device,
+            &self.queue,
+            &self.config,
+            image,
+            &mut self.yuv_pipeline,
+        )?;
+        self.textured_quad = Some(Quad::Yuv(quad));
+        Ok(())
+    }
+
+    pub fn prewarm_yuv_pipeline(&mut self) {
+        let _ = self.ensure_yuv_pipeline();
     }
 
     pub fn set_scene(&mut self, mesh: MeshData) -> Result<(), SceneError> {
@@ -356,17 +483,66 @@ impl<'window> Renderer<'window> {
                 a: 1.0,
             },
             textured_quad: None,
+            yuv_pipeline: None,
             scene: None,
         })
+    }
+
+    fn ensure_yuv_pipeline(&mut self) -> Arc<YuvPipeline> {
+        let needs_new = match self.yuv_pipeline.as_ref() {
+            Some(pipeline) => pipeline.format != self.config.format,
+            None => true,
+        };
+        if needs_new {
+            self.yuv_pipeline = Some(Arc::new(YuvPipeline::new(&self.device, &self.config)));
+        }
+        Arc::clone(self.yuv_pipeline.as_ref().expect("yuv pipeline must exist"))
+    }
+}
+
+enum Quad {
+    Rgba(TexturedQuad),
+    Yuv(YuvQuad),
+}
+
+impl Quad {
+    fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        match self {
+            Quad::Rgba(quad) => quad.draw(pass),
+            Quad::Yuv(quad) => quad.draw(pass),
+        }
     }
 }
 
 struct TexturedQuad {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    texture: wgpu::Texture,
+    width: u32,
+    height: u32,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+}
+
+struct YuvPipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    format: wgpu::TextureFormat,
+}
+
+struct YuvQuad {
+    pipeline: Arc<YuvPipeline>,
+    bind_group: wgpu::BindGroup,
+    texture_y: wgpu::Texture,
+    texture_u: wgpu::Texture,
+    texture_v: wgpu::Texture,
+    width: u32,
+    height: u32,
 }
 
 impl TexturedQuad {
@@ -510,10 +686,23 @@ impl TexturedQuad {
         Ok(Self {
             pipeline,
             bind_group,
+            texture,
+            width: image.width,
+            height: image.height,
             vertex_buffer,
             index_buffer,
             index_count: 6,
         })
+    }
+
+    fn update(&self, queue: &wgpu::Queue, image: &ImageData) -> Result<(), ImageError> {
+        if image.width != self.width || image.height != self.height {
+            return Err(ImageError::InvalidDimensions {
+                width: image.width,
+                height: image.height,
+            });
+        }
+        upload_texture(queue, &self.texture, image)
     }
 
     fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
@@ -522,6 +711,277 @@ impl TexturedQuad {
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+}
+
+impl YuvPipeline {
+    fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+        let shader_source = if config.format.is_srgb() {
+            YUV_QUAD_SHADER_SRGB
+        } else {
+            YUV_QUAD_SHADER
+        };
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pallet.yuv.shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_source)),
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pallet.yuv.sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pallet.yuv.bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let vertex_data = quad_vertex_bytes();
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pallet.yuv.vertex_buffer"),
+            contents: &vertex_data,
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_data = quad_index_bytes();
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pallet.yuv.index_buffer"),
+            contents: &index_data,
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pallet.yuv.pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pallet.yuv.pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                    ],
+                }],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+            sampler,
+            vertex_buffer,
+            index_buffer,
+            index_count: 6,
+            format: config.format,
+        }
+    }
+}
+
+impl YuvQuad {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &wgpu::SurfaceConfiguration,
+        image: &YuvImageData,
+        pipeline_cache: &mut Option<Arc<YuvPipeline>>,
+    ) -> Result<Self, ImageError> {
+        let needs_new = match pipeline_cache.as_ref() {
+            Some(pipeline) => pipeline.format != config.format,
+            None => true,
+        };
+        if needs_new {
+            *pipeline_cache = Some(Arc::new(YuvPipeline::new(device, config)));
+        }
+        let pipeline = pipeline_cache
+            .as_ref()
+            .expect("yuv pipeline must exist")
+            .clone();
+
+        let texture_y = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pallet.yuv.texture_y"),
+            size: wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let uv_width = image.width.div_ceil(2);
+        let uv_height = image.height.div_ceil(2);
+        let texture_u = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pallet.yuv.texture_u"),
+            size: wgpu::Extent3d {
+                width: uv_width,
+                height: uv_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let texture_v = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pallet.yuv.texture_v"),
+            size: wgpu::Extent3d {
+                width: uv_width,
+                height: uv_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let view_y = texture_y.create_view(&wgpu::TextureViewDescriptor::default());
+        let view_u = texture_u.create_view(&wgpu::TextureViewDescriptor::default());
+        let view_v = texture_v.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pallet.yuv.bind_group"),
+            layout: &pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view_y),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view_u),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&view_v),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                },
+            ],
+        });
+
+        upload_plane(queue, &texture_y, image.width, image.height, &image.y)?;
+        upload_plane(queue, &texture_u, uv_width, uv_height, &image.u)?;
+        upload_plane(queue, &texture_v, uv_width, uv_height, &image.v)?;
+
+        Ok(Self {
+            pipeline,
+            bind_group,
+            texture_y,
+            texture_u,
+            texture_v,
+            width: image.width,
+            height: image.height,
+        })
+    }
+
+    fn update(&self, queue: &wgpu::Queue, image: &YuvImageData) -> Result<(), ImageError> {
+        if image.width != self.width || image.height != self.height {
+            return Err(ImageError::InvalidDimensions {
+                width: image.width,
+                height: image.height,
+            });
+        }
+        let uv_width = image.width.div_ceil(2);
+        let uv_height = image.height.div_ceil(2);
+        upload_plane(queue, &self.texture_y, image.width, image.height, &image.y)?;
+        upload_plane(queue, &self.texture_u, uv_width, uv_height, &image.u)?;
+        upload_plane(queue, &self.texture_v, uv_width, uv_height, &image.v)?;
+        Ok(())
+    }
+
+    fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        pass.set_pipeline(&self.pipeline.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.pipeline.vertex_buffer.slice(..));
+        pass.set_index_buffer(
+            self.pipeline.index_buffer.slice(..),
+            wgpu::IndexFormat::Uint16,
+        );
+        pass.draw_indexed(0..self.pipeline.index_count, 0, 0..1);
     }
 }
 
@@ -710,6 +1170,86 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const YUV_QUAD_SHADER: &str = r#"
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_main(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> VertexOut {
+    var out: VertexOut;
+    out.position = vec4<f32>(position, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@group(0) @binding(0)
+var t_y: texture_2d<f32>;
+@group(0) @binding(1)
+var t_u: texture_2d<f32>;
+@group(0) @binding(2)
+var t_v: texture_2d<f32>;
+@group(0) @binding(3)
+var s_tex: sampler;
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    let y = textureSample(t_y, s_tex, in.uv).r;
+    let u = textureSample(t_u, s_tex, in.uv).r - 0.5;
+    let v = textureSample(t_v, s_tex, in.uv).r - 0.5;
+    let y_adj = max(y - (16.0 / 255.0), 0.0) * 1.164;
+    let r = y_adj + 1.596 * v;
+    let g = y_adj - 0.392 * u - 0.813 * v;
+    let b = y_adj + 2.017 * u;
+    return vec4<f32>(clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+const YUV_QUAD_SHADER_SRGB: &str = r#"
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_main(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> VertexOut {
+    var out: VertexOut;
+    out.position = vec4<f32>(position, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@group(0) @binding(0)
+var t_y: texture_2d<f32>;
+@group(0) @binding(1)
+var t_u: texture_2d<f32>;
+@group(0) @binding(2)
+var t_v: texture_2d<f32>;
+@group(0) @binding(3)
+var s_tex: sampler;
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let cutoff = vec3<f32>(0.04045);
+    let low = c / 12.92;
+    let high = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= cutoff);
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    let y = textureSample(t_y, s_tex, in.uv).r;
+    let u = textureSample(t_u, s_tex, in.uv).r - 0.5;
+    let v = textureSample(t_v, s_tex, in.uv).r - 0.5;
+    let y_adj = max(y - (16.0 / 255.0), 0.0) * 1.164;
+    let r = y_adj + 1.596 * v;
+    let g = y_adj - 0.392 * u - 0.813 * v;
+    let b = y_adj + 2.017 * u;
+    let rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(srgb_to_linear(rgb), 1.0);
+}
+"#;
+
 const SCENE_SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
@@ -744,6 +1284,12 @@ fn image_data_len(width: u32, height: u32) -> Result<usize, ImageError> {
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or(ImageError::SizeOverflow)
+}
+
+fn plane_len(width: u32, height: u32) -> Result<usize, ImageError> {
+    let width = usize::try_from(width).map_err(|_| ImageError::SizeOverflow)?;
+    let height = usize::try_from(height).map_err(|_| ImageError::SizeOverflow)?;
+    width.checked_mul(height).ok_or(ImageError::SizeOverflow)
 }
 
 fn quad_vertex_bytes() -> Vec<u8> {
@@ -876,6 +1422,65 @@ fn upload_texture(
         wgpu::Extent3d {
             width: image.width,
             height: image.height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    Ok(())
+}
+
+fn upload_plane(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> Result<(), ImageError> {
+    let row_bytes = usize::try_from(width).map_err(|_| ImageError::SizeOverflow)?;
+    let padded = align_to(row_bytes, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)?;
+    let height = usize::try_from(height).map_err(|_| ImageError::SizeOverflow)?;
+    let expected = row_bytes
+        .checked_mul(height)
+        .ok_or(ImageError::SizeOverflow)?;
+    if data.len() != expected {
+        return Err(ImageError::DataSizeMismatch {
+            expected,
+            actual: data.len(),
+        });
+    }
+    let data = if padded == row_bytes {
+        data.to_vec()
+    } else {
+        let mut padded_data = vec![0u8; padded * height];
+        for row in 0..height {
+            let src_start = row * row_bytes;
+            let src_end = src_start + row_bytes;
+            let dst_start = row * padded;
+            padded_data[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&data[src_start..src_end]);
+        }
+        padded_data
+    };
+
+    let bytes_per_row = u32::try_from(padded).map_err(|_| ImageError::SizeOverflow)?;
+    let rows_per_image = u32::try_from(height).map_err(|_| ImageError::SizeOverflow)?;
+
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &data,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(rows_per_image),
+        },
+        wgpu::Extent3d {
+            width,
+            height: height as u32,
             depth_or_array_layers: 1,
         },
     );

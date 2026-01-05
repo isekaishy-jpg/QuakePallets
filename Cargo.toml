@@ -5,6 +5,7 @@ members = [
   "platform_winit",
   "render_wgpu",
   "audio",
+  "video_theora",
   "script_lua",
   "ecs",
   "engine_core",

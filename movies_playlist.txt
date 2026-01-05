@@ -1,0 +1,5 @@
+# One movie path per line. Relative paths resolve against this file's directory.
+# Lines starting with # or ; are treated as comments.
+C:\Program Files (x86)\Steam\steamapps\common\Quake\rerelease\movies\NightDive.ogv
+C:\Program Files (x86)\Steam\steamapps\common\Quake\rerelease\movies\Kex.ogv
+

@@ -28,7 +28,7 @@ include = [
 [lib]
 name = "miniaudio_sys"
 path = "src/lib.rs"
-crate_type = ["lib"]
+crate-type = ["lib"] # NOTE: keep in sync with upstream if this vendored copy is refreshed.
 test = false
 doctest = false
 
