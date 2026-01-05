@@ -89,6 +89,71 @@ impl ExitError {
     }
 }
 
+fn enter_map_scene(
+    renderer: &mut render_wgpu::Renderer,
+    window: &Window,
+    quake_dir: &Path,
+    map: &str,
+    audio: Option<&Rc<AudioEngine>>,
+    camera: &mut CameraState,
+    collision: &mut Option<SceneCollision>,
+    scene_active: &mut bool,
+    mouse_look: &mut bool,
+    mouse_grabbed: &mut bool,
+    loopback: &mut Option<LoopbackNet>,
+) -> Result<(), ExitError> {
+    let (mesh, bounds, scene_collision, spawn) = load_bsp_scene(quake_dir, map)?;
+
+    renderer.clear_textured_quad();
+    renderer
+        .set_scene(mesh)
+        .map_err(|err| ExitError::new(EXIT_SCENE, format!("scene upload failed: {}", err)))?;
+
+    *collision = Some(scene_collision);
+    *camera = CameraState::from_bounds(&bounds, collision.as_ref());
+    if let Some(spawn) = spawn {
+        let base = quake_to_render(spawn.origin);
+        camera.position = camera.camera_from_origin(base);
+        if let Some(angle) = spawn.angle {
+            camera.yaw = (90.0 - angle).to_radians();
+            camera.pitch = 0.0;
+        }
+        // Test-only spawn from BSP entities; M8 Lua spawning will replace this path.
+        if let Some(scene) = collision.as_ref() {
+            camera.snap_to_floor(scene);
+        }
+    }
+    *scene_active = true;
+    *mouse_look = false;
+    *mouse_grabbed = set_cursor_mode(window, *mouse_look);
+    let aspect = aspect_ratio(renderer.size());
+    renderer.update_camera(camera.view_proj(aspect));
+
+    *loopback = match LoopbackNet::start() {
+        Ok(net) => Some(net),
+        Err(err) => {
+            eprintln!("loopback init failed: {}", err);
+            None
+        }
+    };
+
+    if let Some(audio) = audio {
+        match load_music_track(quake_dir) {
+            Ok(Some(track)) => {
+                if let Err(err) = audio.play_music(track.data) {
+                    eprintln!("{}", err);
+                } else {
+                    println!("streaming {}", track.name);
+                }
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("{}", err.message),
+        }
+    }
+
+    Ok(())
+}
+
 struct MusicTrack {
     name: String,
     data: Vec<u8>,
@@ -1141,6 +1206,7 @@ fn main() {
     let mut mouse_look = false;
     let mut mouse_grabbed = false;
     let mut ignore_cursor_move = false;
+    let mut pending_map: Option<(PathBuf, String)> = None;
 
     if let Some(asset) = args.show_image.as_deref() {
         let quake_dir = match args.quake_dir.as_ref() {
@@ -1175,60 +1241,23 @@ fn main() {
                 std::process::exit(EXIT_USAGE);
             }
         };
-
-        let (mesh, bounds, scene_collision, spawn) = match load_bsp_scene(quake_dir, map) {
-            Ok(result) => result,
-            Err(err) => {
-                eprintln!("{}", err.message);
-                std::process::exit(err.code);
-            }
-        };
-
-        if let Err(err) = renderer.set_scene(mesh) {
-            eprintln!("scene upload failed: {}", err);
-            std::process::exit(EXIT_SCENE);
-        }
-
-        collision = Some(scene_collision);
-        camera = CameraState::from_bounds(&bounds, collision.as_ref());
-        if let Some(spawn) = spawn {
-            let base = quake_to_render(spawn.origin);
-            camera.position = camera.camera_from_origin(base);
-            if let Some(angle) = spawn.angle {
-                camera.yaw = (90.0 - angle).to_radians();
-                camera.pitch = 0.0;
-            }
-            // Test-only spawn from BSP entities; M8 Lua spawning will replace this path.
-            if let Some(scene) = collision.as_ref() {
-                camera.snap_to_floor(scene);
-            }
-        }
-        scene_active = true;
-        mouse_look = false;
-        mouse_grabbed = set_cursor_mode(window, mouse_look);
-        let aspect = aspect_ratio(renderer.size());
-        renderer.update_camera(camera.view_proj(aspect));
-
-        loopback = match LoopbackNet::start() {
-            Ok(net) => Some(net),
-            Err(err) => {
-                eprintln!("loopback init failed: {}", err);
-                None
-            }
-        };
-
-        if let (Some(audio), Some(quake_dir)) = (audio.as_ref(), args.quake_dir.as_ref()) {
-            match load_music_track(quake_dir) {
-                Ok(Some(track)) => {
-                    if let Err(err) = audio.play_music(track.data) {
-                        eprintln!("{}", err);
-                    } else {
-                        println!("streaming {}", track.name);
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => eprintln!("{}", err.message),
-            }
+        if video.is_some() {
+            pending_map = Some((quake_dir.to_path_buf(), map.to_string()));
+        } else if let Err(err) = enter_map_scene(
+            &mut renderer,
+            window,
+            quake_dir,
+            map,
+            audio.as_ref(),
+            &mut camera,
+            &mut collision,
+            &mut scene_active,
+            &mut mouse_look,
+            &mut mouse_grabbed,
+            &mut loopback,
+        ) {
+            eprintln!("{}", err.message);
+            std::process::exit(err.code);
         }
     }
 
@@ -1259,6 +1288,30 @@ fn main() {
                                 true,
                             );
                             if !advanced {
+                                if let Some((quake_dir, map)) = pending_map.take() {
+                                    if let Err(err) = enter_map_scene(
+                                        &mut renderer,
+                                        window,
+                                        &quake_dir,
+                                        &map,
+                                        audio.as_ref(),
+                                        &mut camera,
+                                        &mut collision,
+                                        &mut scene_active,
+                                        &mut mouse_look,
+                                        &mut mouse_grabbed,
+                                        &mut loopback,
+                                    ) {
+                                        eprintln!("{}", err.message);
+                                        elwt.exit();
+                                    }
+                                    video_hold_until = None;
+                                    next_video_entry = None;
+                                    next_video_start_at = None;
+                                    next_video_created_at = None;
+                                    video_start_delay_until = None;
+                                    return;
+                                }
                                 elwt.exit();
                             }
                             video_hold_until = None;
@@ -1704,6 +1757,30 @@ fn main() {
                             true,
                         );
                         if !advanced {
+                            if let Some((quake_dir, map)) = pending_map.take() {
+                                if let Err(err) = enter_map_scene(
+                                    &mut renderer,
+                                    window,
+                                    &quake_dir,
+                                    &map,
+                                    audio.as_ref(),
+                                    &mut camera,
+                                    &mut collision,
+                                    &mut scene_active,
+                                    &mut mouse_look,
+                                    &mut mouse_grabbed,
+                                    &mut loopback,
+                                ) {
+                                    eprintln!("{}", err.message);
+                                    elwt.exit();
+                                }
+                                video_hold_until = None;
+                                next_video_entry = None;
+                                next_video_start_at = None;
+                                next_video_created_at = None;
+                                video_start_delay_until = None;
+                                return;
+                            }
                             elwt.exit();
                         }
                         video_hold_until = None;
@@ -1852,14 +1929,14 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
             "--play-movie cannot be used with --playlist".into(),
         ));
     }
-    if play_movie.is_some() && (show_image.is_some() || map.is_some()) {
+    if play_movie.is_some() && show_image.is_some() {
         return Err(ArgParseError::Message(
-            "--play-movie cannot be used with --show-image or --map".into(),
+            "--play-movie cannot be used with --show-image".into(),
         ));
     }
-    if playlist.is_some() && (show_image.is_some() || map.is_some()) {
+    if playlist.is_some() && show_image.is_some() {
         return Err(ArgParseError::Message(
-            "--playlist cannot be used with --show-image or --map".into(),
+            "--playlist cannot be used with --show-image".into(),
         ));
     }
 

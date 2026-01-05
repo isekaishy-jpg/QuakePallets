@@ -235,9 +235,9 @@ Note: Renet integration is deferred to a later networking checklist to reduce fr
 
 # First big test (overall acceptance)
 Given a user path to a legally acquired Quake install:
-- [ ] Mount `id1/pak0.pak` (and additional paks if present)
-- [ ] Load and render a BSP map
-- [ ] Walk/fly with collision
+- [x] Mount `id1/pak0.pak` (and additional paks if present)
+- [x] Load and render a BSP map
+- [x] Walk/fly with collision
 - [x] Play WAV SFX and stream OGG music if present
 - [ ] Works in:
   - single-process loopback client/server
