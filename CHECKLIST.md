@@ -239,7 +239,7 @@ Given a user path to a legally acquired Quake install:
 - [x] Load and render a BSP map
 - [x] Walk/fly with collision
 - [x] Play WAV SFX and stream OGG music if present
-- [ ] Works in:
+- [x] Works in:
   - single-process loopback client/server
   - dedicated server + network client
 
