@@ -48,7 +48,7 @@ const EXIT_SCENE: i32 = 14;
 const DEFAULT_SFX: &str = "sound/misc/menu1.wav";
 const HUD_FONT_SIZE: f32 = 16.0;
 const HUD_FONT_SIZE_SMALL: f32 = 14.0;
-const CONSOLE_FONT_SIZE: f32 = 11.0;
+const CONSOLE_FONT_SIZE: f32 = 14.0;
 const HUD_TEXT_COLOR: [f32; 4] = [0.9, 0.95, 1.0, 1.0];
 const CONSOLE_TEXT_COLOR: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
 const CONSOLE_BG_COLOR: [f32; 4] = [0.05, 0.05, 0.08, 0.75];
@@ -2511,8 +2511,8 @@ fn main() {
                     let font_scale = (resolution.dpi_scale * settings.ui_scale).max(0.1);
                     let pre_video_blackout = video.is_some() && !video_frame_visible;
                     if !pre_video_blackout && scene_active && !ui_state.menu_open {
-                        let hud_font_px = HUD_FONT_SIZE * font_scale;
-                        let hud_small_px = HUD_FONT_SIZE_SMALL * font_scale;
+                        let hud_font_px = (HUD_FONT_SIZE * font_scale).round().max(1.0);
+                        let hud_small_px = (HUD_FONT_SIZE_SMALL * font_scale).round().max(1.0);
                         let hud_style = TextStyle {
                             font_size: hud_font_px,
                             color: HUD_TEXT_COLOR,
@@ -2528,16 +2528,19 @@ fn main() {
                             "fps: {:>4.0}\nsim: {:>4.0} hz\nnet: {:>4.0} hz",
                             fps, sim_rate, net_rate
                         );
-                        let hud_margin = 16.0 * font_scale;
-                        let hud_line_height = hud_font_px * LINE_HEIGHT_SCALE;
-                        let build_line_height = hud_small_px * LINE_HEIGHT_SCALE;
+                        let hud_margin = (16.0 * font_scale).round().max(1.0);
+                        let hud_line_height =
+                            (hud_font_px * LINE_HEIGHT_SCALE).round().max(1.0);
+                        let build_line_height =
+                            (hud_small_px * LINE_HEIGHT_SCALE).round().max(1.0);
                         let hud_total_height = hud_line_height * 3.0 + build_line_height;
                         let hud_origin = TextPosition {
                             x: hud_margin,
                             y: (resolution.physical_px[1] as f32
                                 - hud_margin
                                 - hud_total_height)
-                                .max(hud_margin),
+                                .max(hud_margin)
+                                .round(),
                         };
                         text_overlay.queue(
                             TextLayer::Hud,
@@ -2566,12 +2569,13 @@ fn main() {
                     }
 
                     if !pre_video_blackout && console.is_visible() {
-                        let console_font_px = CONSOLE_FONT_SIZE * font_scale;
+                        let console_font_px = (CONSOLE_FONT_SIZE * font_scale).round().max(1.0);
                         let console_width = resolution.physical_px[0] as f32;
                         let full_height = (resolution.physical_px[1] as f32
                             * CONSOLE_HEIGHT_RATIO)
                             .max(console_font_px * 2.0);
-                        let console_height = (full_height * console.height_ratio()).max(1.0);
+                        let console_height =
+                            (full_height * console.height_ratio()).max(1.0).round();
                         text_overlay.queue_rect(
                             TextLayer::Console,
                             TextPosition { x: 0.0, y: 0.0 },
@@ -2581,24 +2585,28 @@ fn main() {
                             },
                             CONSOLE_BG_COLOR,
                         );
-                        let padding = CONSOLE_PADDING * font_scale;
-                        let input_padding = CONSOLE_INPUT_PADDING * font_scale;
-                        let text_left = (padding * 0.25).max(1.0);
-                        let text_width = (console_width - text_left - padding).max(1.0);
+                        let padding = (CONSOLE_PADDING * font_scale).round().max(1.0);
+                        let input_padding =
+                            (CONSOLE_INPUT_PADDING * font_scale).round().max(0.0);
+                        let text_left = (padding * 0.25).round().max(1.0);
+                        let text_width =
+                            (console_width - text_left - padding).max(1.0).round();
                         let text_height = (console_height - padding * 2.0).max(0.0);
                         if text_height > 0.0 {
                             let console_style = TextStyle {
                                 font_size: console_font_px,
                                 color: CONSOLE_TEXT_COLOR,
                             };
-                            let line_height = console_font_px * LINE_HEIGHT_SCALE;
+                            let line_height =
+                                (console_font_px * LINE_HEIGHT_SCALE).round().max(1.0);
                             let log_y = padding;
                             let input_y =
-                                (console_height - input_padding - line_height).max(log_y);
-                            let separator_thickness = font_scale.max(1.0);
-                            let separator_gap = 0.25 * font_scale;
+                                (console_height - input_padding - line_height).max(log_y).round();
+                            let separator_thickness = font_scale.round().max(1.0);
+                            let separator_gap = (0.25 * font_scale).round().max(0.0);
                             let separator_y = (input_y - separator_gap - separator_thickness)
-                                .max(log_y);
+                                .max(log_y)
+                                .round();
                             if console_height > input_y + line_height {
                                 let input_box_top =
                                     (separator_y + separator_thickness).min(console_height);
@@ -2656,14 +2664,19 @@ fn main() {
                                     .log
                                     .len()
                                     .saturating_sub(max_lines + console.scroll_offset);
-                                let visible = console
+                                let mut visible = String::new();
+                                for (index, line) in console
                                     .log
                                     .iter()
                                     .skip(start)
                                     .take(max_lines)
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
+                                    .enumerate()
+                                {
+                                    if index > 0 {
+                                        visible.push('\n');
+                                    }
+                                    visible.push_str(line);
+                                }
                                 if !visible.is_empty() {
                                     text_overlay.queue(
                                         TextLayer::Console,
