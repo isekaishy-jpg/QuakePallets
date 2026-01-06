@@ -14,10 +14,12 @@ use engine_core::vfs::{Vfs, VfsError};
 use net_transport::{LoopbackTransport, Transport, TransportConfig};
 use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Fullscreen, Ime,
-    KeyCode, MouseButton, PhysicalKey, PhysicalPosition, PhysicalSize, Window, WindowEvent,
+    KeyCode, MouseButton, MouseScrollDelta, PhysicalKey, PhysicalPosition, PhysicalSize, Window,
+    WindowEvent,
 };
 use render_wgpu::{
-    ImageData, MeshData, MeshVertex, RenderError, TextOverlay, TextViewport, YuvImageView,
+    ImageData, MeshData, MeshVertex, RenderError, TextBounds, TextLayer, TextOverlay, TextPosition,
+    TextStyle, TextViewport, YuvImageView,
 };
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
@@ -44,6 +46,23 @@ const EXIT_IMAGE: i32 = 12;
 const EXIT_BSP: i32 = 13;
 const EXIT_SCENE: i32 = 14;
 const DEFAULT_SFX: &str = "sound/misc/menu1.wav";
+const HUD_FONT_SIZE: f32 = 16.0;
+const HUD_FONT_SIZE_SMALL: f32 = 14.0;
+const CONSOLE_FONT_SIZE: f32 = 11.0;
+const HUD_TEXT_COLOR: [f32; 4] = [0.9, 0.95, 1.0, 1.0];
+const CONSOLE_TEXT_COLOR: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
+const CONSOLE_BG_COLOR: [f32; 4] = [0.05, 0.05, 0.08, 0.75];
+const CONSOLE_SEPARATOR_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.9];
+const CONSOLE_HEIGHT_RATIO: f32 = 0.45;
+const CONSOLE_PADDING: f32 = 6.0;
+const CONSOLE_INPUT_PADDING: f32 = 0.5;
+const CONSOLE_INPUT_BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+const CONSOLE_SLIDE_MS: u64 = 500;
+const BOOT_FULLSCREEN_STARTUP_MS: u64 = 300;
+const BOOT_FULLSCREEN_SETTLE_MS: u64 = 120;
+const BOOT_PRESENT_WARMUP: usize = 2;
+const CONSOLE_CARET_BLINK_MS: u64 = 500;
+const LINE_HEIGHT_SCALE: f32 = 1.2;
 
 const CAMERA_UP: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 const CAMERA_FOV_Y: f32 = 70.0f32.to_radians();
@@ -67,6 +86,81 @@ const OPENGL_TO_WGPU: [[f32; 4]; 4] = [
     [0.0, 0.0, 0.5, 0.0],
     [0.0, 0.0, 0.5, 1.0],
 ];
+
+/// Controls startup visibility to avoid compositor flashes.
+/// Fullscreen modes warm up hidden presents before showing the window.
+enum BootState {
+    Visible,
+    Hidden {
+        settle_deadline: Instant,
+        presents_left: usize,
+    },
+}
+
+impl BootState {
+    fn new(window_mode: WindowMode, now: Instant) -> Self {
+        match window_mode {
+            WindowMode::Windowed => BootState::Visible,
+            WindowMode::Borderless | WindowMode::Fullscreen => BootState::Hidden {
+                settle_deadline: now + Duration::from_millis(BOOT_FULLSCREEN_STARTUP_MS),
+                presents_left: BOOT_PRESENT_WARMUP,
+            },
+        }
+    }
+
+    fn is_hidden(&self) -> bool {
+        matches!(self, BootState::Hidden { .. })
+    }
+
+    fn on_resize(&mut self, now: Instant) {
+        if let BootState::Hidden {
+            settle_deadline,
+            presents_left,
+        } = self
+        {
+            *settle_deadline = now + Duration::from_millis(BOOT_FULLSCREEN_SETTLE_MS);
+            *presents_left = BOOT_PRESENT_WARMUP;
+        }
+    }
+
+    fn on_initial_render(&self, window: &Window) {
+        if matches!(self, BootState::Visible) {
+            window.set_visible(true);
+        }
+    }
+
+    /// Returns true when the hidden warmup completes and the window becomes visible.
+    fn on_present(&mut self, now: Instant, window: &Window) -> bool {
+        if let BootState::Hidden {
+            settle_deadline,
+            presents_left,
+        } = self
+        {
+            if now < *settle_deadline {
+                return false;
+            }
+            if *presents_left > 0 {
+                *presents_left = presents_left.saturating_sub(1);
+            }
+            if *presents_left == 0 {
+                window.set_visible(true);
+                *self = BootState::Visible;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn needs_warmup(&self, now: Instant) -> bool {
+        match self {
+            BootState::Hidden {
+                settle_deadline,
+                presents_left,
+            } => now >= *settle_deadline && *presents_left > 0,
+            BootState::Visible => false,
+        }
+    }
+}
 
 struct CliArgs {
     quake_dir: Option<PathBuf>,
@@ -178,10 +272,177 @@ struct InputState {
     down: bool,
 }
 
-#[derive(Default)]
 struct ConsoleState {
-    active: bool,
+    phase: ConsolePhase,
+    progress: f32,
+    anim_started: Instant,
+    anim_from: f32,
+    anim_to: f32,
+    scroll_offset: usize,
+    visible_lines: usize,
+    caret_epoch: Instant,
     buffer: String,
+    log: VecDeque<String>,
+    max_lines: usize,
+}
+
+impl Default for ConsoleState {
+    fn default() -> Self {
+        Self {
+            phase: ConsolePhase::Closed,
+            progress: 0.0,
+            anim_started: Instant::now(),
+            anim_from: 0.0,
+            anim_to: 0.0,
+            scroll_offset: 0,
+            visible_lines: 0,
+            caret_epoch: Instant::now(),
+            buffer: String::new(),
+            log: VecDeque::new(),
+            max_lines: 256,
+        }
+    }
+}
+
+impl ConsoleState {
+    fn update(&mut self, now: Instant) {
+        match self.phase {
+            ConsolePhase::Opening | ConsolePhase::Closing => {
+                let duration = Duration::from_millis(CONSOLE_SLIDE_MS).as_secs_f32();
+                let elapsed = (now - self.anim_started).as_secs_f32();
+                let t = (elapsed / duration).clamp(0.0, 1.0);
+                let eased = t * t * (3.0 - 2.0 * t);
+                self.progress = self.anim_from + (self.anim_to - self.anim_from) * eased;
+                if t >= 1.0 {
+                    self.progress = self.anim_to;
+                    self.phase = if self.progress >= 1.0 {
+                        ConsolePhase::Open
+                    } else {
+                        ConsolePhase::Closed
+                    };
+                }
+            }
+            ConsolePhase::Closed => {
+                self.progress = 0.0;
+            }
+            ConsolePhase::Open => {
+                self.progress = 1.0;
+            }
+        }
+    }
+
+    fn open(&mut self, now: Instant) {
+        if self.phase == ConsolePhase::Open {
+            return;
+        }
+        self.anim_from = self.progress;
+        self.anim_to = 1.0;
+        self.anim_started = now;
+        self.phase = ConsolePhase::Opening;
+        self.scroll_offset = 0;
+    }
+
+    fn close(&mut self, now: Instant) {
+        if self.phase == ConsolePhase::Closed {
+            return;
+        }
+        self.anim_from = self.progress;
+        self.anim_to = 0.0;
+        self.anim_started = now;
+        self.phase = ConsolePhase::Closing;
+        self.scroll_offset = 0;
+    }
+
+    fn force_closed(&mut self) {
+        self.phase = ConsolePhase::Closed;
+        self.progress = 0.0;
+        self.anim_from = 0.0;
+        self.anim_to = 0.0;
+        self.scroll_offset = 0;
+    }
+
+    fn is_blocking(&self) -> bool {
+        self.phase != ConsolePhase::Closed
+    }
+
+    fn is_visible(&self) -> bool {
+        self.progress > 0.0
+    }
+
+    fn is_interactive(&self) -> bool {
+        self.phase == ConsolePhase::Open
+    }
+
+    fn is_opening(&self) -> bool {
+        self.phase == ConsolePhase::Opening
+    }
+
+    fn height_ratio(&self) -> f32 {
+        self.progress
+    }
+
+    fn caret_visible(&self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.caret_epoch);
+        (elapsed.as_millis() / CONSOLE_CARET_BLINK_MS as u128).is_multiple_of(2)
+    }
+
+    fn scroll_by(&mut self, lines: i32) {
+        if lines > 0 {
+            self.scroll_offset = self.scroll_offset.saturating_add(lines as usize);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub((-lines) as usize);
+        }
+    }
+
+    fn push_line(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if line.is_empty() {
+            return;
+        }
+        self.log.push_back(line);
+        if self.scroll_offset > 0 {
+            self.scroll_offset = self.scroll_offset.saturating_add(1);
+        }
+        while self.log.len() > self.max_lines {
+            self.log.pop_front();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsolePhase {
+    Closed,
+    Opening,
+    Open,
+    Closing,
+}
+
+struct HudState {
+    frame_count: u32,
+    last_sample: Instant,
+    fps: f32,
+}
+
+impl HudState {
+    fn new(now: Instant) -> Self {
+        Self {
+            frame_count: 0,
+            last_sample: now,
+            fps: 0.0,
+        }
+    }
+
+    fn update(&mut self, now: Instant) -> f32 {
+        self.frame_count = self.frame_count.saturating_add(1);
+        let elapsed = now.saturating_duration_since(self.last_sample);
+        if elapsed >= Duration::from_millis(500) {
+            let secs = elapsed.as_secs_f32().max(0.001);
+            self.fps = self.frame_count as f32 / secs;
+            self.frame_count = 0;
+            self.last_sample = now;
+        }
+        self.fps
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,22 +452,15 @@ enum InputLayer {
     Game,
 }
 
-struct InputRouter {
-    ui_wants_keyboard: bool,
-    ui_wants_pointer: bool,
-}
+struct InputRouter;
 
 impl InputRouter {
     fn new() -> Self {
-        Self {
-            ui_wants_keyboard: false,
-            ui_wants_pointer: false,
-        }
+        Self
     }
 
-    fn update_ui_focus(&mut self, wants_keyboard: bool, wants_pointer: bool) {
-        self.ui_wants_keyboard = wants_keyboard;
-        self.ui_wants_pointer = wants_pointer;
+    fn update_ui_focus(&mut self, _wants_keyboard: bool, _wants_pointer: bool) {
+        // Console toggle is always allowed when videos are not playing.
     }
 
     fn active_layer(&self, console_open: bool, menu_open: bool) -> InputLayer {
@@ -219,8 +473,8 @@ impl InputRouter {
         }
     }
 
-    fn allow_console_toggle(&self, menu_open: bool) -> bool {
-        !(menu_open && self.ui_wants_keyboard)
+    fn allow_console_toggle(&self, _menu_open: bool) -> bool {
+        true
     }
 }
 
@@ -1133,6 +1387,16 @@ fn main() {
     };
 
     let mut settings = Settings::load();
+    let mut last_window_mode = settings.window_mode;
+    let mut last_resolution = settings.resolution;
+    let mut pending_video_prewarm = args.play_movie.is_some() || args.playlist.is_some();
+    let mut boot_settings = settings.clone();
+    let mut boot_apply_fullscreen = false;
+    if settings.window_mode == WindowMode::Fullscreen {
+        boot_settings.window_mode = WindowMode::Borderless;
+        boot_apply_fullscreen = true;
+    }
+    let mut boot = BootState::new(boot_settings.window_mode, Instant::now());
     let (event_loop, window) =
         match create_window("Pallet", settings.resolution[0], settings.resolution[1]) {
             Ok(result) => result,
@@ -1142,7 +1406,7 @@ fn main() {
             }
         };
     let window: &'static Window = Box::leak(Box::new(window));
-    apply_window_settings(window, &settings);
+    apply_window_settings(window, &boot_settings);
 
     let mut renderer = match render_wgpu::Renderer::new(window) {
         Ok(renderer) => renderer,
@@ -1152,9 +1416,31 @@ fn main() {
         }
     };
     renderer.resize(renderer.window_inner_size());
-    if args.play_movie.is_some() || args.playlist.is_some() {
+    let mut pending_resize_clear = pending_video_prewarm || boot.is_hidden();
+    if pending_video_prewarm {
         renderer.set_clear_color_rgba(0.0, 0.0, 0.0, 1.0);
-        renderer.prewarm_yuv_pipeline();
+    }
+    let mut initial_render_ok = false;
+    match renderer.render() {
+        Ok(()) => {
+            initial_render_ok = true;
+        }
+        Err(RenderError::Lost | RenderError::Outdated) => {
+            renderer.resize(renderer.size());
+            if renderer.render().is_ok() {
+                initial_render_ok = true;
+            }
+        }
+        Err(RenderError::OutOfMemory) => {
+            eprintln!("render error: out of memory");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("render error: {}", err);
+        }
+    }
+    if initial_render_ok {
+        boot.on_initial_render(window);
     }
     let main_window_id = renderer.window_id();
 
@@ -1182,6 +1468,7 @@ fn main() {
     let mut current_video_entry: Option<PlaylistEntry> = None;
     let mut next_video_start_at: Option<Instant> = None;
     let mut next_video_created_at: Option<Instant> = None;
+    let mut video_frame_visible = false;
     let mut video_start_delay_until: Option<Instant> = None;
     let mut video_hold_until: Option<Instant> = None;
     let video_debug = std::env::var_os("CRUSTQUAKE_VIDEO_DEBUG").is_some();
@@ -1236,6 +1523,7 @@ fn main() {
                 VIDEO_PLAYBACK_WARM_MS,
                 true,
             ));
+            video_frame_visible = false;
         }
         next_video_entry = playlist_entries.pop_front();
         if video.is_some() {
@@ -1246,6 +1534,7 @@ fn main() {
                     Some(Instant::now() + Duration::from_millis(VIDEO_PREDECODE_START_DELAY_MS));
             }
             renderer.clear_textured_quad();
+            video_frame_visible = false;
         }
     }
 
@@ -1286,7 +1575,12 @@ fn main() {
     let mut input_router = InputRouter::new();
     let mut ui_facade = UiFacade::new(window, renderer.device(), renderer.surface_format());
     let mut ui_state = UiState::default();
-    let mut text_overlay = TextOverlay::new();
+    let mut text_overlay = TextOverlay::new(
+        renderer.device(),
+        renderer.queue(),
+        renderer.surface_format(),
+    );
+    let mut hud = HudState::new(Instant::now());
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
     let mut fly_mode = false;
@@ -1352,16 +1646,58 @@ fn main() {
         elwt.set_control_flow(ControlFlow::Poll);
         match event {
             Event::WindowEvent { event, window_id } if window_id == main_window_id => {
-                let _ = if ui_state.menu_open && !console.active {
+                let _ = if ui_state.menu_open && !console.is_blocking() {
                     ui_facade.handle_window_event(&event)
                 } else {
                     false
                 };
                 match event {
                 WindowEvent::CloseRequested => elwt.exit(),
-                WindowEvent::Resized(size) => renderer.resize(size),
+                WindowEvent::Resized(size) => {
+                    renderer.resize(size);
+                    boot.on_resize(Instant::now());
+                    if boot.is_hidden() {
+                        pending_resize_clear = true;
+                    }
+                    if pending_resize_clear {
+                        match renderer.render() {
+                            Ok(()) => {}
+                            Err(RenderError::Lost | RenderError::Outdated) => {
+                                renderer.resize(renderer.size());
+                            }
+                            Err(RenderError::OutOfMemory) => {
+                                eprintln!("render error: out of memory");
+                                elwt.exit();
+                            }
+                            Err(err) => {
+                                eprintln!("render error: {}", err);
+                            }
+                        }
+                        pending_resize_clear = false;
+                    }
+                }
                 WindowEvent::ScaleFactorChanged { .. } => {
                     renderer.resize(renderer.window_inner_size());
+                    boot.on_resize(Instant::now());
+                    if boot.is_hidden() {
+                        pending_resize_clear = true;
+                    }
+                    if pending_resize_clear {
+                        match renderer.render() {
+                            Ok(()) => {}
+                            Err(RenderError::Lost | RenderError::Outdated) => {
+                                renderer.resize(renderer.size());
+                            }
+                            Err(RenderError::OutOfMemory) => {
+                                eprintln!("render error: out of memory");
+                                elwt.exit();
+                            }
+                            Err(err) => {
+                                eprintln!("render error: {}", err);
+                            }
+                        }
+                        pending_resize_clear = false;
+                    }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
@@ -1387,6 +1723,7 @@ fn main() {
                                 video = None;
                                 ui_state.open_title();
                                 renderer.clear_textured_quad();
+                                video_frame_visible = false;
                                 return;
                             }
                             video_hold_until = None;
@@ -1400,6 +1737,7 @@ fn main() {
                                 ));
                             next_video_created_at = None;
                             renderer.clear_textured_quad();
+                            video_frame_visible = false;
                             if video_debug {
                                 last_underrun_frames = audio
                                     .as_ref()
@@ -1423,6 +1761,7 @@ fn main() {
                             }
                             return;
                         }
+                        let video_active = video.is_some();
                         let _ = handle_non_video_key_input(
                             code,
                             pressed,
@@ -1442,17 +1781,40 @@ fn main() {
                             audio.as_ref(),
                             sfx_data.as_ref(),
                             &mut script,
+                            video_active,
                         );
+                        if pressed
+                            && input_router.active_layer(console.is_blocking(), ui_state.menu_open)
+                                == InputLayer::Console
+                            && !video_active
+                            && console.is_interactive()
+                        {
+                            if let Some(text) = event.text.as_deref() {
+                                if !matches!(
+                                    code,
+                                    KeyCode::Backquote
+                                        | KeyCode::Escape
+                                        | KeyCode::Enter
+                                        | KeyCode::NumpadEnter
+                                ) {
+                                    for ch in text.chars() {
+                                        if !ch.is_control() {
+                                            console.buffer.push(ch);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 WindowEvent::Ime(Ime::Commit(text)) => {
-                    if console.active {
+                    if console.is_interactive() && video.is_none() {
                         console.buffer.push_str(&text);
                     }
                 }
                 WindowEvent::Ime(_) => {}
                 WindowEvent::MouseInput { state, button, .. } => {
-                    if input_router.active_layer(console.active, ui_state.menu_open)
+                    if input_router.active_layer(console.is_blocking(), ui_state.menu_open)
                         == InputLayer::Game
                         && button == MouseButton::Right
                         && state == ElementState::Pressed
@@ -1464,8 +1826,19 @@ fn main() {
                         }
                     }
                 }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    if console.is_interactive() {
+                        let lines = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                            MouseScrollDelta::PixelDelta(pos) => (pos.y / 30.0).round() as i32,
+                        };
+                        if lines != 0 {
+                            console.scroll_by(lines);
+                        }
+                    }
+                }
                 WindowEvent::CursorMoved { position, .. } => {
-                    if input_router.active_layer(console.active, ui_state.menu_open)
+                    if input_router.active_layer(console.is_blocking(), ui_state.menu_open)
                         == InputLayer::Game
                         && scene_active
                         && mouse_look
@@ -1487,14 +1860,26 @@ fn main() {
                 WindowEvent::Focused(false) => {
                     mouse_look = false;
                     mouse_grabbed = set_cursor_mode(window, mouse_look);
-                    if console.active {
+                    if console.is_blocking() {
                         close_console(&mut console, &mut ui_state, window);
                     }
                 }
                 WindowEvent::RedrawRequested => {
                     let now = Instant::now();
+                    if pending_video_prewarm {
+                        renderer.prewarm_yuv_pipeline();
+                        pending_video_prewarm = false;
+                    }
                     let dt = (now - last_frame).as_secs_f32().min(0.1);
                     last_frame = now;
+                    if video.is_some() && console.is_blocking() {
+                        console.force_closed();
+                        console.buffer.clear();
+                        ui_state.console_open = false;
+                        window.set_ime_allowed(false);
+                    }
+                    console.update(now);
+                    window.set_ime_allowed(console.is_interactive());
                     let mut finish_input_script = false;
                     if let Some(scripted) = input_script.as_mut() {
                         if scripted.ready(now) {
@@ -1569,6 +1954,7 @@ fn main() {
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
                                         &mut script,
+                                        video.is_some(),
                                     );
                                     println!("input script: open menu");
                                     scripted.advance(now);
@@ -1611,6 +1997,7 @@ fn main() {
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
                                         &mut script,
+                                        video.is_some(),
                                     );
                                     println!("input script: close menu");
                                     scripted.advance(now);
@@ -1635,12 +2022,13 @@ fn main() {
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
                                         &mut script,
+                                        video.is_some(),
                                     );
                                     println!("input script: open console");
                                     scripted.advance(now);
                                 }
                                 5 => {
-                                    if console.active {
+                                    if console.is_interactive() {
                                         console.buffer.push_str("status");
                                         println!("input script: type command");
                                         scripted.advance(now);
@@ -1666,6 +2054,7 @@ fn main() {
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
                                         &mut script,
+                                        video.is_some(),
                                     );
                                     println!("input script: submit command");
                                     scripted.advance(now);
@@ -1690,6 +2079,7 @@ fn main() {
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
                                         &mut script,
+                                        video.is_some(),
                                     );
                                     println!("input script: close console");
                                     scripted.advance(now);
@@ -1735,7 +2125,7 @@ fn main() {
                         audio_available: audio.is_some(),
                     };
                     let mut ui_ctx = ui_facade.begin_frame(frame_input);
-                    ui_state.console_open = console.active;
+                    ui_state.console_open = console.is_blocking();
                     ui_facade.build_ui(&mut ui_ctx, &mut ui_state, &mut settings);
                     let ui_draw = ui_facade.end_frame(ui_ctx);
                     input_router.update_ui_focus(
@@ -1753,6 +2143,14 @@ fn main() {
                     if ui_draw.output.display_settings_changed {
                         apply_window_settings(window, &settings);
                         renderer.resize(renderer.window_inner_size());
+                        if settings.window_mode != last_window_mode
+                            || settings.resolution != last_resolution
+                        {
+                            window.set_visible(true);
+                            pending_resize_clear = true;
+                            last_window_mode = settings.window_mode;
+                            last_resolution = settings.resolution;
+                        }
                     }
                     if ui_draw.output.start_requested {
                         if let Some((quake_dir, map)) = pending_map.take() {
@@ -1867,6 +2265,9 @@ fn main() {
                     let delay_active = video_start_delay_until.is_some();
                     let mut advance_video = false;
                     if let Some(video) = video.as_mut() {
+                        if !video_frame_visible {
+                            renderer.clear_textured_quad();
+                        }
                         if let Err(err) = video.drain_events() {
                             eprintln!("{}", err);
                             video.stop();
@@ -1972,27 +2373,7 @@ fn main() {
                         }
                         if !delay_active {
                             if !video.is_started() {
-                                let mut preview_uploaded = false;
-                                if let Some(frame) = video.preview_frame() {
-                                    if let Ok(image) = YuvImageView::new(
-                                        frame.width,
-                                        frame.height,
-                                        frame.y_plane(),
-                                        frame.u_plane(),
-                                        frame.v_plane(),
-                                    ) {
-                                        if let Err(err) = renderer.update_yuv_image_view(&image) {
-                                            eprintln!("video frame upload failed: {}", err);
-                                        } else {
-                                            preview_uploaded = true;
-                                        }
-                                    }
-                                }
-                                if preview_uploaded {
-                                    video.mark_frame_uploaded();
-                                }
-                            }
-                            if !video.is_started() {
+                                let _ = video.preview_frame();
                                 if let Some(audio) = audio.as_ref() {
                                     if video.has_frames()
                                         && video.frame_queue_len() >= VIDEO_START_MIN_FRAMES
@@ -2009,21 +2390,27 @@ fn main() {
                                     video.start_now();
                                 }
                             }
-                            let elapsed_ms = video.elapsed_ms();
-                            if let Some(frame) = video.next_frame(elapsed_ms) {
-                                if let Ok(image) = YuvImageView::new(
-                                    frame.width,
-                                    frame.height,
-                                    frame.y_plane(),
-                                    frame.u_plane(),
-                                    frame.v_plane(),
-                                ) {
-                                    if let Err(err) =
-                                        renderer.update_yuv_image_view(&image)
-                                    {
-                                        eprintln!("video frame upload failed: {}", err);
+                            if video.is_started() {
+                                let elapsed_ms = video.elapsed_ms();
+                                if let Some(frame) = video.next_frame(elapsed_ms) {
+                                    if let Ok(image) = YuvImageView::new(
+                                        frame.width,
+                                        frame.height,
+                                        frame.y_plane(),
+                                        frame.u_plane(),
+                                        frame.v_plane(),
+                                    ) {
+                                        if let Err(err) = renderer.update_yuv_image_view(&image) {
+                                            eprintln!("video frame upload failed: {}", err);
+                                            video_frame_visible = false;
+                                            renderer.clear_textured_quad();
+                                        } else {
+                                            video.mark_frame_uploaded();
+                                            video_frame_visible = true;
+                                        }
                                     } else {
-                                        video.mark_frame_uploaded();
+                                        video_frame_visible = false;
+                                        renderer.clear_textured_quad();
                                     }
                                 }
                             }
@@ -2071,6 +2458,7 @@ fn main() {
                             video = None;
                             ui_state.open_title();
                             renderer.clear_textured_quad();
+                            video_frame_visible = false;
                             return;
                         }
                         video_hold_until = None;
@@ -2084,6 +2472,7 @@ fn main() {
                             ));
                         next_video_created_at = None;
                         renderer.clear_textured_quad();
+                        video_frame_visible = false;
                         if video_debug {
                             last_underrun_frames = audio
                                 .as_ref()
@@ -2119,8 +2508,209 @@ fn main() {
                         }
                     }
 
+                    let font_scale = (resolution.dpi_scale * settings.ui_scale).max(0.1);
+                    let pre_video_blackout = video.is_some() && !video_frame_visible;
+                    if !pre_video_blackout && scene_active && !ui_state.menu_open {
+                        let hud_font_px = HUD_FONT_SIZE * font_scale;
+                        let hud_small_px = HUD_FONT_SIZE_SMALL * font_scale;
+                        let hud_style = TextStyle {
+                            font_size: hud_font_px,
+                            color: HUD_TEXT_COLOR,
+                        };
+                        let hud_small_style = TextStyle {
+                            font_size: hud_small_px,
+                            color: HUD_TEXT_COLOR,
+                        };
+                        let fps = hud.update(now);
+                        let sim_rate = 1.0 / dt.max(0.001);
+                        let net_rate = if loopback.is_some() { 60.0 } else { 0.0 };
+                        let hud_stats_text = format!(
+                            "fps: {:>4.0}\nsim: {:>4.0} hz\nnet: {:>4.0} hz",
+                            fps, sim_rate, net_rate
+                        );
+                        let hud_margin = 16.0 * font_scale;
+                        let hud_line_height = hud_font_px * LINE_HEIGHT_SCALE;
+                        let build_line_height = hud_small_px * LINE_HEIGHT_SCALE;
+                        let hud_total_height = hud_line_height * 3.0 + build_line_height;
+                        let hud_origin = TextPosition {
+                            x: hud_margin,
+                            y: (resolution.physical_px[1] as f32
+                                - hud_margin
+                                - hud_total_height)
+                                .max(hud_margin),
+                        };
+                        text_overlay.queue(
+                            TextLayer::Hud,
+                            hud_style,
+                            hud_origin,
+                            TextBounds {
+                                width: resolution.physical_px[0] as f32,
+                                height: hud_line_height * 3.0,
+                            },
+                            hud_stats_text,
+                        );
+                        let build_text = format!("build: {}", env!("CARGO_PKG_VERSION"));
+                        text_overlay.queue(
+                            TextLayer::Hud,
+                            hud_small_style,
+                            TextPosition {
+                                x: hud_origin.x,
+                                y: hud_origin.y + hud_line_height * 3.0,
+                            },
+                            TextBounds {
+                                width: resolution.physical_px[0] as f32,
+                                height: build_line_height,
+                            },
+                            build_text,
+                        );
+                    }
+
+                    if !pre_video_blackout && console.is_visible() {
+                        let console_font_px = CONSOLE_FONT_SIZE * font_scale;
+                        let console_width = resolution.physical_px[0] as f32;
+                        let full_height = (resolution.physical_px[1] as f32
+                            * CONSOLE_HEIGHT_RATIO)
+                            .max(console_font_px * 2.0);
+                        let console_height = (full_height * console.height_ratio()).max(1.0);
+                        text_overlay.queue_rect(
+                            TextLayer::Console,
+                            TextPosition { x: 0.0, y: 0.0 },
+                            TextBounds {
+                                width: console_width,
+                                height: console_height,
+                            },
+                            CONSOLE_BG_COLOR,
+                        );
+                        let padding = CONSOLE_PADDING * font_scale;
+                        let input_padding = CONSOLE_INPUT_PADDING * font_scale;
+                        let text_left = (padding * 0.25).max(1.0);
+                        let text_width = (console_width - text_left - padding).max(1.0);
+                        let text_height = (console_height - padding * 2.0).max(0.0);
+                        if text_height > 0.0 {
+                            let console_style = TextStyle {
+                                font_size: console_font_px,
+                                color: CONSOLE_TEXT_COLOR,
+                            };
+                            let line_height = console_font_px * LINE_HEIGHT_SCALE;
+                            let log_y = padding;
+                            let input_y =
+                                (console_height - input_padding - line_height).max(log_y);
+                            let separator_thickness = font_scale.max(1.0);
+                            let separator_gap = 0.25 * font_scale;
+                            let separator_y = (input_y - separator_gap - separator_thickness)
+                                .max(log_y);
+                            if console_height > input_y + line_height {
+                                let input_box_top =
+                                    (separator_y + separator_thickness).min(console_height);
+                                let input_box_height =
+                                    (console_height - input_box_top).max(0.0);
+                                if input_box_height > 0.0 {
+                                    text_overlay.queue_rect(
+                                        TextLayer::Console,
+                                        TextPosition {
+                                            x: 0.0,
+                                            y: input_box_top,
+                                        },
+                                        TextBounds {
+                                            width: console_width,
+                                            height: input_box_height,
+                                        },
+                                        CONSOLE_INPUT_BG_COLOR,
+                                    );
+                                }
+                                text_overlay.queue_rect(
+                                    TextLayer::Console,
+                                    TextPosition {
+                                        x: 0.0,
+                                        y: separator_y,
+                                    },
+                                    TextBounds {
+                                        width: console_width,
+                                        height: separator_thickness,
+                                    },
+                                    CONSOLE_SEPARATOR_COLOR,
+                                );
+                            }
+                            if console_height >= separator_thickness {
+                                text_overlay.queue_rect(
+                                    TextLayer::Console,
+                                    TextPosition {
+                                        x: 0.0,
+                                        y: console_height - separator_thickness,
+                                    },
+                                    TextBounds {
+                                        width: console_width,
+                                        height: separator_thickness,
+                                    },
+                                    CONSOLE_SEPARATOR_COLOR,
+                                );
+                            }
+
+                            let log_height = (separator_y - log_y).max(0.0);
+                            let max_lines = (log_height / line_height).floor() as usize;
+                            console.visible_lines = max_lines;
+                            let max_offset = console.log.len().saturating_sub(max_lines);
+                            console.scroll_offset = console.scroll_offset.min(max_offset);
+                            if max_lines > 0 && console_height > log_y {
+                                let start = console
+                                    .log
+                                    .len()
+                                    .saturating_sub(max_lines + console.scroll_offset);
+                                let visible = console
+                                    .log
+                                    .iter()
+                                    .skip(start)
+                                    .take(max_lines)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if !visible.is_empty() {
+                                    text_overlay.queue(
+                                        TextLayer::Console,
+                                        console_style,
+                                        TextPosition {
+                                            x: text_left,
+                                            y: log_y,
+                                        },
+                                        TextBounds {
+                                            width: text_width,
+                                            height: line_height * max_lines as f32,
+                                        },
+                                        visible,
+                                    );
+                                }
+                            }
+                            if console_height > input_y + line_height {
+                                let caret = if console.is_interactive()
+                                    && console.caret_visible(now)
+                                {
+                                    "|"
+                                } else {
+                                    " "
+                                };
+                                let input_line = format!("> {}{}", console.buffer, caret);
+                                text_overlay.queue(
+                                    TextLayer::Console,
+                                    console_style,
+                                    TextPosition {
+                                        x: text_left,
+                                        y: input_y,
+                                    },
+                                    TextBounds {
+                                        width: text_width,
+                                        height: line_height,
+                                    },
+                                    input_line,
+                                );
+                            }
+                        }
+                    }
+
+                    let draw_ui = ui_state.menu_open;
+                    let draw_text_overlay = !pre_video_blackout;
                     match renderer.render_with_overlay(|device, queue, encoder, view, _format| {
-                        {
+                        ui_facade.render(device, queue, encoder, view, &ui_draw, draw_ui);
+                        if draw_text_overlay {
                             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("pallet.text_overlay.pass"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2135,11 +2725,17 @@ fn main() {
                                 occlusion_query_set: None,
                                 timestamp_writes: None,
                             });
-                            text_overlay.flush(&mut pass, text_viewport);
+                            text_overlay.flush(&mut pass, text_viewport, device, queue);
                         }
-                        ui_facade.render(device, queue, encoder, view, &ui_draw);
                     }) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            if boot.on_present(now, window) && boot_apply_fullscreen {
+                                apply_window_settings(window, &settings);
+                                renderer.resize(renderer.window_inner_size());
+                                pending_resize_clear = true;
+                                boot_apply_fullscreen = false;
+                            }
+                        }
                         Err(RenderError::Lost | RenderError::Outdated) => {
                             renderer.resize(renderer.size());
                         }
@@ -2156,7 +2752,8 @@ fn main() {
                 }
             }
             Event::DeviceEvent { event, .. } => {
-                if input_router.active_layer(console.active, ui_state.menu_open) == InputLayer::Game
+                if input_router.active_layer(console.is_blocking(), ui_state.menu_open)
+                    == InputLayer::Game
                     && scene_active
                     && mouse_look
                     && mouse_grabbed
@@ -2168,6 +2765,31 @@ fn main() {
             }
             Event::AboutToWait => {
                 renderer.request_redraw();
+                if boot.is_hidden() {
+                    let now = Instant::now();
+                    if boot.needs_warmup(now) {
+                        match renderer.render() {
+                            Ok(()) => {
+                                if boot.on_present(now, window) && boot_apply_fullscreen {
+                                    apply_window_settings(window, &settings);
+                                    renderer.resize(renderer.window_inner_size());
+                                    pending_resize_clear = true;
+                                    boot_apply_fullscreen = false;
+                                }
+                            }
+                            Err(RenderError::Lost | RenderError::Outdated) => {
+                                renderer.resize(renderer.size());
+                            }
+                            Err(RenderError::OutOfMemory) => {
+                                eprintln!("render error: out of memory");
+                                elwt.exit();
+                            }
+                            Err(err) => {
+                                eprintln!("render error: {}", err);
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -2718,20 +3340,22 @@ fn open_console(
     mouse_look: &mut bool,
     mouse_grabbed: &mut bool,
 ) {
-    console.active = true;
+    let now = Instant::now();
+    console.caret_epoch = now;
+    console.open(now);
     console.buffer.clear();
-    ui_state.console_open = true;
+    ui_state.console_open = console.is_blocking();
     *input = InputState::default();
     *mouse_look = false;
     *mouse_grabbed = set_cursor_mode(window, *mouse_look);
-    window.set_ime_allowed(true);
+    window.set_ime_allowed(false);
     println!("console: open");
 }
 
 fn close_console(console: &mut ConsoleState, ui_state: &mut UiState, window: &Window) {
-    console.active = false;
+    console.close(Instant::now());
     console.buffer.clear();
-    ui_state.console_open = false;
+    ui_state.console_open = console.is_blocking();
     window.set_ime_allowed(false);
     println!("console: closed");
 }
@@ -2756,10 +3380,14 @@ fn handle_non_video_key_input(
     audio: Option<&Rc<AudioEngine>>,
     sfx_data: Option<&Vec<u8>>,
     script: &mut Option<ScriptRuntime>,
+    video_active: bool,
 ) -> bool {
     if pressed && !is_repeat && code == KeyCode::Backquote {
+        if video_active {
+            return true;
+        }
         if input_router.allow_console_toggle(ui_state.menu_open) {
-            if console.active {
+            if console.is_opening() || console.is_interactive() {
                 close_console(console, ui_state, window);
             } else {
                 open_console(console, ui_state, window, input, mouse_look, mouse_grabbed);
@@ -2768,7 +3396,7 @@ fn handle_non_video_key_input(
         return true;
     }
     if pressed && !is_repeat && code == KeyCode::Escape {
-        if console.active {
+        if console.is_blocking() {
             close_console(console, ui_state, window);
             return true;
         }
@@ -2789,34 +3417,56 @@ fn handle_non_video_key_input(
         }
         return true;
     }
-    match input_router.active_layer(console.active, ui_state.menu_open) {
+    match input_router.active_layer(console.is_blocking(), ui_state.menu_open) {
         InputLayer::Console => {
-            if pressed {
+            if pressed && console.is_interactive() {
                 match code {
                     KeyCode::Enter | KeyCode::NumpadEnter => {
                         let line = console.buffer.trim().to_string();
                         console.buffer.clear();
                         if !line.is_empty() {
                             println!("> {}", line);
+                            console.push_line(format!("> {}", line));
                             if let Some((command, args)) = parse_command_line(&line) {
                                 if let Some(script) = script.as_mut() {
                                     match script.engine.run_command(&command, &args) {
                                         Ok(true) => {}
                                         Ok(false) => {
                                             eprintln!("unknown script command: {}", command);
+                                            console.push_line(format!(
+                                                "unknown script command: {}",
+                                                command
+                                            ));
                                         }
                                         Err(err) => {
                                             eprintln!("lua command failed: {}", err);
+                                            console
+                                                .push_line(format!("lua command failed: {}", err));
                                         }
                                     }
                                 } else {
                                     eprintln!("no script loaded");
+                                    console.push_line("no script loaded");
                                 }
                             }
                         }
                     }
                     KeyCode::Backspace => {
                         console.buffer.pop();
+                    }
+                    KeyCode::PageUp => {
+                        let page = console.visible_lines.max(1) as i32;
+                        console.scroll_by(page);
+                    }
+                    KeyCode::PageDown => {
+                        let page = console.visible_lines.max(1) as i32;
+                        console.scroll_by(-page);
+                    }
+                    KeyCode::Home => {
+                        console.scroll_offset = usize::MAX;
+                    }
+                    KeyCode::End => {
+                        console.scroll_offset = 0;
                     }
                     _ => {}
                 }

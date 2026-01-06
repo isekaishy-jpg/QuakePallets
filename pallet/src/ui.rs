@@ -324,6 +324,7 @@ impl UiFacade {
         encoder: &mut CommandEncoder,
         view: &TextureView,
         draw_data: &UiDrawData,
+        draw_ui: bool,
     ) {
         for (id, image_delta) in &draw_data.textures_delta.set {
             self.egui_renderer
@@ -336,7 +337,7 @@ impl UiFacade {
             &draw_data.paint_jobs,
             &draw_data.screen_descriptor,
         );
-        {
+        if draw_ui && !draw_data.paint_jobs.is_empty() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pallet.egui.pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

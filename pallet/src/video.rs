@@ -724,7 +724,7 @@ impl VideoPlayback {
     }
 
     pub fn is_ready_to_start(&self) -> bool {
-        self.first_frame_uploaded
+        self.previewed || self.first_frame_uploaded
     }
 
     pub fn set_max_queued_video_ms(&self, max_ms: u64) {

@@ -3,7 +3,9 @@
 use std::fmt;
 
 pub use winit::dpi::{PhysicalPosition, PhysicalSize};
-pub use winit::event::{DeviceEvent, ElementState, Event, Ime, MouseButton, WindowEvent};
+pub use winit::event::{
+    DeviceEvent, ElementState, Event, Ime, MouseButton, MouseScrollDelta, WindowEvent,
+};
 pub use winit::event_loop::{ControlFlow, EventLoop};
 pub use winit::keyboard::{KeyCode, PhysicalKey};
 pub use winit::window::{CursorGrabMode, Fullscreen, Window};
@@ -43,6 +45,7 @@ pub fn create_window(
     let window = winit::window::WindowBuilder::new()
         .with_title(title)
         .with_inner_size(PhysicalSize::new(width, height))
+        .with_visible(false)
         .build(&event_loop)
         .map_err(WindowInitError::Window)?;
     Ok((event_loop, window))

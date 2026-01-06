@@ -99,22 +99,22 @@ This checklist is intentionally a single vertical slice to avoid coupling with l
 ---
 
 ## D3 — High-quality text overlays with glyphon (HUD + console rendering)
-- [ ] Add glyphon renderer module (wgpu pass integration).
-- [ ] Use cosmic-text shaping/layout via glyphon (no custom shaper).
-- [ ] Font packaging:
+- [x] Add glyphon renderer module (wgpu pass integration).
+- [x] Use cosmic-text shaping/layout via glyphon (no custom shaper).
+- [x] Font packaging:
   - `third_party/fonts/FiraSans/`
     - `FiraSans-Regular.ttf`
     - `FiraSans-Italic.ttf` (optional)
     - `FiraSans-Bold.ttf` (optional)
     - `LICENSE.txt` (OFL-1.1 text)
     - `SOURCE.txt` (where the files were obtained)
-- [ ] Canonical font sizes (avoid churn):
+- [x] Canonical font sizes (avoid churn):
   - UI: 14pt, 16pt, 18pt
   - HUD: 14pt, 16pt
   - Console: 14pt or 16pt (pick one initially)
-- [ ] HUD overlay (glyphon):
+- [x] HUD overlay (glyphon):
   - FPS, sim tick rate, net tick rate, build string
-- [ ] Console overlay (glyphon):
+- [x] Console overlay (glyphon):
   - translucent background quad (can be egui panel or a simple wgpu quad)
   - scrollback region with clipping (render only visible lines)
   - input line with caret

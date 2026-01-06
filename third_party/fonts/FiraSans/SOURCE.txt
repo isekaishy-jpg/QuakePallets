@@ -1,0 +1,2 @@
+Source: https://fonts.google.com/specimen/Fira+Sans
+Notes: Included Regular, Italic, and Bold faces.

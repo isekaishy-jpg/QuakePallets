@@ -20,3 +20,4 @@ members = [
 
 [patch.crates-io]
 bindgen = { path = "third_party/bindgen" }
+glyphon = { path = "third_party/glyphon" }
