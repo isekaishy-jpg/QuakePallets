@@ -19,4 +19,5 @@ video_theora = { path = "../video_theora", version = "0.1.0" }
 egui = "0.28"
 egui-wgpu = "0.28"
 egui-winit = "0.28"
+png = "0.17"
 wgpu = "0.20"

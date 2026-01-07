@@ -7,7 +7,7 @@ pub use winit::event::{
     DeviceEvent, ElementState, Event, Ime, MouseButton, MouseScrollDelta, WindowEvent,
 };
 pub use winit::event_loop::{ControlFlow, EventLoop};
-pub use winit::keyboard::{KeyCode, PhysicalKey};
+pub use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 pub use winit::window::{CursorGrabMode, Fullscreen, Window};
 
 #[derive(Debug)]

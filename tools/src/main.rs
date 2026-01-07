@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use compat_quake::pak::{self, PakFile};
@@ -21,6 +23,7 @@ struct Cli {
 enum Commands {
     Smoke(SmokeArgs),
     Pak(PakArgs),
+    UiRegression(UiRegressionArgs),
 }
 
 #[derive(Parser)]
@@ -67,11 +70,44 @@ enum PakCommand {
     },
 }
 
+#[derive(Parser)]
+struct UiRegressionArgs {
+    #[arg(long, value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UiRegressionScreen {
+    Main,
+    Options,
+}
+
+impl UiRegressionScreen {
+    fn as_str(self) -> &'static str {
+        match self {
+            UiRegressionScreen::Main => "main",
+            UiRegressionScreen::Options => "options",
+        }
+    }
+}
+
+struct UiRegressionEntry {
+    screen: UiRegressionScreen,
+    resolution: [u32; 2],
+    dpi_scale: f32,
+    ui_scale: f32,
+    png: PathBuf,
+    ok: bool,
+    exit_code: i32,
+    error: Option<String>,
+}
+
 fn main() {
     let cli = Cli::parse();
     let exit_code = match cli.command {
         Commands::Smoke(args) => run_smoke(args),
         Commands::Pak(args) => run_pak(args),
+        Commands::UiRegression(args) => run_ui_regression(args),
     };
     std::process::exit(exit_code);
 }
@@ -204,4 +240,261 @@ fn load_pak_from_quake_dir(quake_dir: &Path) -> Result<(PakFile, PathBuf), i32> 
             Err(EXIT_PAK)
         }
     }
+}
+
+fn run_ui_regression(args: UiRegressionArgs) -> i32 {
+    let out_dir = args.out_dir.unwrap_or_else(default_ui_regression_dir);
+    if let Err(err) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("ui regression create dir failed: {}", err);
+        return EXIT_USAGE;
+    }
+    let out_dir = out_dir.canonicalize().unwrap_or(out_dir);
+    let pallet_path = pallet_binary_path();
+    if let Err(err) = ensure_pallet_binary(&pallet_path) {
+        eprintln!("{}", err);
+        return EXIT_USAGE;
+    }
+
+    let resolutions = [[1280, 720], [1920, 1080], [2560, 1440], [3840, 2160]];
+    let dpi_scales = [1.0f32, 1.5f32, 2.0f32];
+    let ui_scales = [0.85f32, 1.0f32, 1.25f32, 1.5f32];
+    let screens = [UiRegressionScreen::Main, UiRegressionScreen::Options];
+
+    let mut entries = Vec::new();
+    for screen in screens {
+        for resolution in resolutions {
+            for dpi_scale in dpi_scales {
+                for ui_scale in ui_scales {
+                    let filename = format!(
+                        "ui_{}_{}x{}_dpi{}_ui{}.png",
+                        screen.as_str(),
+                        resolution[0],
+                        resolution[1],
+                        format_scale(dpi_scale),
+                        format_scale(ui_scale)
+                    );
+                    let shot_path = out_dir.join(filename);
+                    println!(
+                        "ui regression: screen={} res={}x{} dpi={} ui={}",
+                        screen.as_str(),
+                        resolution[0],
+                        resolution[1],
+                        dpi_scale,
+                        ui_scale
+                    );
+                    let entry = run_pallet_ui_regression(
+                        &pallet_path,
+                        resolution,
+                        dpi_scale,
+                        ui_scale,
+                        screen,
+                        &shot_path,
+                    );
+                    entries.push(entry);
+                }
+            }
+        }
+    }
+
+    let manifest_path = out_dir.join("manifest.json");
+    if let Err(err) = write_ui_regression_manifest(&manifest_path, &entries, &out_dir) {
+        eprintln!("ui regression manifest failed: {}", err);
+        return EXIT_USAGE;
+    }
+    if entries.iter().any(|entry| !entry.ok) {
+        EXIT_USAGE
+    } else {
+        EXIT_SUCCESS
+    }
+}
+
+fn run_pallet_ui_regression(
+    pallet_path: &Path,
+    resolution: [u32; 2],
+    dpi_scale: f32,
+    ui_scale: f32,
+    screen: UiRegressionScreen,
+    shot_path: &Path,
+) -> UiRegressionEntry {
+    let mut command = Command::new(pallet_path);
+    command
+        .arg("--ui-regression-shot")
+        .arg(shot_path)
+        .arg("--ui-regression-res")
+        .arg(format!("{}x{}", resolution[0], resolution[1]))
+        .arg("--ui-regression-dpi")
+        .arg(format_scale(dpi_scale))
+        .arg("--ui-regression-ui-scale")
+        .arg(format_scale(ui_scale))
+        .arg("--ui-regression-screen")
+        .arg(screen.as_str());
+    let output = command.output();
+    match output {
+        Ok(output) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let ok = output.status.success();
+            let mut message = String::new();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stdout.trim().is_empty() {
+                message.push_str("stdout:\n");
+                message.push_str(stdout.trim());
+            }
+            if !stderr.trim().is_empty() {
+                if !message.is_empty() {
+                    message.push('\n');
+                }
+                message.push_str("stderr:\n");
+                message.push_str(stderr.trim());
+            }
+            UiRegressionEntry {
+                screen,
+                resolution,
+                dpi_scale,
+                ui_scale,
+                png: shot_path.to_path_buf(),
+                ok,
+                exit_code,
+                error: if ok {
+                    None
+                } else {
+                    Some(truncate_text(&message, 2000))
+                },
+            }
+        }
+        Err(err) => UiRegressionEntry {
+            screen,
+            resolution,
+            dpi_scale,
+            ui_scale,
+            png: shot_path.to_path_buf(),
+            ok: false,
+            exit_code: -1,
+            error: Some(format!("spawn failed: {}", err)),
+        },
+    }
+}
+
+fn ensure_pallet_binary(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        return Ok(());
+    }
+    println!("building pallet binary...");
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("-p")
+        .arg("pallet")
+        .status()
+        .map_err(|err| format!("cargo build failed: {}", err))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("cargo build failed".into())
+    }
+}
+
+fn pallet_binary_path() -> PathBuf {
+    let mut path = PathBuf::from("target").join("debug").join("pallet");
+    if cfg!(windows) {
+        path.set_extension("exe");
+    }
+    path
+}
+
+fn default_ui_regression_dir() -> PathBuf {
+    PathBuf::from("ui_regression").join(timestamp_string())
+}
+
+fn timestamp_string() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    secs.to_string()
+}
+
+fn format_scale(value: f32) -> String {
+    let mut text = format!("{:.2}", value);
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
+}
+
+fn write_ui_regression_manifest(
+    path: &Path,
+    entries: &[UiRegressionEntry],
+    root: &Path,
+) -> Result<(), String> {
+    let root_str = json_escape(root.to_string_lossy().as_ref());
+    let mut body = String::new();
+    body.push_str("{\n");
+    body.push_str(&format!("  \"root\": \"{}\",\n", root_str));
+    body.push_str("  \"entries\": [\n");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            body.push_str(",\n");
+        }
+        let png_path = entry
+            .png
+            .strip_prefix(root)
+            .unwrap_or(&entry.png)
+            .to_string_lossy();
+        let png_str = json_escape(png_path.as_ref());
+        body.push_str("    {\n");
+        body.push_str(&format!(
+            "      \"screen\": \"{}\",\n",
+            entry.screen.as_str()
+        ));
+        body.push_str(&format!(
+            "      \"resolution\": [{}, {}],\n",
+            entry.resolution[0], entry.resolution[1]
+        ));
+        body.push_str(&format!(
+            "      \"dpi_scale\": {},\n",
+            format_scale(entry.dpi_scale)
+        ));
+        body.push_str(&format!(
+            "      \"ui_scale\": {},\n",
+            format_scale(entry.ui_scale)
+        ));
+        body.push_str(&format!("      \"png\": \"{}\",\n", png_str));
+        body.push_str(&format!("      \"ok\": {},\n", entry.ok));
+        body.push_str(&format!("      \"exit_code\": {}", entry.exit_code));
+        if let Some(error) = entry.error.as_ref() {
+            body.push_str(",\n");
+            body.push_str(&format!("      \"error\": \"{}\"", json_escape(error)));
+        }
+        body.push_str("\n    }");
+    }
+    body.push_str("\n  ]\n}\n");
+    std::fs::write(path, body).map_err(|err| format!("manifest write failed: {}", err))?;
+    Ok(())
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn truncate_text(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut text = value.chars().take(max).collect::<String>();
+    text.push_str("...");
+    text
 }

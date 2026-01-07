@@ -1,5 +1,7 @@
-use std::cell::RefCell;
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,12 +16,12 @@ use engine_core::vfs::{Vfs, VfsError};
 use net_transport::{LoopbackTransport, Transport, TransportConfig};
 use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Fullscreen, Ime,
-    KeyCode, MouseButton, MouseScrollDelta, PhysicalKey, PhysicalPosition, PhysicalSize, Window,
-    WindowEvent,
+    KeyCode, ModifiersState, MouseButton, MouseScrollDelta, PhysicalKey, PhysicalPosition,
+    PhysicalSize, Window, WindowEvent,
 };
 use render_wgpu::{
-    ImageData, MeshData, MeshVertex, RenderError, TextBounds, TextLayer, TextOverlay, TextPosition,
-    TextStyle, TextViewport, YuvImageView,
+    FrameCapture, ImageData, MeshData, MeshVertex, RenderCaptureError, RenderError, TextBounds,
+    TextFontSystem, TextLayer, TextOverlay, TextPosition, TextStyle, TextViewport, YuvImageView,
 };
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
@@ -31,6 +33,7 @@ use video::{
     VIDEO_PREDECODE_MIN_FRAMES, VIDEO_PREDECODE_RAMP_MS, VIDEO_PREDECODE_START_DELAY_MS,
     VIDEO_PREDECODE_WARM_MS, VIDEO_START_MIN_FRAMES,
 };
+use wgpu::util::DeviceExt;
 
 use settings::{Settings, WindowMode};
 use ui::{MenuMode, MenuScreen, ResolutionModel, UiFacade, UiFrameInput, UiState};
@@ -39,12 +42,14 @@ mod settings;
 mod ui;
 mod video;
 
+const EXIT_SUCCESS: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 const EXIT_QUAKE_DIR: i32 = 10;
 const EXIT_PAK: i32 = 11;
 const EXIT_IMAGE: i32 = 12;
 const EXIT_BSP: i32 = 13;
 const EXIT_SCENE: i32 = 14;
+const EXIT_UI_REGRESSION: i32 = 20;
 const DEFAULT_SFX: &str = "sound/misc/menu1.wav";
 const HUD_FONT_SIZE: f32 = 16.0;
 const HUD_FONT_SIZE_SMALL: f32 = 14.0;
@@ -53,16 +58,52 @@ const HUD_TEXT_COLOR: [f32; 4] = [0.9, 0.95, 1.0, 1.0];
 const CONSOLE_TEXT_COLOR: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
 const CONSOLE_BG_COLOR: [f32; 4] = [0.05, 0.05, 0.08, 0.75];
 const CONSOLE_SEPARATOR_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.9];
+const CONSOLE_SELECTION_COLOR: [f32; 4] = [0.2, 0.4, 0.8, 0.35];
+const CONSOLE_MENU_BG_COLOR: [f32; 4] = [0.08, 0.1, 0.14, 0.95];
+const CONSOLE_MENU_TEXT_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
+const CONSOLE_MENU_PADDING: f32 = 4.0;
+const CONSOLE_MENU_CHAR_WIDTH: f32 = 0.6;
+const CONSOLE_TOAST_DURATION_MS: u64 = 1200;
 const CONSOLE_HEIGHT_RATIO: f32 = 0.45;
 const CONSOLE_PADDING: f32 = 6.0;
 const CONSOLE_INPUT_PADDING: f32 = 0.5;
 const CONSOLE_INPUT_BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const CONSOLE_SLIDE_MS: u64 = 500;
+const CONSOLE_SELECTION_LINE_LIMIT: usize = 128;
+const UI_REGRESSION_MIN_FONT_PX: f32 = 9.0;
+const UI_REGRESSION_LOG_LINE_COUNT: usize = 24;
+const UI_REGRESSION_FPS: f32 = 144.0;
+const UI_REGRESSION_SIM_RATE: f32 = 60.0;
+const UI_REGRESSION_NET_RATE: f32 = 30.0;
 const BOOT_FULLSCREEN_STARTUP_MS: u64 = 300;
 const BOOT_FULLSCREEN_SETTLE_MS: u64 = 120;
 const BOOT_PRESENT_WARMUP: usize = 2;
 const CONSOLE_CARET_BLINK_MS: u64 = 500;
 const LINE_HEIGHT_SCALE: f32 = 1.2;
+const CONSOLE_LOG_SHADER: &str = r#"
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_main(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> VertexOut {
+    var out: VertexOut;
+    out.position = vec4<f32>(position, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@group(0) @binding(0)
+var t_color: texture_2d<f32>;
+@group(0) @binding(1)
+var s_color: sampler;
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    return textureSample(t_color, s_color, in.uv);
+}
+"#;
 
 const CAMERA_UP: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 const CAMERA_FOV_Y: f32 = 70.0f32.to_radians();
@@ -162,6 +203,115 @@ impl BootState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiRegressionScreen {
+    Main,
+    Options,
+}
+
+impl UiRegressionScreen {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "main" => Some(UiRegressionScreen::Main),
+            "options" => Some(UiRegressionScreen::Options),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UiRegressionArgs {
+    shot_path: PathBuf,
+    resolution: [u32; 2],
+    dpi_scale: f32,
+    ui_scale: f32,
+    screen: UiRegressionScreen,
+}
+
+struct UiRegressionChecks {
+    min_font_px: f32,
+    ui_bounds_ok: bool,
+    ui_used_min: [f32; 2],
+    ui_used_max: [f32; 2],
+    ui_limit: [f32; 2],
+    console_input_visible: bool,
+    hud_bounds_ok: bool,
+}
+
+impl UiRegressionChecks {
+    fn new(ui_limit: [f32; 2]) -> Self {
+        Self {
+            min_font_px: f32::INFINITY,
+            ui_bounds_ok: true,
+            ui_used_min: [0.0, 0.0],
+            ui_used_max: [0.0, 0.0],
+            ui_limit,
+            console_input_visible: true,
+            hud_bounds_ok: true,
+        }
+    }
+
+    fn record_min_font(&mut self, value: f32) {
+        if value.is_finite() {
+            self.min_font_px = self.min_font_px.min(value);
+        }
+    }
+
+    fn record_ui_bounds(&mut self, used_rect: egui::Rect) {
+        let min = used_rect.min;
+        let max = used_rect.max;
+        self.ui_used_min = [min.x, min.y];
+        self.ui_used_max = [max.x, max.y];
+        self.ui_bounds_ok =
+            min.x >= 0.0 && min.y >= 0.0 && max.x <= self.ui_limit[0] && max.y <= self.ui_limit[1];
+    }
+
+    fn record_console_input(&mut self, visible: bool) {
+        self.console_input_visible = self.console_input_visible && visible;
+    }
+
+    fn record_hud_bounds(&mut self, ok: bool) {
+        self.hud_bounds_ok = self.hud_bounds_ok && ok;
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let min_font = if self.min_font_px.is_finite() {
+            self.min_font_px
+        } else {
+            0.0
+        };
+        if min_font < UI_REGRESSION_MIN_FONT_PX {
+            errors.push(format!(
+                "min font {:.2}px below threshold {:.2}px",
+                min_font, UI_REGRESSION_MIN_FONT_PX
+            ));
+        }
+        if !self.ui_bounds_ok {
+            errors.push(format!(
+                "ui bounds exceeded (min {:.2},{:.2} max {:.2},{:.2} limit {:.2},{:.2})",
+                self.ui_used_min[0],
+                self.ui_used_min[1],
+                self.ui_used_max[0],
+                self.ui_used_max[1],
+                self.ui_limit[0],
+                self.ui_limit[1]
+            ));
+        }
+        if !self.console_input_visible {
+            errors.push("console input line not visible".to_string());
+        }
+        if !self.hud_bounds_ok {
+            errors.push("hud text is clipped".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
 struct CliArgs {
     quake_dir: Option<PathBuf>,
     show_image: Option<String>,
@@ -170,6 +320,7 @@ struct CliArgs {
     playlist: Option<PathBuf>,
     script: Option<PathBuf>,
     input_script: bool,
+    ui_regression: Option<UiRegressionArgs>,
 }
 
 enum ArgParseError {
@@ -278,12 +429,109 @@ struct ConsoleState {
     anim_started: Instant,
     anim_from: f32,
     anim_to: f32,
-    scroll_offset: usize,
+    scroll_offset: f32,
     visible_lines: usize,
+    line_height: f32,
+    log_area: Option<ConsoleLogArea>,
+    selection: Option<ConsoleSelection>,
+    selecting: bool,
+    resume_mouse_look: bool,
+    context_menu: Option<ConsoleContextMenu>,
+    toast: Option<ConsoleToast>,
     caret_epoch: Instant,
     buffer: String,
     log: VecDeque<String>,
     max_lines: usize,
+    log_revision: u64,
+    visible_cache: Option<ConsoleVisibleCache>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConsoleLogArea {
+    y: f32,
+    height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConsoleSelection {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConsoleContextMenu {
+    position: TextPosition,
+    bounds: Option<ConsoleMenuBounds>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConsoleMenuBounds {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl ConsoleMenuBounds {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && y >= self.y && x <= self.x + self.width && y <= self.y + self.height
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConsoleToast {
+    text: String,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ConsoleVisibleCache {
+    start: usize,
+    lines: usize,
+    revision: u64,
+    text: Arc<str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ConsoleLogParams {
+    revision: u64,
+    start: usize,
+    draw_lines: usize,
+    scroll_px: u32,
+    line_height_px: u32,
+    font_px: u32,
+    selection: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ConsoleLogRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+struct ConsoleLogUpdate {
+    params: ConsoleLogParams,
+    size: [u32; 2],
+    viewport: TextViewport,
+}
+
+struct ConsoleLogCache {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+    format: wgpu::TextureFormat,
+    texture: Option<wgpu::Texture>,
+    view: Option<wgpu::TextureView>,
+    bind_group: Option<wgpu::BindGroup>,
+    size: [u32; 2],
+    last_params: Option<ConsoleLogParams>,
+    last_rect: Option<ConsoleLogRect>,
+    last_surface: [u32; 2],
 }
 
 impl Default for ConsoleState {
@@ -294,18 +542,32 @@ impl Default for ConsoleState {
             anim_started: Instant::now(),
             anim_from: 0.0,
             anim_to: 0.0,
-            scroll_offset: 0,
+            scroll_offset: 0.0,
             visible_lines: 0,
+            line_height: 0.0,
+            log_area: None,
+            selection: None,
+            selecting: false,
+            resume_mouse_look: false,
+            context_menu: None,
+            toast: None,
             caret_epoch: Instant::now(),
             buffer: String::new(),
             log: VecDeque::new(),
             max_lines: 256,
+            log_revision: 0,
+            visible_cache: None,
         }
     }
 }
 
 impl ConsoleState {
     fn update(&mut self, now: Instant) {
+        if let Some(toast) = &self.toast {
+            if now >= toast.expires_at {
+                self.toast = None;
+            }
+        }
         match self.phase {
             ConsolePhase::Opening | ConsolePhase::Closing => {
                 let duration = Duration::from_millis(CONSOLE_SLIDE_MS).as_secs_f32();
@@ -339,7 +601,9 @@ impl ConsoleState {
         self.anim_to = 1.0;
         self.anim_started = now;
         self.phase = ConsolePhase::Opening;
-        self.scroll_offset = 0;
+        self.scroll_offset = 0.0;
+        self.toast = None;
+        self.clear_selection();
     }
 
     fn close(&mut self, now: Instant) {
@@ -350,7 +614,9 @@ impl ConsoleState {
         self.anim_to = 0.0;
         self.anim_started = now;
         self.phase = ConsolePhase::Closing;
-        self.scroll_offset = 0;
+        self.scroll_offset = 0.0;
+        self.toast = None;
+        self.clear_selection();
     }
 
     fn force_closed(&mut self) {
@@ -358,7 +624,21 @@ impl ConsoleState {
         self.progress = 0.0;
         self.anim_from = 0.0;
         self.anim_to = 0.0;
-        self.scroll_offset = 0;
+        self.scroll_offset = 0.0;
+        self.resume_mouse_look = false;
+        self.toast = None;
+        self.clear_selection();
+    }
+
+    fn force_open(&mut self, now: Instant) {
+        self.phase = ConsolePhase::Open;
+        self.progress = 1.0;
+        self.anim_from = 1.0;
+        self.anim_to = 1.0;
+        self.anim_started = now;
+        self.scroll_offset = 0.0;
+        self.toast = None;
+        self.clear_selection();
     }
 
     fn is_blocking(&self) -> bool {
@@ -386,12 +666,211 @@ impl ConsoleState {
         (elapsed.as_millis() / CONSOLE_CARET_BLINK_MS as u128).is_multiple_of(2)
     }
 
-    fn scroll_by(&mut self, lines: i32) {
-        if lines > 0 {
-            self.scroll_offset = self.scroll_offset.saturating_add(lines as usize);
-        } else {
-            self.scroll_offset = self.scroll_offset.saturating_sub((-lines) as usize);
+    fn set_log_area(&mut self, area: Option<ConsoleLogArea>) {
+        self.log_area = area;
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selecting = false;
+        self.close_menu();
+    }
+
+    fn is_selecting(&self) -> bool {
+        self.selecting
+    }
+
+    fn open_menu(&mut self, position: TextPosition) {
+        self.context_menu = Some(ConsoleContextMenu {
+            position,
+            bounds: None,
+        });
+    }
+
+    fn close_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    fn menu_bounds(&self) -> Option<ConsoleMenuBounds> {
+        self.context_menu.and_then(|menu| menu.bounds)
+    }
+
+    fn set_menu_bounds(&mut self, bounds: Option<ConsoleMenuBounds>) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.bounds = bounds;
         }
+    }
+
+    fn menu_position(&self) -> Option<TextPosition> {
+        self.context_menu.map(|menu| menu.position)
+    }
+
+    fn show_toast(&mut self, text: impl Into<String>, now: Instant) {
+        let text = text.into();
+        if text.is_empty() {
+            return;
+        }
+        self.toast = Some(ConsoleToast {
+            text,
+            expires_at: now + Duration::from_millis(CONSOLE_TOAST_DURATION_MS),
+        });
+    }
+
+    fn start_selection(&mut self, line: usize) {
+        self.selection = Some(ConsoleSelection {
+            start: line,
+            end: line,
+        });
+        self.selecting = true;
+    }
+
+    fn update_selection(&mut self, line: usize) {
+        if let Some(selection) = &mut self.selection {
+            selection.end = line;
+        } else {
+            self.start_selection(line);
+        }
+    }
+
+    fn finish_selection(&mut self) {
+        self.selecting = false;
+    }
+
+    fn selection_range_limited(&self, max_lines: usize) -> Option<(usize, usize)> {
+        let selection = self.selection?;
+        if max_lines == 0 {
+            return None;
+        }
+        let limit = max_lines.saturating_sub(1);
+        if selection.start <= selection.end {
+            let end = selection.end.min(selection.start.saturating_add(limit));
+            Some((selection.start, end))
+        } else {
+            let end = selection.end.max(selection.start.saturating_sub(limit));
+            Some((end, selection.start))
+        }
+    }
+
+    fn selection_text(&self) -> Option<String> {
+        let (start, end) = self.selection_range_limited(CONSOLE_SELECTION_LINE_LIMIT)?;
+        if self.log.is_empty() || start >= self.log.len() {
+            return None;
+        }
+        let end = end.min(self.log.len().saturating_sub(1));
+        let mut text = String::new();
+        for (index, line) in self
+            .log
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end.saturating_sub(start) + 1)
+        {
+            if index > start {
+                text.push('\n');
+            }
+            text.push_str(line);
+        }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn log_line_at(&self, y: f32, clamp: bool) -> Option<usize> {
+        let area = self.log_area?;
+        if self.log.is_empty() || self.line_height <= 0.0 {
+            return None;
+        }
+        let log_height = area.height.max(0.0);
+        if log_height <= 0.0 {
+            return None;
+        }
+        if !clamp && (y < area.y || y > area.y + log_height) {
+            return None;
+        }
+        let line_height = self.line_height.max(1.0);
+        let max_lines = (log_height / line_height).floor() as usize;
+        if max_lines == 0 {
+            return None;
+        }
+        let content_height = line_height * self.log.len() as f32;
+        let max_offset = (content_height - log_height).max(0.0);
+        let scroll_px = self.scroll_offset.round().clamp(0.0, max_offset);
+        let scroll_lines = (scroll_px / line_height).floor() as usize;
+        let scroll_remainder = scroll_px - scroll_lines as f32 * line_height;
+        let extra_line = if scroll_remainder > 0.0 {
+            1usize
+        } else {
+            0usize
+        };
+        let draw_lines = (max_lines + extra_line).min(self.log.len());
+        if draw_lines == 0 {
+            return None;
+        }
+        let y_offset = if extra_line == 1 {
+            (line_height - scroll_remainder).round()
+        } else {
+            0.0
+        };
+        let y_clamped = y.clamp(area.y, area.y + log_height - 1.0).max(area.y);
+        let top = area.y - y_offset;
+        let line_in_view = ((y_clamped - top) / line_height)
+            .floor()
+            .clamp(0.0, (draw_lines - 1) as f32) as usize;
+        let start = self.log.len().saturating_sub(draw_lines + scroll_lines);
+        let line_index = start + line_in_view;
+        if line_index < self.log.len() {
+            Some(line_index)
+        } else {
+            None
+        }
+    }
+
+    fn scroll_by(&mut self, delta_px: f32) {
+        if delta_px.is_finite() {
+            self.scroll_offset = (self.scroll_offset + delta_px).max(0.0);
+        }
+    }
+
+    fn bump_log_revision(&mut self) {
+        self.log_revision = self.log_revision.wrapping_add(1);
+        self.visible_cache = None;
+    }
+
+    fn clear_log(&mut self) {
+        self.log.clear();
+        self.bump_log_revision();
+        self.clear_selection();
+    }
+
+    fn visible_text(&mut self, start: usize, lines: usize) -> Arc<str> {
+        if self.log.is_empty() || lines == 0 || start >= self.log.len() {
+            return Arc::from("");
+        }
+        let lines = lines.min(self.log.len().saturating_sub(start));
+        if let Some(cache) = &self.visible_cache {
+            if cache.start == start && cache.lines == lines && cache.revision == self.log_revision {
+                return cache.text.clone();
+            }
+        }
+        let mut text = String::new();
+        for index in start..start + lines {
+            if let Some(line) = self.log.get(index) {
+                if index > start {
+                    text.push('\n');
+                }
+                text.push_str(line);
+            }
+        }
+        let text: Arc<str> = Arc::from(text);
+        self.visible_cache = Some(ConsoleVisibleCache {
+            start,
+            lines,
+            revision: self.log_revision,
+            text: text.clone(),
+        });
+        text
     }
 
     fn push_line(&mut self, line: impl Into<String>) {
@@ -400,12 +879,287 @@ impl ConsoleState {
             return;
         }
         self.log.push_back(line);
-        if self.scroll_offset > 0 {
-            self.scroll_offset = self.scroll_offset.saturating_add(1);
+        if self.scroll_offset > 0.0 {
+            self.scroll_offset += self.line_height.max(1.0);
         }
+        let mut removed = 0usize;
         while self.log.len() > self.max_lines {
             self.log.pop_front();
+            removed = removed.saturating_add(1);
         }
+        if removed > 0 {
+            if let Some(selection) = &mut self.selection {
+                if selection.start < removed && selection.end < removed {
+                    self.selection = None;
+                    self.selecting = false;
+                } else {
+                    selection.start = selection.start.saturating_sub(removed);
+                    selection.end = selection.end.saturating_sub(removed);
+                }
+            }
+        }
+        self.bump_log_revision();
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct ConsoleQuadVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+}
+
+impl ConsoleLogCache {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pallet.console_log.shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CONSOLE_LOG_SHADER)),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pallet.console_log.sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pallet.console_log.bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pallet.console_log.pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("pallet.console_log.pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                    ],
+                }],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pallet.console_log.vertex_buffer"),
+            size: (std::mem::size_of::<ConsoleQuadVertex>() * 4) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let index_data = console_quad_index_bytes(&[0, 1, 2, 0, 2, 3]);
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pallet.console_log.index_buffer"),
+            contents: &index_data,
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        Self {
+            pipeline,
+            bind_group_layout,
+            sampler,
+            vertex_buffer,
+            index_buffer,
+            index_count: 6,
+            format,
+            texture: None,
+            view: None,
+            bind_group: None,
+            size: [0, 0],
+            last_params: None,
+            last_rect: None,
+            last_surface: [0, 0],
+        }
+    }
+
+    fn needs_update(&self, params: ConsoleLogParams, size: [u32; 2]) -> bool {
+        if size[0] == 0 || size[1] == 0 {
+            return false;
+        }
+        if self.size != size {
+            return true;
+        }
+        match self.last_params {
+            Some(last) => last != params,
+            None => true,
+        }
+    }
+
+    fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        log_overlay: &mut TextOverlay,
+        update: ConsoleLogUpdate,
+    ) {
+        if update.size[0] == 0 || update.size[1] == 0 {
+            self.size = update.size;
+            self.texture = None;
+            self.view = None;
+            self.bind_group = None;
+            self.last_params = Some(update.params);
+            return;
+        }
+        self.ensure_texture(device, update.size);
+        let view = match self.view.as_ref() {
+            Some(view) => view,
+            None => return,
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("pallet.console_log.cache.pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        log_overlay.flush_layers(
+            &mut pass,
+            update.viewport,
+            device,
+            queue,
+            &[TextLayer::ConsoleLog],
+        );
+        self.last_params = Some(update.params);
+    }
+
+    fn draw<'pass>(
+        &'pass mut self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'pass>,
+        rect: ConsoleLogRect,
+        surface_size: [u32; 2],
+    ) {
+        let bind_group = match self.bind_group.as_ref() {
+            Some(bind_group) => bind_group,
+            None => return,
+        };
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let surface_size = [surface_size[0].max(1), surface_size[1].max(1)];
+        let rect = ConsoleLogRect {
+            x: rect.x.round(),
+            y: rect.y.round(),
+            width: rect.width.round().max(1.0),
+            height: rect.height.round().max(1.0),
+        };
+        if self.last_rect != Some(rect) || self.last_surface != surface_size {
+            let texture_width = self.size[0].max(1) as f32;
+            let texture_height = self.size[1].max(1) as f32;
+            let uv_max_x = (rect.width / texture_width).clamp(0.0, 1.0);
+            let uv_max_y = (rect.height / texture_height).clamp(0.0, 1.0);
+            let vertices = console_quad_vertices(rect, surface_size, [uv_max_x, uv_max_y]);
+            let bytes = console_quad_vertex_bytes(&vertices);
+            queue.write_buffer(&self.vertex_buffer, 0, &bytes);
+            self.last_rect = Some(rect);
+            self.last_surface = surface_size;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+
+    fn ensure_texture(&mut self, device: &wgpu::Device, size: [u32; 2]) {
+        if self.size == size && self.view.is_some() {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pallet.console_log.texture"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pallet.console_log.bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.texture = Some(texture);
+        self.view = Some(view);
+        self.bind_group = Some(bind_group);
+        self.size = size;
+        self.last_rect = None;
     }
 }
 
@@ -1386,10 +2140,20 @@ fn main() {
         }
     };
 
+    let ui_regression = args.ui_regression.clone();
     let mut settings = Settings::load();
+    if let Some(regression) = ui_regression.as_ref() {
+        settings.window_mode = WindowMode::Windowed;
+        settings.resolution = regression.resolution;
+        settings.ui_scale = regression.ui_scale;
+        settings.master_volume = 0.5;
+    }
     let mut last_window_mode = settings.window_mode;
     let mut last_resolution = settings.resolution;
     let mut pending_video_prewarm = args.play_movie.is_some() || args.playlist.is_some();
+    if ui_regression.is_some() {
+        pending_video_prewarm = false;
+    }
     let mut boot_settings = settings.clone();
     let mut boot_apply_fullscreen = false;
     if settings.window_mode == WindowMode::Fullscreen {
@@ -1416,6 +2180,16 @@ fn main() {
         }
     };
     renderer.resize(renderer.window_inner_size());
+    if let Some(regression) = ui_regression.as_ref() {
+        let actual = renderer.size();
+        if actual.width != regression.resolution[0] || actual.height != regression.resolution[1] {
+            eprintln!(
+                "ui regression size mismatch: expected {}x{}, got {}x{}",
+                regression.resolution[0], regression.resolution[1], actual.width, actual.height
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+    }
     let mut pending_resize_clear = pending_video_prewarm || boot.is_hidden();
     if pending_video_prewarm {
         renderer.set_clear_color_rgba(0.0, 0.0, 0.0, 1.0);
@@ -1572,14 +2346,43 @@ fn main() {
 
     let mut input = InputState::default();
     let mut console = ConsoleState::default();
+    let mut modifiers = ModifiersState::default();
+    let mut last_cursor_pos = PhysicalPosition::new(0.0, 0.0);
     let mut input_router = InputRouter::new();
     let mut ui_facade = UiFacade::new(window, renderer.device(), renderer.surface_format());
     let mut ui_state = UiState::default();
-    let mut text_overlay = TextOverlay::new(
+    let text_fonts = TextFontSystem::new();
+    let mut text_overlay = TextOverlay::new_with_font_system(
         renderer.device(),
         renderer.queue(),
         renderer.surface_format(),
+        &text_fonts,
     );
+    let mut hud_overlay = TextOverlay::new_with_font_system(
+        renderer.device(),
+        renderer.queue(),
+        renderer.surface_format(),
+        &text_fonts,
+    );
+    let mut console_log_overlay = TextOverlay::new_with_font_system(
+        renderer.device(),
+        renderer.queue(),
+        renderer.surface_format(),
+        &text_fonts,
+    );
+    let mut console_log_cache = ConsoleLogCache::new(renderer.device(), renderer.surface_format());
+    let ui_regression_capture = ui_regression.as_ref().map(|regression| {
+        FrameCapture::new(
+            renderer.device(),
+            regression.resolution,
+            renderer.surface_format(),
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("ui regression capture init failed: {}", err);
+            std::process::exit(EXIT_UI_REGRESSION);
+        })
+    });
+    let mut ui_regression_done = false;
     let mut hud = HudState::new(Instant::now());
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
@@ -1634,6 +2437,16 @@ fn main() {
         ui_state.menu_open = false;
     }
 
+    if let Some(regression) = ui_regression.as_ref() {
+        setup_ui_regression(
+            &mut ui_state,
+            &mut console,
+            &mut settings,
+            regression,
+            Instant::now(),
+        );
+    }
+
     let mut input_script = if args.input_script {
         Some(InputScript::new(Instant::now(), &settings))
     } else {
@@ -1641,6 +2454,8 @@ fn main() {
     };
 
     let mut last_frame = Instant::now();
+    let exit_code = Rc::new(Cell::new(EXIT_SUCCESS));
+    let exit_code_handle = Rc::clone(&exit_code);
 
     if let Err(err) = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
@@ -1698,6 +2513,9 @@ fn main() {
                         }
                         pending_resize_clear = false;
                     }
+                }
+                WindowEvent::ModifiersChanged(mods) => {
+                    modifiers = mods.state();
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
@@ -1783,11 +2601,30 @@ fn main() {
                             &mut script,
                             video_active,
                         );
+                        let copy_combo = modifiers.control_key() || modifiers.super_key();
+                        if pressed
+                            && !is_repeat
+                            && copy_combo
+                            && code == KeyCode::KeyC
+                            && !video_active
+                            && console.is_interactive()
+                            && input_router.active_layer(
+                                console.is_blocking(),
+                                ui_state.menu_open,
+                            ) == InputLayer::Console
+                        {
+                            if let Some(text) = console.selection_text() {
+                                ui_facade.set_clipboard_text(text);
+                                console.show_toast("Copied", Instant::now());
+                            }
+                            return;
+                        }
                         if pressed
                             && input_router.active_layer(console.is_blocking(), ui_state.menu_open)
                                 == InputLayer::Console
                             && !video_active
                             && console.is_interactive()
+                            && !copy_combo
                         {
                             if let Some(text) = event.text.as_deref() {
                                 if !matches!(
@@ -1814,30 +2651,78 @@ fn main() {
                 }
                 WindowEvent::Ime(_) => {}
                 WindowEvent::MouseInput { state, button, .. } => {
-                    if input_router.active_layer(console.is_blocking(), ui_state.menu_open)
-                        == InputLayer::Game
+                    if console.is_interactive() && button == MouseButton::Left {
+                        let click_x = last_cursor_pos.x as f32;
+                        let click_y = last_cursor_pos.y as f32;
+                        let mut handled_menu = false;
+                        if console.menu_position().is_some() {
+                            if let Some(bounds) = console.menu_bounds() {
+                                if bounds.contains(click_x, click_y) {
+                                    if let Some(text) = console.selection_text() {
+                                        ui_facade.set_clipboard_text(text);
+                                        console.show_toast("Copied", Instant::now());
+                                    }
+                                    handled_menu = true;
+                                }
+                            }
+                            console.close_menu();
+                        }
+                        if !handled_menu {
+                            match state {
+                                ElementState::Pressed => {
+                                    if let Some(line) =
+                                        console.log_line_at(last_cursor_pos.y as f32, false)
+                                    {
+                                        console.start_selection(line);
+                                    } else {
+                                        console.clear_selection();
+                                    }
+                                }
+                                ElementState::Released => {
+                                    console.finish_selection();
+                                }
+                            }
+                        }
+                    } else if console.is_interactive()
                         && button == MouseButton::Right
-                        && state == ElementState::Pressed
+                        && state == ElementState::Released
                     {
-                        mouse_look = !mouse_look;
-                        mouse_grabbed = set_cursor_mode(window, mouse_look);
-                        if mouse_look && !mouse_grabbed {
-                            ignore_cursor_move = center_cursor(window);
+                        if let Some(line) =
+                            console.log_line_at(last_cursor_pos.y as f32, false)
+                        {
+                            if console.selection_text().is_none() {
+                                console.start_selection(line);
+                                console.finish_selection();
+                            }
+                            console.open_menu(TextPosition {
+                                x: last_cursor_pos.x as f32,
+                                y: last_cursor_pos.y as f32,
+                            });
+                        } else {
+                            console.close_menu();
                         }
                     }
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
                     if console.is_interactive() {
-                        let lines = match delta {
-                            MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
-                            MouseScrollDelta::PixelDelta(pos) => (pos.y / 30.0).round() as i32,
+                        let delta_px = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => {
+                                y * console.line_height.max(1.0)
+                            }
+                            MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                         };
-                        if lines != 0 {
-                            console.scroll_by(lines);
+                        if delta_px != 0.0 {
+                            console.scroll_by(delta_px);
                         }
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
+                    last_cursor_pos = position;
+                    if console.is_interactive() && console.is_selecting() {
+                        if let Some(line) = console.log_line_at(position.y as f32, true) {
+                            console.update_selection(line);
+                        }
+                    }
                     if input_router.active_layer(console.is_blocking(), ui_state.menu_open)
                         == InputLayer::Game
                         && scene_active
@@ -1861,7 +2746,15 @@ fn main() {
                     mouse_look = false;
                     mouse_grabbed = set_cursor_mode(window, mouse_look);
                     if console.is_blocking() {
-                        close_console(&mut console, &mut ui_state, window);
+                        close_console(
+                            &mut console,
+                            &mut ui_state,
+                            window,
+                            &mut mouse_look,
+                            &mut mouse_grabbed,
+                            scene_active,
+                            false,
+                        );
                     }
                 }
                 WindowEvent::RedrawRequested => {
@@ -2103,11 +2996,13 @@ fn main() {
                         input_script = None;
                         println!("input script: done");
                     }
-                    let resolution = ResolutionModel::new(
-                        renderer.size(),
-                        window.scale_factor(),
-                        settings.ui_scale,
-                    );
+                    let mut skip_render = false;
+                    let dpi_scale = ui_regression
+                        .as_ref()
+                        .map(|regression| regression.dpi_scale as f64)
+                        .unwrap_or_else(|| window.scale_factor());
+                    let resolution =
+                        ResolutionModel::new(renderer.size(), dpi_scale, settings.ui_scale);
                     println!(
                         "resolution: physical={}x{} dpi_scale={:.3} ui_scale={:.3} logical={:.2}x{:.2} ui_points={:.2}x{:.2}",
                         resolution.physical_px[0],
@@ -2124,17 +3019,25 @@ fn main() {
                         resolution,
                         audio_available: audio.is_some(),
                     };
+                    let mut ui_regression_checks =
+                        ui_regression.as_ref().map(|_| UiRegressionChecks::new(resolution.ui_points));
                     let mut ui_ctx = ui_facade.begin_frame(frame_input);
                     ui_state.console_open = console.is_blocking();
                     ui_facade.build_ui(&mut ui_ctx, &mut ui_state, &mut settings);
+                    if let Some(checks) = ui_regression_checks.as_mut() {
+                        checks.record_min_font(egui_min_font_px(&ui_ctx.egui_ctx));
+                        checks.record_ui_bounds(ui_ctx.egui_ctx.used_rect());
+                    }
                     let ui_draw = ui_facade.end_frame(ui_ctx);
                     input_router.update_ui_focus(
                         ui_draw.output.wants_keyboard,
                         ui_draw.output.wants_pointer,
                     );
                     if ui_draw.output.settings_changed {
-                        if let Err(err) = settings.save() {
-                            eprintln!("settings save failed: {}", err);
+                        if ui_regression.is_none() {
+                            if let Err(err) = settings.save() {
+                                eprintln!("settings save failed: {}", err);
+                            }
                         }
                         if let Some(audio) = audio.as_ref() {
                             audio.set_master_volume(settings.master_volume);
@@ -2151,6 +3054,7 @@ fn main() {
                             last_window_mode = settings.window_mode;
                             last_resolution = settings.resolution;
                         }
+                        skip_render = true;
                     }
                     if ui_draw.output.start_requested {
                         if let Some((quake_dir, map)) = pending_map.take() {
@@ -2187,6 +3091,10 @@ fn main() {
                     }
                     if ui_draw.output.quit_requested {
                         elwt.exit();
+                        return;
+                    }
+                    if skip_render {
+                        renderer.request_redraw();
                         return;
                     }
                     let text_viewport = TextViewport {
@@ -2510,7 +3418,12 @@ fn main() {
 
                     let font_scale = (resolution.dpi_scale * settings.ui_scale).max(0.1);
                     let pre_video_blackout = video.is_some() && !video_frame_visible;
-                    if !pre_video_blackout && scene_active && !ui_state.menu_open {
+                    let show_hud = if ui_regression.is_some() {
+                        true
+                    } else {
+                        scene_active && !ui_state.menu_open
+                    };
+                    if !pre_video_blackout && show_hud {
                         let hud_font_px = (HUD_FONT_SIZE * font_scale).round().max(1.0);
                         let hud_small_px = (HUD_FONT_SIZE_SMALL * font_scale).round().max(1.0);
                         let hud_style = TextStyle {
@@ -2521,9 +3434,15 @@ fn main() {
                             font_size: hud_small_px,
                             color: HUD_TEXT_COLOR,
                         };
-                        let fps = hud.update(now);
-                        let sim_rate = 1.0 / dt.max(0.001);
-                        let net_rate = if loopback.is_some() { 60.0 } else { 0.0 };
+                        let (fps, sim_rate, net_rate) = if ui_regression.is_some() {
+                            (UI_REGRESSION_FPS, UI_REGRESSION_SIM_RATE, UI_REGRESSION_NET_RATE)
+                        } else {
+                            (
+                                hud.update(now),
+                                1.0 / dt.max(0.001),
+                                if loopback.is_some() { 60.0 } else { 0.0 },
+                            )
+                        };
                         let hud_stats_text = format!(
                             "fps: {:>4.0}\nsim: {:>4.0} hz\nnet: {:>4.0} hz",
                             fps, sim_rate, net_rate
@@ -2542,7 +3461,7 @@ fn main() {
                                 .max(hud_margin)
                                 .round(),
                         };
-                        text_overlay.queue(
+                        hud_overlay.queue(
                             TextLayer::Hud,
                             hud_style,
                             hud_origin,
@@ -2553,7 +3472,7 @@ fn main() {
                             hud_stats_text,
                         );
                         let build_text = format!("build: {}", env!("CARGO_PKG_VERSION"));
-                        text_overlay.queue(
+                        hud_overlay.queue(
                             TextLayer::Hud,
                             hud_small_style,
                             TextPosition {
@@ -2566,18 +3485,40 @@ fn main() {
                             },
                             build_text,
                         );
+                        if let Some(checks) = ui_regression_checks.as_mut() {
+                            checks.record_min_font(hud_font_px);
+                            checks.record_min_font(hud_small_px);
+                            let hud_ok = hud_origin.x >= 0.0
+                                && hud_origin.y >= 0.0
+                                && hud_origin.y + hud_total_height
+                                    <= resolution.physical_px[1] as f32;
+                            checks.record_hud_bounds(hud_ok);
+                        }
                     }
 
+                    let mut console_log_update: Option<ConsoleLogUpdate> = None;
+                    let mut console_log_draw: Option<ConsoleLogRect> = None;
+                    console.set_log_area(None);
+                    console.set_menu_bounds(None);
                     if !pre_video_blackout && console.is_visible() {
                         let console_font_px = (CONSOLE_FONT_SIZE * font_scale).round().max(1.0);
                         let console_width = resolution.physical_px[0] as f32;
                         let full_height = (resolution.physical_px[1] as f32
                             * CONSOLE_HEIGHT_RATIO)
-                            .max(console_font_px * 2.0);
+                            .max(console_font_px * 2.0)
+                            .round();
                         let console_height =
                             (full_height * console.height_ratio()).max(1.0).round();
+                        let layout_console_height = if console.is_interactive() {
+                            console_height
+                        } else {
+                            full_height
+                        };
+                        if let Some(checks) = ui_regression_checks.as_mut() {
+                            checks.record_min_font(console_font_px);
+                        }
                         text_overlay.queue_rect(
-                            TextLayer::Console,
+                            TextLayer::ConsoleBackground,
                             TextPosition { x: 0.0, y: 0.0 },
                             TextBounds {
                                 width: console_width,
@@ -2599,12 +3540,26 @@ fn main() {
                             };
                             let line_height =
                                 (console_font_px * LINE_HEIGHT_SCALE).round().max(1.0);
+                            console.line_height = line_height;
                             let log_y = padding;
                             let input_y =
                                 (console_height - input_padding - line_height).max(log_y).round();
+                            let layout_input_y =
+                                (layout_console_height - input_padding - line_height)
+                                    .max(log_y)
+                                    .round();
+                            let input_visible = console_height > input_y + line_height;
+                            if let Some(checks) = ui_regression_checks.as_mut() {
+                                checks.record_console_input(input_visible);
+                            }
                             let separator_thickness = font_scale.round().max(1.0);
                             let separator_gap = (0.25 * font_scale).round().max(0.0);
                             let separator_y = (input_y - separator_gap - separator_thickness)
+                                .max(log_y)
+                                .round();
+                            let layout_separator_y = (layout_input_y
+                                - separator_gap
+                                - separator_thickness)
                                 .max(log_y)
                                 .round();
                             if console_height > input_y + line_height {
@@ -2614,7 +3569,7 @@ fn main() {
                                     (console_height - input_box_top).max(0.0);
                                 if input_box_height > 0.0 {
                                     text_overlay.queue_rect(
-                                        TextLayer::Console,
+                                        TextLayer::ConsoleBackground,
                                         TextPosition {
                                             x: 0.0,
                                             y: input_box_top,
@@ -2627,7 +3582,7 @@ fn main() {
                                     );
                                 }
                                 text_overlay.queue_rect(
-                                    TextLayer::Console,
+                                    TextLayer::ConsoleBackground,
                                     TextPosition {
                                         x: 0.0,
                                         y: separator_y,
@@ -2641,7 +3596,7 @@ fn main() {
                             }
                             if console_height >= separator_thickness {
                                 text_overlay.queue_rect(
-                                    TextLayer::Console,
+                                    TextLayer::ConsoleBackground,
                                     TextPosition {
                                         x: 0.0,
                                         y: console_height - separator_thickness,
@@ -2656,40 +3611,244 @@ fn main() {
 
                             let log_height = (separator_y - log_y).max(0.0);
                             let max_lines = (log_height / line_height).floor() as usize;
+                            let log_text_height = line_height * max_lines as f32;
+                            let layout_log_height = (layout_separator_y - log_y).max(0.0);
+                            let layout_max_lines =
+                                (layout_log_height / line_height).floor() as usize;
+                            let layout_log_text_height = line_height * layout_max_lines as f32;
+                            if log_text_height > 0.0 {
+                                console.set_log_area(Some(ConsoleLogArea {
+                                    y: log_y,
+                                    height: log_text_height,
+                                }));
+                            }
                             console.visible_lines = max_lines;
-                            let max_offset = console.log.len().saturating_sub(max_lines);
-                            console.scroll_offset = console.scroll_offset.min(max_offset);
-                            if max_lines > 0 && console_height > log_y {
+                            let content_height = line_height * console.log.len() as f32;
+                            let max_offset =
+                                (content_height - layout_log_text_height).max(0.0);
+                            console.scroll_offset =
+                                console.scroll_offset.clamp(0.0, max_offset);
+                            if layout_max_lines > 0 && layout_console_height > log_y {
+                                let scroll_px = console.scroll_offset.round();
+                                let scroll_lines = (scroll_px / line_height).floor() as usize;
+                                let scroll_remainder =
+                                    scroll_px - scroll_lines as f32 * line_height;
+                                let extra_line = if scroll_remainder > 0.0 {
+                                    1usize
+                                } else {
+                                    0usize
+                                };
+                                let draw_lines =
+                                    (layout_max_lines + extra_line).min(console.log.len());
                                 let start = console
                                     .log
                                     .len()
-                                    .saturating_sub(max_lines + console.scroll_offset);
-                                let mut visible = String::new();
-                                for (index, line) in console
-                                    .log
-                                    .iter()
-                                    .skip(start)
-                                    .take(max_lines)
-                                    .enumerate()
-                                {
-                                    if index > 0 {
-                                        visible.push('\n');
+                                    .saturating_sub(draw_lines + scroll_lines);
+                                let y_offset = if extra_line == 1 {
+                                    (line_height - scroll_remainder).round()
+                                } else {
+                                    0.0
+                                };
+                                if draw_lines > 0 {
+                                    let scroll_px_u32 = scroll_px.max(0.0) as u32;
+                                    let line_height_px = line_height.round().max(1.0) as u32;
+                                    let font_px = console_font_px.round().max(1.0) as u32;
+                                    let log_size = [
+                                        text_width.round().max(1.0) as u32,
+                                        layout_log_text_height.round().max(1.0) as u32,
+                                    ];
+                                    let selection = console
+                                        .selection_range_limited(CONSOLE_SELECTION_LINE_LIMIT);
+                                    let params = ConsoleLogParams {
+                                        revision: console.log_revision,
+                                        start,
+                                        draw_lines,
+                                        scroll_px: scroll_px_u32,
+                                        line_height_px,
+                                        font_px,
+                                        selection,
+                                    };
+                                    if console_log_cache.needs_update(params, log_size) {
+                                        if let Some((sel_start, sel_end)) = selection {
+                                            let visible_start = start;
+                                            let visible_end =
+                                                start + draw_lines.saturating_sub(1);
+                                            if sel_start <= visible_end
+                                                && sel_end >= visible_start
+                                            {
+                                                let highlight_start =
+                                                    sel_start.max(visible_start);
+                                                let highlight_end =
+                                                    sel_end.min(visible_end);
+                                                for line_index in
+                                                    highlight_start..=highlight_end
+                                                {
+                                                    let line_offset =
+                                                        line_index.saturating_sub(start);
+                                                    let rect_top =
+                                                        -y_offset
+                                                            + line_offset as f32 * line_height;
+                                                    let rect_bottom =
+                                                        rect_top + line_height;
+                                                    let clipped_top = rect_top.max(0.0);
+                                                    let clipped_bottom =
+                                                        rect_bottom.min(layout_log_text_height);
+                                                    if clipped_bottom > clipped_top {
+                                                        console_log_overlay.queue_rect(
+                                                            TextLayer::ConsoleLog,
+                                                            TextPosition {
+                                                                x: 0.0,
+                                                                y: clipped_top,
+                                                            },
+                                                            TextBounds {
+                                                                width: text_width,
+                                                                height: clipped_bottom
+                                                                    - clipped_top,
+                                                            },
+                                                            CONSOLE_SELECTION_COLOR,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let visible_text =
+                                            console.visible_text(start, draw_lines);
+                                        if !visible_text.is_empty() {
+                                            console_log_overlay.queue(
+                                                TextLayer::ConsoleLog,
+                                                console_style,
+                                                TextPosition {
+                                                    x: 0.0,
+                                                    y: -y_offset,
+                                                },
+                                                TextBounds {
+                                                    width: text_width,
+                                                    height: (layout_log_text_height + y_offset)
+                                                        .max(1.0),
+                                                },
+                                                visible_text,
+                                            );
+                                        }
+                                        console_log_update = Some(ConsoleLogUpdate {
+                                            params,
+                                            size: log_size,
+                                            viewport: TextViewport {
+                                                physical_px: log_size,
+                                                dpi_scale: 1.0,
+                                                ui_scale: 1.0,
+                                            },
+                                        });
                                     }
-                                    visible.push_str(line);
-                                }
-                                if !visible.is_empty() {
-                                    text_overlay.queue(
-                                        TextLayer::Console,
-                                        console_style,
-                                        TextPosition {
+                                    if log_text_height > 0.0 {
+                                        console_log_draw = Some(ConsoleLogRect {
                                             x: text_left,
                                             y: log_y,
+                                            width: text_width,
+                                            height: log_text_height,
+                                        });
+                                    }
+                                }
+                            }
+                            if let Some(menu_pos) = console.menu_position() {
+                                let menu_label = "Copy";
+                                let menu_padding =
+                                    (CONSOLE_MENU_PADDING * font_scale).round().max(1.0);
+                                let menu_text_width = (menu_label.len() as f32
+                                    * console_font_px
+                                    * CONSOLE_MENU_CHAR_WIDTH)
+                                    .round()
+                                    .max(1.0);
+                                let menu_width = (menu_text_width + menu_padding * 2.0)
+                                    .max(line_height * 2.0)
+                                    .round();
+                                let menu_height =
+                                    (line_height + menu_padding * 2.0).round().max(1.0);
+                                let menu_x = menu_pos
+                                    .x
+                                    .clamp(0.0, (console_width - menu_width).max(0.0))
+                                    .round();
+                                let menu_y = menu_pos
+                                    .y
+                                    .clamp(0.0, (console_height - menu_height).max(0.0))
+                                    .round();
+                                console.set_menu_bounds(Some(ConsoleMenuBounds {
+                                    x: menu_x,
+                                    y: menu_y,
+                                    width: menu_width,
+                                    height: menu_height,
+                                }));
+                                text_overlay.queue_rect(
+                                    TextLayer::ConsoleMenu,
+                                    TextPosition { x: menu_x, y: menu_y },
+                                    TextBounds {
+                                        width: menu_width,
+                                        height: menu_height,
+                                    },
+                                    CONSOLE_MENU_BG_COLOR,
+                                );
+                                text_overlay.queue(
+                                    TextLayer::ConsoleMenu,
+                                    TextStyle {
+                                        font_size: console_font_px,
+                                        color: CONSOLE_MENU_TEXT_COLOR,
+                                    },
+                                    TextPosition {
+                                        x: (menu_x + menu_padding).round(),
+                                        y: (menu_y + menu_padding).round(),
+                                    },
+                                    TextBounds {
+                                        width: (menu_width - menu_padding * 2.0).max(1.0),
+                                        height: line_height,
+                                    },
+                                    menu_label,
+                                );
+                            }
+                            if let Some(toast) = console.toast.as_ref() {
+                                if now < toast.expires_at {
+                                    let toast_padding =
+                                        (CONSOLE_MENU_PADDING * font_scale).round().max(1.0);
+                                    let toast_text_width = (toast.text.len() as f32
+                                        * console_font_px
+                                        * CONSOLE_MENU_CHAR_WIDTH)
+                                        .round()
+                                        .max(1.0);
+                                    let toast_width =
+                                        (toast_text_width + toast_padding * 2.0).round();
+                                    let toast_height =
+                                        (line_height + toast_padding * 2.0).round().max(1.0);
+                                    let toast_x = (console_width - toast_width - padding)
+                                        .max(0.0)
+                                        .round();
+                                    let toast_y = (log_y + padding)
+                                        .min((console_height - toast_height).max(0.0))
+                                        .round();
+                                    text_overlay.queue_rect(
+                                        TextLayer::ConsoleMenu,
+                                        TextPosition {
+                                            x: toast_x,
+                                            y: toast_y,
                                         },
                                         TextBounds {
-                                            width: text_width,
-                                            height: line_height * max_lines as f32,
+                                            width: toast_width,
+                                            height: toast_height,
                                         },
-                                        visible,
+                                        CONSOLE_MENU_BG_COLOR,
+                                    );
+                                    text_overlay.queue(
+                                        TextLayer::ConsoleMenu,
+                                        TextStyle {
+                                            font_size: console_font_px,
+                                            color: CONSOLE_MENU_TEXT_COLOR,
+                                        },
+                                        TextPosition {
+                                            x: (toast_x + toast_padding).round(),
+                                            y: (toast_y + toast_padding).round(),
+                                        },
+                                        TextBounds {
+                                            width: (toast_width - toast_padding * 2.0).max(1.0),
+                                            height: line_height,
+                                        },
+                                        toast.text.clone(),
                                     );
                                 }
                             }
@@ -2721,26 +3880,161 @@ fn main() {
 
                     let draw_ui = ui_state.menu_open;
                     let draw_text_overlay = !pre_video_blackout;
-                    match renderer.render_with_overlay(|device, queue, encoder, view, _format| {
+                    let render_overlay = |device: &wgpu::Device,
+                                          queue: &wgpu::Queue,
+                                          encoder: &mut wgpu::CommandEncoder,
+                                          view: &wgpu::TextureView,
+                                          _format: wgpu::TextureFormat| {
+                        if let Some(update) = console_log_update {
+                            console_log_cache.update(
+                                device,
+                                queue,
+                                encoder,
+                                &mut console_log_overlay,
+                                update,
+                            );
+                        }
                         ui_facade.render(device, queue, encoder, view, &ui_draw, draw_ui);
                         if draw_text_overlay {
-                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("pallet.text_overlay.pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Load,
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                })],
-                                depth_stencil_attachment: None,
-                                occlusion_query_set: None,
-                                timestamp_writes: None,
-                            });
-                            text_overlay.flush(&mut pass, text_viewport, device, queue);
+                            {
+                                let mut pass =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("pallet.text_overlay.background.pass"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        occlusion_query_set: None,
+                                        timestamp_writes: None,
+                                    });
+                                hud_overlay.flush_layers(
+                                    &mut pass,
+                                    text_viewport,
+                                    device,
+                                    queue,
+                                    &[TextLayer::Hud],
+                                );
+                                text_overlay.flush_layers(
+                                    &mut pass,
+                                    text_viewport,
+                                    device,
+                                    queue,
+                                    &[TextLayer::ConsoleBackground],
+                                );
+                            }
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("pallet.text_overlay.foreground.pass"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    occlusion_query_set: None,
+                                    timestamp_writes: None,
+                                });
+                            if let Some(log_rect) = console_log_draw {
+                                console_log_cache.draw(
+                                    queue,
+                                    &mut pass,
+                                    log_rect,
+                                    resolution.physical_px,
+                                );
+                            }
+                            text_overlay.flush_layers(
+                                &mut pass,
+                                text_viewport,
+                                device,
+                                queue,
+                                &[TextLayer::Console, TextLayer::ConsoleMenu, TextLayer::Ui],
+                            );
                         }
-                    }) {
+                    };
+
+                    if let Some(capture) = ui_regression_capture.as_ref() {
+                        if ui_regression_done {
+                            return;
+                        }
+                        match renderer.render_with_overlay_and_capture(render_overlay, capture) {
+                            Ok(()) => {
+                                if boot.on_present(now, window) && boot_apply_fullscreen {
+                                    apply_window_settings(window, &settings);
+                                    renderer.resize(renderer.window_inner_size());
+                                    pending_resize_clear = true;
+                                    boot_apply_fullscreen = false;
+                                }
+                            }
+                            Err(RenderCaptureError::Surface(err)) => match err {
+                                RenderError::Lost | RenderError::Outdated => {
+                                    renderer.resize(renderer.size());
+                                }
+                                RenderError::OutOfMemory => {
+                                    eprintln!("ui regression render failed: out of memory");
+                                    exit_code_handle.set(EXIT_UI_REGRESSION);
+                                    elwt.exit();
+                                    return;
+                                }
+                                _ => {
+                                    eprintln!("ui regression render failed: {}", err);
+                                    exit_code_handle.set(EXIT_UI_REGRESSION);
+                                    elwt.exit();
+                                    return;
+                                }
+                            },
+                            Err(RenderCaptureError::Capture(err)) => {
+                                eprintln!("ui regression capture encode failed: {}", err);
+                                exit_code_handle.set(EXIT_UI_REGRESSION);
+                                elwt.exit();
+                                return;
+                            }
+                        }
+                        let rgba = match capture.read_rgba(renderer.device()) {
+                            Ok(data) => data,
+                            Err(err) => {
+                                eprintln!("ui regression capture failed: {}", err);
+                                exit_code_handle.set(EXIT_UI_REGRESSION);
+                                elwt.exit();
+                                return;
+                            }
+                        };
+                        let shot_path = ui_regression
+                            .as_ref()
+                            .map(|regression| regression.shot_path.clone())
+                            .unwrap_or_else(|| PathBuf::from("ui_regression.png"));
+                        if let Err(err) = write_png(
+                            &shot_path,
+                            resolution.physical_px[0],
+                            resolution.physical_px[1],
+                            &rgba,
+                        ) {
+                            eprintln!("ui regression write failed: {}", err);
+                            exit_code_handle.set(EXIT_UI_REGRESSION);
+                            elwt.exit();
+                            return;
+                        }
+                        if let Some(checks) = ui_regression_checks.as_ref() {
+                            if let Err(err) = checks.validate() {
+                                eprintln!("ui regression invariant failed: {}", err);
+                                exit_code_handle.set(EXIT_UI_REGRESSION);
+                            }
+                        }
+                        ui_regression_done = true;
+                        elwt.exit();
+                        return;
+                    }
+
+                    match renderer.render_with_overlay(render_overlay) {
                         Ok(()) => {
                             if boot.on_present(now, window) && boot_apply_fullscreen {
                                 apply_window_settings(window, &settings);
@@ -2809,6 +4103,10 @@ fn main() {
     }) {
         eprintln!("event loop exited with error: {}", err);
     }
+    let code = exit_code.get();
+    if code != EXIT_SUCCESS {
+        std::process::exit(code);
+    }
 }
 
 fn parse_args() -> Result<CliArgs, ArgParseError> {
@@ -2819,6 +4117,11 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
     let mut playlist = None;
     let mut script = None;
     let mut input_script = false;
+    let mut ui_regression_shot = None;
+    let mut ui_regression_res = None;
+    let mut ui_regression_dpi = None;
+    let mut ui_regression_ui_scale = None;
+    let mut ui_regression_screen = None;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -2862,6 +4165,47 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
             "--input-script" => {
                 input_script = true;
             }
+            "--ui-regression-shot" => {
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--ui-regression-shot expects a path".into())
+                })?;
+                ui_regression_shot = Some(PathBuf::from(value));
+            }
+            "--ui-regression-res" => {
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--ui-regression-res expects WxH".into())
+                })?;
+                ui_regression_res = Some(parse_resolution_arg(&value).ok_or_else(|| {
+                    ArgParseError::Message("--ui-regression-res expects WxH".into())
+                })?);
+            }
+            "--ui-regression-dpi" => {
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--ui-regression-dpi expects a number".into())
+                })?;
+                ui_regression_dpi = Some(parse_scale_arg(&value).map_err(|_| {
+                    ArgParseError::Message("--ui-regression-dpi expects a number".into())
+                })?);
+            }
+            "--ui-regression-ui-scale" => {
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--ui-regression-ui-scale expects a number".into())
+                })?;
+                ui_regression_ui_scale = Some(parse_scale_arg(&value).map_err(|_| {
+                    ArgParseError::Message("--ui-regression-ui-scale expects a number".into())
+                })?);
+            }
+            "--ui-regression-screen" => {
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--ui-regression-screen expects a value".into())
+                })?;
+                ui_regression_screen =
+                    Some(UiRegressionScreen::parse(&value).ok_or_else(|| {
+                        ArgParseError::Message(
+                            "--ui-regression-screen must be main or options".into(),
+                        )
+                    })?);
+            }
             "-h" | "--help" => return Err(ArgParseError::Help),
             _ => {
                 return Err(ArgParseError::Message(format!(
@@ -2893,6 +4237,55 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
         ));
     }
 
+    let ui_regression = if ui_regression_shot.is_some()
+        || ui_regression_res.is_some()
+        || ui_regression_dpi.is_some()
+        || ui_regression_ui_scale.is_some()
+        || ui_regression_screen.is_some()
+    {
+        let shot_path = ui_regression_shot
+            .ok_or_else(|| ArgParseError::Message("--ui-regression-shot is required".into()))?;
+        let resolution = ui_regression_res
+            .ok_or_else(|| ArgParseError::Message("--ui-regression-res is required".into()))?;
+        let dpi_scale = ui_regression_dpi
+            .ok_or_else(|| ArgParseError::Message("--ui-regression-dpi is required".into()))?;
+        let ui_scale = ui_regression_ui_scale
+            .ok_or_else(|| ArgParseError::Message("--ui-regression-ui-scale is required".into()))?;
+        if dpi_scale <= 0.0 {
+            return Err(ArgParseError::Message(
+                "--ui-regression-dpi must be > 0".into(),
+            ));
+        }
+        if ui_scale <= 0.0 {
+            return Err(ArgParseError::Message(
+                "--ui-regression-ui-scale must be > 0".into(),
+            ));
+        }
+        let screen = ui_regression_screen.unwrap_or(UiRegressionScreen::Main);
+        Some(UiRegressionArgs {
+            shot_path,
+            resolution,
+            dpi_scale,
+            ui_scale,
+            screen,
+        })
+    } else {
+        None
+    };
+
+    if ui_regression.is_some()
+        && (show_image.is_some()
+            || map.is_some()
+            || play_movie.is_some()
+            || playlist.is_some()
+            || script.is_some()
+            || input_script)
+    {
+        return Err(ArgParseError::Message(
+            "--ui-regression-* cannot be combined with other modes".into(),
+        ));
+    }
+
     Ok(CliArgs {
         quake_dir,
         show_image,
@@ -2901,17 +4294,113 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
         playlist,
         script,
         input_script,
+        ui_regression,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <file>] [--script <path>] [--input-script]");
+    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <file>] [--script <path>] [--input-script] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script scripts/demo.lua");
     eprintln!("example: pallet --play-movie intro.ogv");
     eprintln!("example: pallet --playlist movies_playlist.txt");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --input-script");
+    eprintln!("example: pallet --ui-regression-shot ui_regression/shot.png --ui-regression-res 1920x1080 --ui-regression-dpi 1.0 --ui-regression-ui-scale 1.0 --ui-regression-screen main");
+}
+
+fn parse_resolution_arg(value: &str) -> Option<[u32; 2]> {
+    let (width, height) = value
+        .split_once('x')
+        .or_else(|| value.split_once('X'))
+        .or_else(|| value.split_once(','))?;
+    let width = width.trim().parse::<u32>().ok()?;
+    let height = height.trim().parse::<u32>().ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some([width, height])
+}
+
+fn parse_scale_arg(value: &str) -> Result<f32, ()> {
+    let scale = value.trim().parse::<f32>().map_err(|_| ())?;
+    if scale.is_finite() {
+        Ok(scale)
+    } else {
+        Err(())
+    }
+}
+
+fn setup_ui_regression(
+    ui_state: &mut UiState,
+    console: &mut ConsoleState,
+    settings: &mut Settings,
+    regression: &UiRegressionArgs,
+    now: Instant,
+) {
+    settings.window_mode = WindowMode::Windowed;
+    settings.resolution = regression.resolution;
+    settings.ui_scale = regression.ui_scale;
+    settings.master_volume = 0.5;
+    ui_state.menu_open = true;
+    ui_state.menu_mode = MenuMode::Title;
+    ui_state.menu_screen = match regression.screen {
+        UiRegressionScreen::Main => MenuScreen::Main,
+        UiRegressionScreen::Options => MenuScreen::Options,
+    };
+    ui_state.console_open = true;
+    console.force_open(now);
+    console.caret_epoch = now;
+    console.buffer.clear();
+    console.clear_log();
+    console.push_line("ui regression: console log");
+    for index in 0..UI_REGRESSION_LOG_LINE_COUNT {
+        console.push_line(format!(
+            "log {:03}: quick brown fox jumps over line {}",
+            index + 1,
+            index + 1
+        ));
+    }
+}
+
+fn egui_min_font_px(ctx: &egui::Context) -> f32 {
+    let ppp = ctx.pixels_per_point().max(0.001);
+    ctx.style()
+        .text_styles
+        .values()
+        .map(|font_id| font_id.size * ppp)
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn write_png(path: &Path, width: u32, height: u32, data: &[u8]) -> Result<(), String> {
+    let expected = width
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| "png size overflow".to_string())?;
+    if data.len() != expected as usize {
+        return Err(format!(
+            "png data size mismatch (expected {}, got {})",
+            expected,
+            data.len()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            return Err(format!("png create dir failed: {}", err));
+        }
+    }
+    let file = std::fs::File::create(path).map_err(|err| format!("png create failed: {}", err))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|err| format!("png header failed: {}", err))?;
+    writer
+        .write_image_data(data)
+        .map_err(|err| format!("png write failed: {}", err))?;
+    Ok(())
 }
 
 fn load_playlist(path: &Path) -> Result<VecDeque<PlaylistEntry>, ExitError> {
@@ -2991,6 +4480,89 @@ fn parse_command_line(line: &str) -> Option<(String, Vec<String>)> {
     let command = parts.next()?.to_string();
     let args = parts.map(|part| part.to_string()).collect();
     Some((command, args))
+}
+
+fn console_quad_vertices(
+    rect: ConsoleLogRect,
+    surface_size: [u32; 2],
+    uv_max: [f32; 2],
+) -> [ConsoleQuadVertex; 4] {
+    let width = surface_size[0].max(1) as f32;
+    let height = surface_size[1].max(1) as f32;
+    let left = rect.x;
+    let top = rect.y;
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    let (x0, y0) = console_to_ndc(left, top, width, height);
+    let (x1, y1) = console_to_ndc(right, bottom, width, height);
+    [
+        ConsoleQuadVertex {
+            pos: [x0, y0],
+            uv: [0.0, 0.0],
+        },
+        ConsoleQuadVertex {
+            pos: [x1, y0],
+            uv: [uv_max[0], 0.0],
+        },
+        ConsoleQuadVertex {
+            pos: [x1, y1],
+            uv: [uv_max[0], uv_max[1]],
+        },
+        ConsoleQuadVertex {
+            pos: [x0, y1],
+            uv: [0.0, uv_max[1]],
+        },
+    ]
+}
+
+fn console_to_ndc(x: f32, y: f32, width: f32, height: f32) -> (f32, f32) {
+    let nx = (x / width) * 2.0 - 1.0;
+    let ny = 1.0 - (y / height) * 2.0;
+    (nx, ny)
+}
+
+fn console_quad_vertex_bytes(vertices: &[ConsoleQuadVertex]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vertices));
+    for vertex in vertices {
+        for value in vertex.pos {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in vertex.uv {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+fn console_quad_index_bytes(indices: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(indices));
+    for index in indices {
+        bytes.extend_from_slice(&index.to_le_bytes());
+    }
+    bytes
+}
+
+fn handle_console_command(console: &mut ConsoleState, command: &str, args: &[String]) -> bool {
+    match command {
+        "logfill" => {
+            let count = args
+                .first()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(5000)
+                .clamp(1, 20000);
+            console.max_lines = console.max_lines.max(count);
+            console.clear_log();
+            for index in 0..count {
+                console.push_line(format!(
+                    "logfill {:>5}: The quick brown fox jumps over the lazy dog.",
+                    index + 1
+                ));
+            }
+            console.scroll_offset = 0.0;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn load_wav_sfx(quake_dir: &Path, asset: &str) -> Result<Vec<u8>, ExitError> {
@@ -3356,6 +4928,7 @@ fn open_console(
     let now = Instant::now();
     console.caret_epoch = now;
     console.open(now);
+    console.resume_mouse_look = *mouse_look;
     console.buffer.clear();
     ui_state.console_open = console.is_blocking();
     *input = InputState::default();
@@ -3365,10 +4938,23 @@ fn open_console(
     println!("console: open");
 }
 
-fn close_console(console: &mut ConsoleState, ui_state: &mut UiState, window: &Window) {
+fn close_console(
+    console: &mut ConsoleState,
+    ui_state: &mut UiState,
+    window: &Window,
+    mouse_look: &mut bool,
+    mouse_grabbed: &mut bool,
+    scene_active: bool,
+    allow_recapture: bool,
+) {
     console.close(Instant::now());
     console.buffer.clear();
     ui_state.console_open = console.is_blocking();
+    if allow_recapture && scene_active && console.resume_mouse_look && !ui_state.menu_open {
+        *mouse_look = true;
+        *mouse_grabbed = set_cursor_mode(window, *mouse_look);
+    }
+    console.resume_mouse_look = false;
     window.set_ime_allowed(false);
     println!("console: closed");
 }
@@ -3401,7 +4987,15 @@ fn handle_non_video_key_input(
         }
         if input_router.allow_console_toggle(ui_state.menu_open) {
             if console.is_opening() || console.is_interactive() {
-                close_console(console, ui_state, window);
+                close_console(
+                    console,
+                    ui_state,
+                    window,
+                    mouse_look,
+                    mouse_grabbed,
+                    scene_active,
+                    true,
+                );
             } else {
                 open_console(console, ui_state, window, input, mouse_look, mouse_grabbed);
             }
@@ -3410,7 +5004,15 @@ fn handle_non_video_key_input(
     }
     if pressed && !is_repeat && code == KeyCode::Escape {
         if console.is_blocking() {
-            close_console(console, ui_state, window);
+            close_console(
+                console,
+                ui_state,
+                window,
+                mouse_look,
+                mouse_grabbed,
+                scene_active,
+                true,
+            );
             return true;
         }
         if ui_state.menu_open {
@@ -3441,25 +5043,29 @@ fn handle_non_video_key_input(
                             println!("> {}", line);
                             console.push_line(format!("> {}", line));
                             if let Some((command, args)) = parse_command_line(&line) {
-                                if let Some(script) = script.as_mut() {
-                                    match script.engine.run_command(&command, &args) {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            eprintln!("unknown script command: {}", command);
-                                            console.push_line(format!(
-                                                "unknown script command: {}",
-                                                command
-                                            ));
+                                if !handle_console_command(console, &command, &args) {
+                                    if let Some(script) = script.as_mut() {
+                                        match script.engine.run_command(&command, &args) {
+                                            Ok(true) => {}
+                                            Ok(false) => {
+                                                eprintln!("unknown script command: {}", command);
+                                                console.push_line(format!(
+                                                    "unknown script command: {}",
+                                                    command
+                                                ));
+                                            }
+                                            Err(err) => {
+                                                eprintln!("lua command failed: {}", err);
+                                                console.push_line(format!(
+                                                    "lua command failed: {}",
+                                                    err
+                                                ));
+                                            }
                                         }
-                                        Err(err) => {
-                                            eprintln!("lua command failed: {}", err);
-                                            console
-                                                .push_line(format!("lua command failed: {}", err));
-                                        }
+                                    } else {
+                                        eprintln!("no script loaded");
+                                        console.push_line("no script loaded");
                                     }
-                                } else {
-                                    eprintln!("no script loaded");
-                                    console.push_line("no script loaded");
                                 }
                             }
                         }
@@ -3468,18 +5074,20 @@ fn handle_non_video_key_input(
                         console.buffer.pop();
                     }
                     KeyCode::PageUp => {
-                        let page = console.visible_lines.max(1) as i32;
+                        let page =
+                            console.visible_lines.max(1) as f32 * console.line_height.max(1.0);
                         console.scroll_by(page);
                     }
                     KeyCode::PageDown => {
-                        let page = console.visible_lines.max(1) as i32;
+                        let page =
+                            console.visible_lines.max(1) as f32 * console.line_height.max(1.0);
                         console.scroll_by(-page);
                     }
                     KeyCode::Home => {
-                        console.scroll_offset = usize::MAX;
+                        console.scroll_offset = f32::INFINITY;
                     }
                     KeyCode::End => {
-                        console.scroll_offset = 0;
+                        console.scroll_offset = 0.0;
                     }
                     _ => {}
                 }

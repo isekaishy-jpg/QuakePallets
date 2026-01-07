@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use glyphon::{
@@ -44,10 +46,47 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+#[derive(Clone)]
+pub struct TextFontSystem {
+    inner: Rc<RefCell<FontSystem>>,
+}
+
+impl TextFontSystem {
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(create_default_font_system())),
+        }
+    }
+
+    pub fn add_font_bytes(&self, bytes: &[u8]) {
+        let mut font_system = self.inner.borrow_mut();
+        font_system
+            .db_mut()
+            .load_font_source(fontdb::Source::Binary(Arc::new(bytes.to_vec())));
+    }
+}
+
+impl Default for TextFontSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn create_default_font_system() -> FontSystem {
+    FontSystem::new_with_fonts([
+        fontdb::Source::Binary(Arc::new(FIRA_SANS_REGULAR.to_vec())),
+        fontdb::Source::Binary(Arc::new(FIRA_SANS_ITALIC.to_vec())),
+        fontdb::Source::Binary(Arc::new(FIRA_SANS_BOLD.to_vec())),
+    ])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextLayer {
     Hud,
+    ConsoleBackground,
     Console,
+    ConsoleLog,
+    ConsoleMenu,
     Ui,
 }
 
@@ -91,7 +130,7 @@ struct QueuedText {
     style: TextStyle,
     position: TextPosition,
     bounds: TextBounds,
-    text: String,
+    text: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,14 +148,23 @@ struct RectVertex {
     color: [f32; 4],
 }
 
+struct CachedBuffer {
+    buffer: Buffer,
+    text: Arc<str>,
+    metrics: Metrics,
+    bounds: (f32, f32),
+    color: [f32; 4],
+    layer: TextLayer,
+}
+
 pub struct TextOverlay {
-    font_system: FontSystem,
+    font_system: Rc<RefCell<FontSystem>>,
     cache: SwashCache,
     atlas: TextAtlas,
     renderer: TextRenderer,
     queued: Vec<QueuedText>,
     rects: Vec<QueuedRect>,
-    buffers: Vec<Buffer>,
+    buffers: Vec<CachedBuffer>,
     rect_pipeline: Arc<RenderPipeline>,
     rect_vertex_buffer: Arc<WgpuBuffer>,
     rect_vertex_capacity: u64,
@@ -124,12 +172,16 @@ pub struct TextOverlay {
 
 impl TextOverlay {
     pub fn new(device: &Device, queue: &Queue, format: TextureFormat) -> Self {
-        let mut font_system = FontSystem::new();
-        let db = font_system.db_mut();
-        db.load_font_source(fontdb::Source::Binary(Arc::new(FIRA_SANS_REGULAR.to_vec())));
-        db.load_font_source(fontdb::Source::Binary(Arc::new(FIRA_SANS_ITALIC.to_vec())));
-        db.load_font_source(fontdb::Source::Binary(Arc::new(FIRA_SANS_BOLD.to_vec())));
+        let font_system = TextFontSystem::new();
+        Self::new_with_font_system(device, queue, format, &font_system)
+    }
 
+    pub fn new_with_font_system(
+        device: &Device,
+        queue: &Queue,
+        format: TextureFormat,
+        font_system: &TextFontSystem,
+    ) -> Self {
         let mut atlas = TextAtlas::new(device, queue, format);
         let renderer = TextRenderer::new(&mut atlas, device, MultisampleState::default(), None);
 
@@ -143,7 +195,7 @@ impl TextOverlay {
         }));
 
         Self {
-            font_system,
+            font_system: Rc::clone(&font_system.inner),
             cache: SwashCache::new(),
             atlas,
             renderer,
@@ -162,7 +214,7 @@ impl TextOverlay {
         style: TextStyle,
         position: TextPosition,
         bounds: TextBounds,
-        text: impl Into<String>,
+        text: impl Into<Arc<str>>,
     ) {
         self.queued.push(QueuedText {
             layer,
@@ -200,7 +252,13 @@ impl TextOverlay {
             viewport,
             device,
             queue,
-            &[TextLayer::Hud, TextLayer::Console, TextLayer::Ui],
+            &[
+                TextLayer::Hud,
+                TextLayer::ConsoleBackground,
+                TextLayer::Console,
+                TextLayer::ConsoleMenu,
+                TextLayer::Ui,
+            ],
         );
     }
 
@@ -272,28 +330,63 @@ impl TextOverlay {
                 .then_with(|| a.position.y.total_cmp(&b.position.y))
         });
 
-        self.buffers.clear();
-        self.buffers.reserve(queued.len());
+        let mut font_system = self.font_system.borrow_mut();
+        if self.buffers.len() < queued.len() {
+            let needed = queued.len() - self.buffers.len();
+            self.buffers.reserve(needed);
+            for _ in 0..needed {
+                let metrics = Metrics::new(16.0, 16.0 * LINE_HEIGHT_SCALE);
+                let buffer = Buffer::new(&mut font_system, metrics);
+                self.buffers.push(CachedBuffer {
+                    buffer,
+                    text: Arc::from(""),
+                    metrics,
+                    bounds: (0.0, 0.0),
+                    color: [0.0, 0.0, 0.0, 0.0],
+                    layer: TextLayer::Hud,
+                });
+            }
+        }
 
-        for item in &queued {
+        for (index, item) in queued.iter().enumerate() {
+            let cached = &mut self.buffers[index];
             let font_size = item.style.font_size.max(1.0);
-            let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_SCALE);
-            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            let line_height = (font_size * LINE_HEIGHT_SCALE).round().max(1.0);
+            let metrics = Metrics::new(font_size, line_height);
             let width = item.bounds.width.max(1.0);
             let height = item.bounds.height.max(1.0);
-            buffer.set_size(&mut self.font_system, width, height);
-
-            let attrs = Attrs::new()
-                .family(Family::SansSerif)
-                .color(color_from_f32(item.style.color))
-                .metadata(layer_order(item.layer) as usize);
-            buffer.set_text(&mut self.font_system, &item.text, attrs, Shaping::Advanced);
-
-            self.buffers.push(buffer);
+            if cached.metrics != metrics {
+                cached.buffer.set_metrics(&mut font_system, metrics);
+                cached.metrics = metrics;
+            }
+            if cached.bounds != (width, height) {
+                cached.buffer.set_size(&mut font_system, width, height);
+                cached.bounds = (width, height);
+            }
+            let needs_text = cached.text.as_ref() != item.text.as_ref()
+                || cached.color != item.style.color
+                || cached.layer != item.layer;
+            if needs_text {
+                let attrs = Attrs::new()
+                    .family(Family::SansSerif)
+                    .color(color_from_f32(item.style.color))
+                    .metadata(layer_order(item.layer) as usize);
+                let shaping = if matches!(item.layer, TextLayer::Console | TextLayer::ConsoleLog) {
+                    Shaping::Basic
+                } else {
+                    Shaping::Advanced
+                };
+                cached
+                    .buffer
+                    .set_text(&mut font_system, item.text.as_ref(), attrs, shaping);
+                cached.text = item.text.clone();
+                cached.color = item.style.color;
+                cached.layer = item.layer;
+            }
         }
 
         let mut text_areas = Vec::with_capacity(queued.len());
-        for (item, buffer_ref) in queued.iter().zip(self.buffers.iter()) {
+        for (item, cached) in queued.iter().zip(self.buffers.iter()) {
             let width = item.bounds.width.max(1.0);
             let height = item.bounds.height.max(1.0);
             let bounds = GlyphonBounds {
@@ -304,7 +397,7 @@ impl TextOverlay {
             };
 
             text_areas.push(TextArea {
-                buffer: buffer_ref,
+                buffer: &cached.buffer,
                 left: item.position.x,
                 top: item.position.y,
                 scale: 1.0,
@@ -324,7 +417,7 @@ impl TextOverlay {
                 .prepare(
                     device,
                     queue,
-                    &mut self.font_system,
+                    &mut font_system,
                     &mut self.atlas,
                     resolution,
                     text_areas,
@@ -335,8 +428,6 @@ impl TextOverlay {
                 text_ready = true;
             }
         }
-
-        self.buffers.clear();
 
         if rect_vertex_count > 0 {
             pass.set_pipeline(&self.rect_pipeline);
@@ -404,7 +495,10 @@ fn layer_order(layer: TextLayer) -> u8 {
     match layer {
         TextLayer::Hud => 0,
         TextLayer::Ui => 1,
-        TextLayer::Console => 2,
+        TextLayer::ConsoleBackground => 2,
+        TextLayer::Console => 3,
+        TextLayer::ConsoleMenu => 4,
+        TextLayer::ConsoleLog => 5,
     }
 }
 

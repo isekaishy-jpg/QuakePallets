@@ -1,5 +1,5 @@
 use crate::settings::{Settings, WindowMode};
-use egui::Context;
+use egui::{Context, PlatformOutput};
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use egui_winit::State as EguiState;
 use platform_winit::{PhysicalSize, Window};
@@ -160,7 +160,9 @@ impl UiFacade {
     }
 
     pub fn begin_frame(&mut self, input: UiFrameInput) -> UiFrameContext {
-        self.egui_ctx.set_zoom_factor(input.resolution.ui_scale);
+        let native_scale = (self.window.scale_factor() as f32).max(0.0001);
+        let zoom = input.resolution.ui_scale * (input.resolution.dpi_scale / native_scale);
+        self.egui_ctx.set_zoom_factor(zoom.max(0.0001));
         let mut raw_input = self.egui_state.take_egui_input(self.window);
         raw_input.time = raw_input.time.or(Some(0.0));
         self.egui_ctx.begin_frame(raw_input);
@@ -170,6 +172,17 @@ impl UiFacade {
             audio_available: input.audio_available,
             egui_ctx: self.egui_ctx.clone(),
         }
+    }
+
+    pub fn set_clipboard_text(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let output = PlatformOutput {
+            copied_text: text,
+            ..Default::default()
+        };
+        self.egui_state.handle_platform_output(self.window, output);
     }
 
     pub fn build_ui(

@@ -119,13 +119,22 @@ This checklist is intentionally a single vertical slice to avoid coupling with l
   - scrollback region with clipping (render only visible lines)
   - input line with caret
   - bounded ring buffer for log lines (prevent unbounded memory)
+- [x] Console animation + UX polish:
+  - slide in/out with input active only when fully open
+  - caret blink
+  - context menu copy + toast
+  - selection/copy clamp (128 lines)
+- [x] Console performance improvements:
+  - offscreen log cache + draw as textured quad
+  - shared font system across overlays (single font registration set)
+  - HUD rendered via separate overlay pass to avoid glyph invalidation
 
 **DoD**
-- [ ] Console and HUD are crisp and correctly aligned at:
+- [x] Console and HUD are crisp and correctly aligned at:
   - 1280×720, 1920×1080, 3840×2160
   - DPI scale 1.0 and 2.0 (simulated or real)
-- [ ] No per-frame allocations proportional to scrollback size.
-- [ ] Scrolling a long log remains responsive.
+- [x] No per-frame allocations proportional to scrollback size.
+- [x] Scrolling a long log remains responsive.
 
 ---
 
@@ -133,24 +142,24 @@ This checklist is intentionally a single vertical slice to avoid coupling with l
 ### Core requirement
 You must be able to validate UI/text across a matrix without manual resizing.
 
-- [ ] Implement a “UI verification scene” that renders:
+- [x] Implement a “UI verification scene” that renders:
   - main menu (open)
   - options menu (open; sliders set to midpoints)
   - console overlay with a known fixed set of log lines
   - HUD overlay with fixed numeric values
-- [ ] Implement a matrix runner:
+- [x] Implement a matrix runner:
   - resolutions: 720p, 1080p, 1440p, 4K
   - dpi scales: 1.0, 1.5, 2.0 (simulated acceptable)
   - ui scales: 0.85, 1.0, 1.25, 1.5
-- [ ] Implement screenshot capture to PNG for each case:
+- [x] Implement screenshot capture to PNG for each case:
   - file naming includes all parameters
   - output manifest JSON lists each run and file path
 
 **DoD**
-- [ ] One command produces a “UI regression pack”:
+- [x] One command produces a “UI regression pack”:
   - `ui_regression/<timestamp>/manifest.json`
   - `ui_regression/<timestamp>/*.png`
-- [ ] Invariants are checked per case:
+- [x] Invariants are checked per case:
   - minimum font height >= configured px threshold
   - no UI panel exceeds safe area
   - console input line visible

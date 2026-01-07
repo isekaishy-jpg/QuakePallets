@@ -2,11 +2,14 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::mpsc;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
-pub use text_overlay::{TextBounds, TextLayer, TextOverlay, TextPosition, TextStyle, TextViewport};
+pub use text_overlay::{
+    TextBounds, TextFontSystem, TextLayer, TextOverlay, TextPosition, TextStyle, TextViewport,
+};
 pub use wgpu::SurfaceError as RenderError;
 
 mod text_overlay;
@@ -78,6 +81,175 @@ impl fmt::Display for ImageError {
                 plane, expected, actual
             ),
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum CaptureError {
+    SizeMismatch {
+        expected: [u32; 2],
+        actual: [u32; 2],
+    },
+    UnsupportedFormat(wgpu::TextureFormat),
+    MapFailed,
+    BufferOverflow,
+}
+
+impl fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CaptureError::SizeMismatch { expected, actual } => write!(
+                f,
+                "capture size mismatch (expected {}x{}, got {}x{})",
+                expected[0], expected[1], actual[0], actual[1]
+            ),
+            CaptureError::UnsupportedFormat(format) => {
+                write!(f, "capture unsupported format: {:?}", format)
+            }
+            CaptureError::MapFailed => write!(f, "capture buffer map failed"),
+            CaptureError::BufferOverflow => write!(f, "capture buffer size overflow"),
+        }
+    }
+}
+
+impl std::error::Error for CaptureError {}
+
+#[derive(Debug)]
+pub enum RenderCaptureError {
+    Surface(RenderError),
+    Capture(CaptureError),
+}
+
+impl fmt::Display for RenderCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RenderCaptureError::Surface(err) => write!(f, "render error: {}", err),
+            RenderCaptureError::Capture(err) => write!(f, "capture error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for RenderCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RenderCaptureError::Surface(err) => Some(err),
+            RenderCaptureError::Capture(err) => Some(err),
+        }
+    }
+}
+
+pub struct FrameCapture {
+    size: [u32; 2],
+    format: wgpu::TextureFormat,
+    bytes_per_row: u32,
+    padded_bytes_per_row: u32,
+    buffer: wgpu::Buffer,
+}
+
+impl FrameCapture {
+    pub fn new(
+        device: &wgpu::Device,
+        size: [u32; 2],
+        format: wgpu::TextureFormat,
+    ) -> Result<Self, CaptureError> {
+        let bytes_per_row = size[0].checked_mul(4).ok_or(CaptureError::BufferOverflow)?;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = bytes_per_row.div_ceil(align) * align;
+        let buffer_size = (padded_bytes_per_row as u64)
+            .checked_mul(size[1] as u64)
+            .ok_or(CaptureError::BufferOverflow)?;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pallet.frame_capture.buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(Self {
+            size,
+            format,
+            bytes_per_row,
+            padded_bytes_per_row,
+            buffer,
+        })
+    }
+
+    pub fn size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    pub fn encode(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+    ) -> Result<(), CaptureError> {
+        let texture_size = texture.size();
+        let actual = [texture_size.width, texture_size.height];
+        if actual != self.size {
+            return Err(CaptureError::SizeMismatch {
+                expected: self.size,
+                actual,
+            });
+        }
+        let layout = wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(self.padded_bytes_per_row),
+            rows_per_image: Some(self.size[1]),
+        };
+        let copy_size = wgpu::Extent3d {
+            width: self.size[0],
+            height: self.size[1],
+            depth_or_array_layers: 1,
+        };
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &self.buffer,
+                layout,
+            },
+            copy_size,
+        );
+        Ok(())
+    }
+
+    pub fn read_rgba(&self, device: &wgpu::Device) -> Result<Vec<u8>, CaptureError> {
+        let buffer_slice = self.buffer.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        match receiver.recv() {
+            Ok(Ok(())) => {}
+            _ => return Err(CaptureError::MapFailed),
+        }
+        let mapped = buffer_slice.get_mapped_range();
+        let mut rgba =
+            vec![0u8; (self.bytes_per_row as usize).saturating_mul(self.size[1] as usize)];
+        for y in 0..self.size[1] {
+            let src = (y * self.padded_bytes_per_row) as usize;
+            let dst = (y * self.bytes_per_row) as usize;
+            let row = &mapped[src..src + self.bytes_per_row as usize];
+            rgba[dst..dst + self.bytes_per_row as usize].copy_from_slice(row);
+        }
+        drop(mapped);
+        self.buffer.unmap();
+
+        match self.format {
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+                for pixel in rgba.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+            }
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {}
+            other => return Err(CaptureError::UnsupportedFormat(other)),
+        }
+
+        Ok(rgba)
     }
 }
 
@@ -442,6 +614,109 @@ impl<'window> Renderer<'window> {
         Ok(())
     }
 
+    pub fn render_with_overlay_and_capture<F>(
+        &mut self,
+        overlay: F,
+        capture: &FrameCapture,
+    ) -> Result<(), RenderCaptureError>
+    where
+        F: FnOnce(
+            &wgpu::Device,
+            &wgpu::Queue,
+            &mut wgpu::CommandEncoder,
+            &wgpu::TextureView,
+            wgpu::TextureFormat,
+        ),
+    {
+        let frame = self
+            .surface
+            .get_current_texture()
+            .map_err(RenderCaptureError::Surface)?;
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pallet.render.encoder"),
+            });
+        if let Some(scene) = &self.scene {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pallet.render.scene.pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: scene.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            scene.draw(&mut pass);
+        } else {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pallet.render.pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            if let Some(quad) = &self.textured_quad {
+                quad.draw(&mut pass);
+            }
+        }
+
+        if self.scene.is_some() {
+            if let Some(quad) = &self.textured_quad {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("pallet.render.overlay.pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                quad.draw(&mut pass);
+            }
+        }
+        overlay(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &view,
+            self.config.format,
+        );
+        capture
+            .encode(&mut encoder, &frame.texture)
+            .map_err(RenderCaptureError::Capture)?;
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        Ok(())
+    }
+
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -569,7 +844,7 @@ impl<'window> Renderer<'window> {
             .copied()
             .unwrap_or(wgpu::CompositeAlphaMode::Auto);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
             width: size.width,
             height: size.height,
