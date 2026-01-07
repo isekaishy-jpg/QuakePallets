@@ -335,6 +335,7 @@ struct CliArgs {
     script: Option<PathBuf>,
     input_script: bool,
     ui_regression: Option<UiRegressionArgs>,
+    debug_resolution: bool,
 }
 
 enum ArgParseError {
@@ -2341,6 +2342,17 @@ fn main() {
     }
     let mut last_window_mode = settings.window_mode;
     let mut last_resolution = settings.resolution;
+    let mut last_fullscreen_mode = if matches!(
+        settings.window_mode,
+        WindowMode::Fullscreen | WindowMode::Borderless
+    ) {
+        settings.window_mode
+    } else {
+        WindowMode::Fullscreen
+    };
+    let mut window_focused = true;
+    let mut console_fullscreen_override = false;
+    let mut focus_fullscreen_override = false;
     let mut pending_video_prewarm = args.play_movie.is_some() || args.playlist.is_some();
     if ui_regression.is_some() {
         pending_video_prewarm = false;
@@ -2713,6 +2725,46 @@ fn main() {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         let pressed = event.state == ElementState::Pressed;
                         let is_repeat = event.repeat;
+                        let alt_pressed = modifiers.alt_key();
+                        if pressed
+                            && !is_repeat
+                            && alt_pressed
+                            && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter)
+                            && ui_regression.is_none()
+                        {
+                            console_fullscreen_override = false;
+                            focus_fullscreen_override = false;
+                            if settings.window_mode == WindowMode::Windowed {
+                                settings.window_mode = last_fullscreen_mode;
+                            } else {
+                                if settings.window_mode != WindowMode::Windowed {
+                                    last_fullscreen_mode = settings.window_mode;
+                                }
+                                settings.window_mode = WindowMode::Windowed;
+                            }
+                            if settings.window_mode != WindowMode::Windowed {
+                                last_fullscreen_mode = settings.window_mode;
+                            }
+                            apply_window_settings(window, &settings);
+                            renderer.resize(renderer.window_inner_size());
+                            pending_resize_clear = true;
+                            if console.is_blocking()
+                                && settings.window_mode == WindowMode::Fullscreen
+                            {
+                                enable_console_fullscreen_override(
+                                    window,
+                                    &settings,
+                                    &mut console_fullscreen_override,
+                                );
+                            }
+                            if ui_regression.is_none() {
+                                if let Err(err) = settings.save() {
+                                    eprintln!("settings save failed: {}", err);
+                                }
+                            }
+                            last_window_mode = settings.window_mode;
+                            return;
+                        }
                         if pressed && code == KeyCode::Space && video.is_some() {
                             let advanced = advance_playlist(
                                 &mut video,
@@ -2781,6 +2833,8 @@ fn main() {
                             &mut perf,
                             &mut ui_state,
                             window,
+                            &settings,
+                            &mut console_fullscreen_override,
                             &mut input,
                             &mut mouse_look,
                             &mut mouse_grabbed,
@@ -2936,18 +2990,50 @@ fn main() {
                     }
                 }
                 WindowEvent::Focused(false) => {
+                    window_focused = false;
                     mouse_look = false;
                     mouse_grabbed = set_cursor_mode(window, mouse_look);
+                    if settings.window_mode == WindowMode::Fullscreen
+                        && !focus_fullscreen_override
+                    {
+                        set_borderless_fullscreen(window);
+                        focus_fullscreen_override = true;
+                    }
                     if console.is_blocking() {
                         close_console(
                             &mut console,
                             &mut ui_state,
                             window,
+                            &settings,
+                            &mut console_fullscreen_override,
                             &mut mouse_look,
                             &mut mouse_grabbed,
                             scene_active,
                             false,
+                            false,
                         );
+                        console_fullscreen_override = false;
+                    }
+                }
+                WindowEvent::Focused(true) => {
+                    window_focused = true;
+                    if focus_fullscreen_override
+                        && settings.window_mode == WindowMode::Fullscreen
+                        && !console_fullscreen_override
+                    {
+                        apply_window_settings(window, &settings);
+                        renderer.resize(renderer.window_inner_size());
+                        pending_resize_clear = true;
+                    }
+                    focus_fullscreen_override = false;
+                    if console_fullscreen_override
+                        && !console.is_blocking()
+                        && settings.window_mode == WindowMode::Fullscreen
+                    {
+                        apply_window_settings(window, &settings);
+                        renderer.resize(renderer.window_inner_size());
+                        pending_resize_clear = true;
+                        console_fullscreen_override = false;
                     }
                 }
                 WindowEvent::RedrawRequested => {
@@ -2963,6 +3049,16 @@ fn main() {
                         console.buffer.clear();
                         ui_state.console_open = false;
                         window.set_ime_allowed(false);
+                        if console_fullscreen_override
+                            && window_focused
+                            && settings.window_mode == WindowMode::Fullscreen
+                            && !focus_fullscreen_override
+                        {
+                            apply_window_settings(window, &settings);
+                            renderer.resize(renderer.window_inner_size());
+                            pending_resize_clear = true;
+                            console_fullscreen_override = false;
+                        }
                     }
                     console.update(now);
                     update_text_stress(&mut perf, &mut console, now);
@@ -3031,6 +3127,8 @@ fn main() {
                                         &mut perf,
                                         &mut ui_state,
                                         window,
+                                        &settings,
+                                        &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
                                         &mut mouse_grabbed,
@@ -3075,6 +3173,8 @@ fn main() {
                                         &mut perf,
                                         &mut ui_state,
                                         window,
+                                        &settings,
+                                        &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
                                         &mut mouse_grabbed,
@@ -3101,6 +3201,8 @@ fn main() {
                                         &mut perf,
                                         &mut ui_state,
                                         window,
+                                        &settings,
+                                        &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
                                         &mut mouse_grabbed,
@@ -3134,6 +3236,8 @@ fn main() {
                                         &mut perf,
                                         &mut ui_state,
                                         window,
+                                        &settings,
+                                        &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
                                         &mut mouse_grabbed,
@@ -3160,6 +3264,8 @@ fn main() {
                                         &mut perf,
                                         &mut ui_state,
                                         window,
+                                        &settings,
+                                        &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
                                         &mut mouse_grabbed,
@@ -3202,17 +3308,19 @@ fn main() {
                         .unwrap_or_else(|| window.scale_factor());
                     let resolution =
                         ResolutionModel::new(renderer.size(), dpi_scale, settings.ui_scale);
-                    println!(
-                        "resolution: physical={}x{} dpi_scale={:.3} ui_scale={:.3} logical={:.2}x{:.2} ui_points={:.2}x{:.2}",
-                        resolution.physical_px[0],
-                        resolution.physical_px[1],
-                        resolution.dpi_scale,
-                        resolution.ui_scale,
-                        resolution.logical_px[0],
-                        resolution.logical_px[1],
-                        resolution.ui_points[0],
-                        resolution.ui_points[1]
-                    );
+                    if args.debug_resolution {
+                        println!(
+                            "resolution: physical={}x{} dpi_scale={:.3} ui_scale={:.3} logical={:.2}x{:.2} ui_points={:.2}x{:.2}",
+                            resolution.physical_px[0],
+                            resolution.physical_px[1],
+                            resolution.dpi_scale,
+                            resolution.ui_scale,
+                            resolution.logical_px[0],
+                            resolution.logical_px[1],
+                            resolution.ui_points[0],
+                            resolution.ui_points[1]
+                        );
+                    }
                     let frame_input = UiFrameInput {
                         dt_seconds: dt,
                         resolution,
@@ -3254,6 +3362,9 @@ fn main() {
                             pending_resize_clear = true;
                             last_window_mode = settings.window_mode;
                             last_resolution = settings.resolution;
+                            if settings.window_mode != WindowMode::Windowed {
+                                last_fullscreen_mode = settings.window_mode;
+                            }
                         }
                         skip_render = true;
                     }
@@ -4380,6 +4491,7 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
     let mut ui_regression_dpi = None;
     let mut ui_regression_ui_scale = None;
     let mut ui_regression_screen = None;
+    let mut debug_resolution = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -4463,6 +4575,9 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
                             "--ui-regression-screen must be main or options".into(),
                         )
                     })?);
+            }
+            "--debug-resolution" => {
+                debug_resolution = true;
             }
             "-h" | "--help" => return Err(ArgParseError::Help),
             _ => {
@@ -4553,11 +4668,12 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
         script,
         input_script,
         ui_regression,
+        debug_resolution,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <file>] [--script <path>] [--input-script] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
+    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <file>] [--script <path>] [--input-script] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script scripts/demo.lua");
@@ -5345,15 +5461,19 @@ fn normalize_map_asset(name: &str) -> String {
     format!("maps/{}", normalized)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_console(
     console: &mut ConsoleState,
     ui_state: &mut UiState,
     window: &Window,
+    settings: &Settings,
+    console_fullscreen_override: &mut bool,
     input: &mut InputState,
     mouse_look: &mut bool,
     mouse_grabbed: &mut bool,
 ) {
     let now = Instant::now();
+    enable_console_fullscreen_override(window, settings, console_fullscreen_override);
     console.caret_epoch = now;
     console.open(now);
     console.resume_mouse_look = *mouse_look;
@@ -5366,14 +5486,18 @@ fn open_console(
     println!("console: open");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn close_console(
     console: &mut ConsoleState,
     ui_state: &mut UiState,
     window: &Window,
+    settings: &Settings,
+    console_fullscreen_override: &mut bool,
     mouse_look: &mut bool,
     mouse_grabbed: &mut bool,
     scene_active: bool,
     allow_recapture: bool,
+    restore_fullscreen: bool,
 ) {
     console.close(Instant::now());
     console.buffer.clear();
@@ -5385,6 +5509,12 @@ fn close_console(
     console.resume_mouse_look = false;
     window.set_ime_allowed(false);
     println!("console: closed");
+    restore_console_fullscreen_override(
+        window,
+        settings,
+        console_fullscreen_override,
+        restore_fullscreen,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5397,6 +5527,8 @@ fn handle_non_video_key_input(
     perf: &mut PerfState,
     ui_state: &mut UiState,
     window: &Window,
+    settings: &Settings,
+    console_fullscreen_override: &mut bool,
     input: &mut InputState,
     mouse_look: &mut bool,
     mouse_grabbed: &mut bool,
@@ -5420,13 +5552,25 @@ fn handle_non_video_key_input(
                     console,
                     ui_state,
                     window,
+                    settings,
+                    console_fullscreen_override,
                     mouse_look,
                     mouse_grabbed,
                     scene_active,
                     true,
+                    true,
                 );
             } else {
-                open_console(console, ui_state, window, input, mouse_look, mouse_grabbed);
+                open_console(
+                    console,
+                    ui_state,
+                    window,
+                    settings,
+                    console_fullscreen_override,
+                    input,
+                    mouse_look,
+                    mouse_grabbed,
+                );
             }
         }
         return true;
@@ -5437,9 +5581,12 @@ fn handle_non_video_key_input(
                 console,
                 ui_state,
                 window,
+                settings,
+                console_fullscreen_override,
                 mouse_look,
                 mouse_grabbed,
                 scene_active,
+                true,
                 true,
             );
             return true;
@@ -5599,6 +5746,43 @@ fn apply_window_settings(window: &Window, settings: &Settings) {
                 window.set_fullscreen(None);
             }
         }
+    }
+}
+
+fn set_borderless_fullscreen(window: &Window) {
+    let monitor = window
+        .current_monitor()
+        .or_else(|| window.primary_monitor());
+    window.set_fullscreen(Some(Fullscreen::Borderless(monitor)));
+}
+
+fn enable_console_fullscreen_override(
+    window: &Window,
+    settings: &Settings,
+    console_fullscreen_override: &mut bool,
+) {
+    if settings.window_mode == WindowMode::Fullscreen && !*console_fullscreen_override {
+        set_borderless_fullscreen(window);
+        *console_fullscreen_override = true;
+    }
+}
+
+fn restore_console_fullscreen_override(
+    window: &Window,
+    settings: &Settings,
+    console_fullscreen_override: &mut bool,
+    restore_fullscreen: bool,
+) {
+    if !*console_fullscreen_override {
+        return;
+    }
+    if settings.window_mode != WindowMode::Fullscreen {
+        *console_fullscreen_override = false;
+        return;
+    }
+    if restore_fullscreen {
+        apply_window_settings(window, settings);
+        *console_fullscreen_override = false;
     }
 }
 
