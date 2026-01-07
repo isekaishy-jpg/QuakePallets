@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "pallet",
+  "pallet_runner_gui",
   "platform_winit",
   "render_wgpu",
   "audio",

@@ -2015,6 +2015,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet_runner_gui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "platform_winit",
+ "render_wgpu",
+ "wgpu",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
