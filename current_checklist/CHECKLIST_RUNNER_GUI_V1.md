@@ -130,75 +130,75 @@ Action:
 
 ---
 
-## D5 — Debug preset dropdown (data-driven)
+## D5 – Debug preset dropdown (data-driven)
 ### Preset model
-- [ ] Persist `DebugPreset` in config:
+- [x] Persist `DebugPreset` in config:
   - `name`
   - `description` (short)
   - `extra_args: Vec<String>` (appended after `--`)
   - `env: HashMap<String,String>` (e.g., `CRUSTQUAKE_VIDEO_DEBUG=1`)
 
 ### Initial presets (based on current inventory)
-- [ ] `Default` (no extras)
-- [ ] `Video Debug` (env `CRUSTQUAKE_VIDEO_DEBUG=1`)
-- [ ] `Intro Playlist + E1M1` (adds `--playlist movies_playlist.txt --map e1m1`)
+- [x] `Default` (no extras)
+- [x] `Video Debug` (env `CRUSTQUAKE_VIDEO_DEBUG=1`)
+- [x] `Intro Playlist + E1M1` (adds `--playlist movies_playlist.txt --map e1m1`)
 
 **DoD**
-- [ ] Selecting a preset deterministically changes the launch args/env; “Copy command” reflects it.
+- [x] Selecting a preset deterministically changes the launch args/env; “Copy command” reflects it.
 
 ---
 
-## D6 — fmt / clippy / test buttons (repo-root aware)
+## D6 – fmt / clippy / test buttons (repo-root aware)
 Buttons run from `repo_root` and stream output:
-- [ ] `fmt` (prefer `just fmt`; fallback `cargo fmt`)
-- [ ] `clippy` (prefer `just clippy`; fallback `cargo clippy --workspace --all-targets -D warnings`)
-- [ ] `test` (prefer `just test`; fallback `cargo test --workspace`)
-- [ ] Enforce one “build command” at a time (disable others while running)
+- [x] `fmt` (prefer `just fmt`; fallback `cargo fmt`)
+- [x] `clippy` (prefer `just clippy`; fallback `cargo clippy --workspace --all-targets -D warnings`)
+- [x] `test` (prefer `just test`; fallback `cargo test --workspace`)
+- [x] Enforce one “build command” at a time (disable others while running)
 
 **DoD**
-- [ ] One-click fmt/clippy/test works regardless of where the GUI is launched from.
+- [x] One-click fmt/clippy/test works regardless of where the GUI is launched from.
 
 ---
 
-## D7 — Process management
-- [ ] Choose process concurrency model:
+## D7 – Process management
+- [x] Choose process concurrency model:
   - Either one global active process at a time, **or**
   - One active process per lane (Pallet / Tools / Server / Client)
-- [ ] Stop button terminates the correct lane process
-- [ ] On app exit: terminate any children (or prompt)
+- [x] Stop button terminates the correct lane process
+- [x] On app exit: terminate any children (or prompt)
 
 **DoD**
-- [ ] No orphan processes remain after exit.
+- [x] No orphan processes remain after exit.
 
 ---
 
-## D8 — Logging and UX
-- [ ] Central log panel with tabs (Pallet/Tools/Server/Client) or per-tab logs
-- [ ] Log ring buffer (bounded)
-- [ ] “Clear log” button
-- [ ] Display last exit code + duration
-- [ ] Non-blocking validation warnings:
+## D8 – Logging and UX
+- [x] Central log panel with tabs (Pallet/Tools/Server/Client) or per-tab logs
+- [x] Log ring buffer (bounded)
+- [x] “Clear log” button
+- [x] Display last exit code + duration
+- [x] Non-blocking validation warnings:
   - quake dir missing
   - playlist missing when enabled
   - repo root invalid
 
 **DoD**
-- [ ] Output is readable and tool remains responsive during subprocess execution.
+- [x] Output is readable and tool remains responsive during subprocess execution.
 
 ---
 
-## D9 — Console command notes (v1)
-- [ ] Add a small “In-game console notes” panel with copyable snippets:
+## D9 – Console command notes (v1)
+- [x] Add a small “In-game console notes” panel with copyable snippets:
   - `logfill [count]` (1–20000) to stress log rendering.
 
 **DoD**
-- [ ] Runner remains useful without runtime console injection.
+- [x] Runner remains useful without runtime console injection.
 
 ---
 
 ## Acceptance criteria
-- [ ] Main tab: one-click run of `pallet` with `--quake-dir`, `--map`, optional `--playlist`, optional `CRUSTQUAKE_VIDEO_DEBUG=1`.
-- [ ] Tools tab: one-click `smoke` and `pak list/extract`.
-- [ ] Net tab: one-click dedicated server + headless client.
-- [ ] Debug preset dropdown modifies args/env deterministically.
-- [ ] fmt/clippy/test buttons work from repo root and show output.
+- [x] Main tab: one-click run of `pallet` with `--quake-dir`, `--map`, optional `--playlist`, optional `CRUSTQUAKE_VIDEO_DEBUG=1`.
+- [x] Tools tab: one-click `smoke` and `pak list/extract`.
+- [x] Net tab: one-click dedicated server + headless client.
+- [x] Debug preset dropdown modifies args/env deterministically.
+- [x] fmt/clippy/test buttons work from repo root and show output.

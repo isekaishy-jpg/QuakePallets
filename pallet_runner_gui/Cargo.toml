@@ -3,11 +3,17 @@ name = "pallet_runner_gui"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+build = "build.rs"
 
 [dependencies]
 egui = "0.28"
 egui-wgpu = "0.28"
 egui-winit = "0.28"
 platform_winit = { path = "../platform_winit", version = "0.1.0" }
+png = "0.17"
 render_wgpu = { path = "../render_wgpu", version = "0.1.0" }
 wgpu = "0.20"
+winit = "0.29"
+
+[build-dependencies]
+winres = "0.1"

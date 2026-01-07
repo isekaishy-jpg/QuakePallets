@@ -2,8 +2,8 @@
 
 mod config;
 
-use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -15,8 +15,9 @@ use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use egui_winit::State as EguiState;
 use platform_winit::{create_window, ControlFlow, Event, Window, WindowEvent};
 use render_wgpu::RenderError;
+use winit::window::Icon;
 
-use config::RunnerConfig;
+use config::{DebugPresetConfig, RunnerConfig};
 
 const WINDOW_TITLE: &str = "Pallet Runner GUI";
 const WINDOW_WIDTH: u32 = 960;
@@ -78,34 +79,21 @@ enum AppTab {
     Checks,
 }
 
-struct DebugPresetDef {
-    name: &'static str,
-    description: &'static str,
-    extra_args: &'static [&'static str],
-    env: &'static [(&'static str, &'static str)],
+#[derive(Clone, Copy, Debug)]
+enum ChecksAction {
+    Fmt,
+    Clippy,
+    Test,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WindowAction {
+    Minimize,
+    MaximizeToggle,
+    Close,
 }
 
 const LOG_MAX_LINES: usize = 500;
-const DEBUG_PRESETS: &[DebugPresetDef] = &[
-    DebugPresetDef {
-        name: "Default",
-        description: "No extra args or env vars.",
-        extra_args: &[],
-        env: &[],
-    },
-    DebugPresetDef {
-        name: "Video Debug",
-        description: "Enable video/audio debug stats.",
-        extra_args: &[],
-        env: &[("CRUSTQUAKE_VIDEO_DEBUG", "1")],
-    },
-    DebugPresetDef {
-        name: "Intro Playlist + E1M1",
-        description: "Play the intro playlist then load e1m1.",
-        extra_args: &["--playlist", "movies_playlist.txt", "--map", "e1m1"],
-        env: &[],
-    },
-];
 
 const SMOKE_MODES: [&str; 2] = ["no-assets", "quake"];
 
@@ -116,6 +104,8 @@ struct RunnerApp {
     tools_process: ProcessLane,
     server_process: ProcessLane,
     client_process: ProcessLane,
+    checks_process: ProcessLane,
+    pending_window_action: Option<WindowAction>,
     repo_root_input: String,
     repo_root: Option<PathBuf>,
     repo_root_status: StatusLine,
@@ -135,6 +125,7 @@ impl RunnerApp {
         if config.repo_root.is_none() && !repo_root_input.trim().is_empty() {
             config.repo_root = Some(repo_root_input.clone());
         }
+        config.ensure_debug_presets();
         let mut app = Self {
             config,
             active_tab: AppTab::Pallet,
@@ -142,6 +133,8 @@ impl RunnerApp {
             tools_process: ProcessLane::new(LOG_MAX_LINES),
             server_process: ProcessLane::new(LOG_MAX_LINES),
             client_process: ProcessLane::new(LOG_MAX_LINES),
+            checks_process: ProcessLane::new(LOG_MAX_LINES),
+            pending_window_action: None,
             repo_root_input,
             repo_root: None,
             repo_root_status: StatusLine::warn("Repo root not validated."),
@@ -463,6 +456,79 @@ impl RunnerApp {
         }
     }
 
+    fn run_checks_fmt(&mut self) {
+        self.run_checks(ChecksAction::Fmt);
+    }
+
+    fn run_checks_clippy(&mut self) {
+        self.run_checks(ChecksAction::Clippy);
+    }
+
+    fn run_checks_test(&mut self) {
+        self.run_checks(ChecksAction::Test);
+    }
+
+    fn run_checks(&mut self, action: ChecksAction) {
+        match self.build_checks_command(action) {
+            Ok(command) => {
+                if let Err(err) = self.checks_process.start(command) {
+                    self.checks_process.push_system(err);
+                }
+            }
+            Err(err) => {
+                self.checks_process.push_system(err);
+            }
+        }
+    }
+
+    fn build_checks_command(&self, action: ChecksAction) -> Result<Command, String> {
+        let repo_root = self
+            .repo_root
+            .as_ref()
+            .ok_or_else(|| "Repo root is required to run checks.".to_string())?;
+        if self.should_use_just(repo_root) {
+            let mut command = Command::new("just");
+            command.current_dir(repo_root);
+            command.arg(match action {
+                ChecksAction::Fmt => "fmt",
+                ChecksAction::Clippy => "clippy",
+                ChecksAction::Test => "test",
+            });
+            return Ok(command);
+        }
+        let mut command = Command::new("cargo");
+        command.current_dir(repo_root);
+        match action {
+            ChecksAction::Fmt => {
+                command.arg("fmt");
+            }
+            ChecksAction::Clippy => {
+                command
+                    .arg("clippy")
+                    .arg("--workspace")
+                    .arg("--all-targets")
+                    .arg("--")
+                    .arg("-D")
+                    .arg("warnings");
+            }
+            ChecksAction::Test => {
+                command.arg("test").arg("--workspace");
+            }
+        }
+        Ok(command)
+    }
+
+    fn should_use_just(&self, repo_root: &Path) -> bool {
+        if !repo_root.join("justfile").is_file() && !repo_root.join("Justfile").is_file() {
+            return false;
+        }
+        Command::new("just")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
     fn pallet_args(&self) -> Vec<String> {
         let mut args = Vec::new();
         let quake_dir = self.config.quake_dir.trim();
@@ -508,23 +574,29 @@ impl RunnerApp {
         if self.config.input_script {
             args.push("--input-script".to_string());
         }
-        let preset = find_debug_preset(&self.config.debug_preset);
-        for arg in preset.extra_args {
-            args.push(arg.to_string());
+        if let Some(preset) =
+            find_debug_preset(&self.config.debug_presets, &self.config.debug_preset)
+        {
+            for arg in &preset.extra_args {
+                args.push(arg.to_string());
+            }
         }
         args
     }
 
     fn pallet_env(&self) -> Vec<(String, String)> {
-        let mut envs = Vec::new();
+        let mut envs = BTreeMap::new();
         if self.config.video_debug {
-            envs.push(("CRUSTQUAKE_VIDEO_DEBUG".to_string(), "1".to_string()));
+            envs.insert("CRUSTQUAKE_VIDEO_DEBUG".to_string(), "1".to_string());
         }
-        let preset = find_debug_preset(&self.config.debug_preset);
-        for (key, value) in preset.env {
-            envs.push(((*key).to_string(), (*value).to_string()));
+        if let Some(preset) =
+            find_debug_preset(&self.config.debug_presets, &self.config.debug_preset)
+        {
+            for (key, value) in &preset.env {
+                envs.insert(key.to_string(), value.to_string());
+            }
         }
-        envs
+        envs.into_iter().collect()
     }
 
     fn build_pallet_command(&self) -> Result<Command, String> {
@@ -576,11 +648,57 @@ impl RunnerApp {
         }
     }
 
-    fn ui(&mut self, ctx: &Context) {
+    fn pallet_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.repo_root.is_none() {
+            warnings.push("Repo root is not valid; commands will fail.".to_string());
+        }
+        let quake_dir = self.config.quake_dir.trim();
+        if quake_dir.is_empty() {
+            warnings.push("Quake dir is required.".to_string());
+        } else if !Path::new(quake_dir).exists() {
+            warnings.push("Quake dir path does not exist.".to_string());
+        }
+        if self.config.playlist_enabled {
+            match self
+                .config
+                .playlist_path
+                .as_ref()
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+            {
+                Some(path) => {
+                    if !Path::new(path).is_file() {
+                        warnings.push("Playlist path does not exist.".to_string());
+                    }
+                }
+                None => {
+                    warnings.push("Playlist enabled but no playlist file set.".to_string());
+                }
+            }
+        }
+        warnings
+    }
+
+    fn stop_all_processes(&mut self) {
+        self.pallet_process.stop();
+        self.tools_process.stop();
+        self.server_process.stop();
+        self.client_process.stop();
+        self.checks_process.stop();
+    }
+
+    fn take_window_action(&mut self) -> Option<WindowAction> {
+        self.pending_window_action.take()
+    }
+
+    fn ui(&mut self, ctx: &Context, window: &Window) {
         self.pallet_process.poll();
         self.tools_process.poll();
         self.server_process.poll();
         self.client_process.poll();
+        self.checks_process.poll();
+        self.ui_title_bar(ctx, window);
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Pallet Runner GUI");
             ui.add_space(8.0);
@@ -649,10 +767,46 @@ impl RunnerApp {
                     self.ui_net(ui);
                 }
                 AppTab::Checks => {
-                    ui.label("Checks tab coming soon.");
+                    self.ui_checks(ui, ctx);
                 }
             }
         });
+    }
+
+    fn ui_title_bar(&mut self, ctx: &Context, window: &Window) {
+        let title_bar_height = 28.0;
+        egui::TopBottomPanel::top("title_bar")
+            .exact_height(title_bar_height)
+            .show(ctx, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+                let mut block_drag = false;
+                ui.allocate_ui_at_rect(rect, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.label(WINDOW_TITLE);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let close = ui.add_sized([28.0, 20.0], egui::Button::new("X"));
+                            if close.clicked() {
+                                self.pending_window_action = Some(WindowAction::Close);
+                            }
+                            block_drag |= close.hovered();
+                            let max = ui.add_sized([28.0, 20.0], egui::Button::new("[ ]"));
+                            if max.clicked() {
+                                self.pending_window_action = Some(WindowAction::MaximizeToggle);
+                            }
+                            block_drag |= max.hovered();
+                            let min = ui.add_sized([28.0, 20.0], egui::Button::new("_"));
+                            if min.clicked() {
+                                self.pending_window_action = Some(WindowAction::Minimize);
+                            }
+                            block_drag |= min.hovered();
+                        });
+                    });
+                });
+                if response.drag_started() && !block_drag {
+                    let _ = window.drag_window();
+                }
+            });
     }
 
     fn ui_pallet(&mut self, ui: &mut egui::Ui, ctx: &Context) {
@@ -756,19 +910,18 @@ impl RunnerApp {
         egui::ComboBox::from_label("Debug preset")
             .selected_text(self.config.debug_preset.clone())
             .show_ui(ui, |ui| {
-                for preset in debug_presets() {
+                for preset in &self.config.debug_presets {
                     ui.selectable_value(
                         &mut self.config.debug_preset,
-                        preset.name.to_string(),
-                        preset.name,
+                        preset.name.clone(),
+                        preset.name.as_str(),
                     );
                 }
             });
-        if let Some(preset) = debug_presets()
-            .iter()
-            .find(|preset| preset.name == self.config.debug_preset)
+        if let Some(preset) =
+            find_debug_preset(&self.config.debug_presets, &self.config.debug_preset)
         {
-            ui.small(preset.description);
+            ui.small(&preset.description);
         }
         ui.add_space(8.0);
         ui.horizontal_top(|ui| {
@@ -792,9 +945,12 @@ impl RunnerApp {
             }
         });
         ui.add_space(6.0);
+        for warning in self.pallet_warnings() {
+            ui.colored_label(STATUS_WARN, warning);
+        }
         ui.label(self.pallet_process.status_line());
         ui.separator();
-        ui.label("Pallet log");
+        log_header(ui, "Pallet log", &mut self.pallet_process);
         egui::ScrollArea::vertical()
             .id_source("pallet_log")
             .max_height(200.0)
@@ -902,7 +1058,7 @@ impl RunnerApp {
         ui.add_space(6.0);
         ui.label(self.tools_process.status_line());
         ui.separator();
-        ui.label("Tools log");
+        log_header(ui, "Tools log", &mut self.tools_process);
         egui::ScrollArea::vertical()
             .id_source("tools_log")
             .max_height(200.0)
@@ -973,6 +1129,7 @@ impl RunnerApp {
                         }
                     });
                     ui.label(self.server_process.status_line());
+                    log_header(ui, "Server log", &mut self.server_process);
                     let log_height = ui.available_height().max(0.0);
                     egui::ScrollArea::vertical()
                         .id_source("net_server_log")
@@ -1062,6 +1219,7 @@ impl RunnerApp {
                         }
                     });
                     ui.label(self.client_process.status_line());
+                    log_header(ui, "Client log", &mut self.client_process);
                     let log_height = ui.available_height().max(0.0);
                     egui::ScrollArea::vertical()
                         .id_source("net_client_log")
@@ -1074,6 +1232,66 @@ impl RunnerApp {
                 },
             );
         });
+    }
+
+    fn ui_checks(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        ui.heading("Checks");
+        ui.add_space(6.0);
+        let can_run = self.repo_root.is_some();
+        let checks_running = self.checks_process.is_running();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_run && !checks_running, egui::Button::new("fmt"))
+                .clicked()
+            {
+                self.run_checks_fmt();
+            }
+            if ui
+                .add_enabled(can_run && !checks_running, egui::Button::new("clippy"))
+                .clicked()
+            {
+                self.run_checks_clippy();
+            }
+            if ui
+                .add_enabled(can_run && !checks_running, egui::Button::new("test"))
+                .clicked()
+            {
+                self.run_checks_test();
+            }
+            if ui
+                .add_enabled(checks_running, egui::Button::new("Stop"))
+                .clicked()
+            {
+                self.checks_process.stop();
+            }
+        });
+        if !can_run {
+            ui.colored_label(STATUS_WARN, "Select a valid repo root to run checks.");
+        }
+        ui.add_space(6.0);
+        ui.label(self.checks_process.status_line());
+        ui.separator();
+        log_header(ui, "Checks log", &mut self.checks_process);
+        egui::ScrollArea::vertical()
+            .id_source("checks_log")
+            .max_height(220.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                render_log_lines(ui, &self.checks_process.logs);
+            });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label("In-game console notes");
+        ui.horizontal(|ui| {
+            ui.monospace("logfill [count]");
+            ui.label("(1-20000)");
+            if ui.button("Copy").clicked() {
+                ctx.output_mut(|output| {
+                    output.copied_text = "logfill [count]".to_string();
+                });
+            }
+        });
+        ui.small("Use logfill to stress the in-game console log rendering.");
     }
 
     fn save_config(&self) {
@@ -1108,6 +1326,15 @@ fn render_log_lines(ui: &mut egui::Ui, logs: &VecDeque<String>) {
     for line in logs {
         ui.add(egui::Label::new(egui::RichText::new(line).monospace()).wrap());
     }
+}
+
+fn log_header(ui: &mut egui::Ui, title: &str, lane: &mut ProcessLane) {
+    ui.horizontal(|ui| {
+        ui.label(title);
+        if ui.button("Clear log").clicked() {
+            lane.clear();
+        }
+    });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1280,15 +1507,11 @@ fn format_duration(duration: Duration) -> String {
     format!("{:.1}s", seconds)
 }
 
-fn debug_presets() -> &'static [DebugPresetDef] {
-    DEBUG_PRESETS
-}
-
-fn find_debug_preset(name: &str) -> &'static DebugPresetDef {
-    debug_presets()
-        .iter()
-        .find(|preset| preset.name == name)
-        .unwrap_or(&debug_presets()[0])
+fn find_debug_preset<'a>(
+    presets: &'a [DebugPresetConfig],
+    name: &str,
+) -> Option<&'a DebugPresetConfig> {
+    presets.iter().find(|preset| preset.name == name)
 }
 
 fn quote_arg(value: &str) -> String {
@@ -1428,6 +1651,10 @@ fn main() {
             std::process::exit(1);
         });
     let window: &'static Window = Box::leak(Box::new(window));
+    window.set_decorations(false);
+    if let Some(icon) = load_window_icon() {
+        window.set_window_icon(Some(icon));
+    }
     let main_window_id = window.id();
 
     let mut renderer = render_wgpu::Renderer::new(window).unwrap_or_else(|err| {
@@ -1450,6 +1677,7 @@ fn main() {
                 let _ = ui.handle_window_event(window, &event);
                 match event {
                     WindowEvent::CloseRequested => {
+                        app.stop_all_processes();
                         app.save_config();
                         elwt.exit();
                     }
@@ -1466,7 +1694,20 @@ fn main() {
                         last_frame = now;
 
                         let ctx = ui.begin_frame(window, time_seconds);
-                        app.ui(&ctx);
+                        app.ui(&ctx, window);
+                        if let Some(action) = app.take_window_action() {
+                            match action {
+                                WindowAction::Minimize => window.set_minimized(true),
+                                WindowAction::MaximizeToggle => {
+                                    window.set_maximized(!window.is_maximized())
+                                }
+                                WindowAction::Close => {
+                                    app.stop_all_processes();
+                                    app.save_config();
+                                    elwt.exit();
+                                }
+                            }
+                        }
                         let draw_data = ui.end_frame(window);
 
                         let render_result = renderer.render_with_overlay(
@@ -1493,6 +1734,7 @@ fn main() {
                 window.request_redraw();
             }
             Event::LoopExiting => {
+                app.stop_all_processes();
                 app.save_config();
             }
             _ => {}
@@ -1500,6 +1742,48 @@ fn main() {
     }) {
         eprintln!("event loop exited with error: {}", err);
     }
+}
+
+fn load_window_icon() -> Option<Icon> {
+    let bytes = include_bytes!("../../pallet_runner_gui_icon.png");
+    let (rgba, width, height) = decode_png_icon(bytes)?;
+    Icon::from_rgba(rgba, width, height).ok()
+}
+
+fn decode_png_icon(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    let data = &buffer[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgb => {
+            let mut rgba = Vec::with_capacity(data.len() / 3 * 4);
+            for chunk in data.chunks_exact(3) {
+                rgba.extend_from_slice(chunk);
+                rgba.push(255);
+            }
+            rgba
+        }
+        png::ColorType::Grayscale => {
+            let mut rgba = Vec::with_capacity(data.len() * 4);
+            for value in data {
+                rgba.extend_from_slice(&[*value, *value, *value, 255]);
+            }
+            rgba
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let mut rgba = Vec::with_capacity(data.len() / 2 * 4);
+            for chunk in data.chunks_exact(2) {
+                rgba.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
+            }
+            rgba
+        }
+        _ => return None,
+    };
+    Some((rgba, info.width, info.height))
 }
 
 #[cfg(windows)]

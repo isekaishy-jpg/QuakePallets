@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -12,6 +13,14 @@ const DEFAULT_CLIENT_BIND: &str = "0.0.0.0:0";
 const DEFAULT_CLIENT_SERVER: &str = "127.0.0.1:40000";
 
 #[derive(Clone, Debug)]
+pub struct DebugPresetConfig {
+    pub name: String,
+    pub description: String,
+    pub extra_args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct RunnerConfig {
     pub version: u32,
     pub repo_root: Option<String>,
@@ -20,6 +29,7 @@ pub struct RunnerConfig {
     pub playlist_enabled: bool,
     pub playlist_path: Option<String>,
     pub debug_preset: String,
+    pub debug_presets: Vec<DebugPresetConfig>,
     pub video_debug: bool,
     pub show_image: Option<String>,
     pub play_movie: Option<String>,
@@ -54,6 +64,7 @@ impl Default for RunnerConfig {
             playlist_enabled: false,
             playlist_path: None,
             debug_preset: DEFAULT_DEBUG_PRESET.to_string(),
+            debug_presets: default_debug_presets(),
             video_debug: false,
             show_image: None,
             play_movie: None,
@@ -86,7 +97,9 @@ impl RunnerConfig {
         let Ok(contents) = fs::read_to_string(&path) else {
             return Self::default();
         };
-        parse_config(&contents).unwrap_or_default()
+        let mut config = parse_config(&contents).unwrap_or_default();
+        config.ensure_debug_presets();
+        config
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -96,6 +109,21 @@ impl RunnerConfig {
         }
         let data = self.to_json();
         fs::write(path, data)
+    }
+
+    pub fn ensure_debug_presets(&mut self) {
+        if self.debug_presets.is_empty() {
+            self.debug_presets = default_debug_presets();
+        }
+        if !self
+            .debug_presets
+            .iter()
+            .any(|preset| preset.name == self.debug_preset)
+        {
+            if let Some(preset) = self.debug_presets.first() {
+                self.debug_preset = preset.name.clone();
+            }
+        }
     }
 
     fn to_json(&self) -> String {
@@ -113,6 +141,7 @@ impl RunnerConfig {
             true,
         );
         push_string(&mut body, "debug_preset", &self.debug_preset, true);
+        push_debug_presets(&mut body, &self.debug_presets, true);
         push_bool(&mut body, "video_debug", self.video_debug, true);
         push_opt_string(&mut body, "show_image", self.show_image.as_deref(), true);
         push_opt_string(&mut body, "play_movie", self.play_movie.as_deref(), true);
@@ -194,6 +223,9 @@ fn parse_config(contents: &str) -> Option<RunnerConfig> {
     if let Some(value) = parse_json_string(contents, "debug_preset") {
         config.debug_preset = value;
     }
+    if let Some(value) = parse_debug_presets(contents) {
+        config.debug_presets = value;
+    }
     if let Some(value) = parse_json_bool(contents, "video_debug") {
         config.video_debug = value;
     }
@@ -260,7 +292,88 @@ fn parse_config(contents: &str) -> Option<RunnerConfig> {
     if let Some(value) = parse_json_f32(contents, "client_yaw_step") {
         config.client_yaw_step = value;
     }
+    config.ensure_debug_presets();
     Some(config)
+}
+
+fn default_debug_presets() -> Vec<DebugPresetConfig> {
+    vec![
+        DebugPresetConfig {
+            name: "Default".to_string(),
+            description: "No extra args or env vars.".to_string(),
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+        },
+        DebugPresetConfig {
+            name: "Video Debug".to_string(),
+            description: "Enable video/audio debug stats.".to_string(),
+            extra_args: Vec::new(),
+            env: [("CRUSTQUAKE_VIDEO_DEBUG".to_string(), "1".to_string())]
+                .into_iter()
+                .collect(),
+        },
+        DebugPresetConfig {
+            name: "Intro Playlist + E1M1".to_string(),
+            description: "Play the intro playlist then load e1m1.".to_string(),
+            extra_args: vec![
+                "--playlist".to_string(),
+                "movies_playlist.txt".to_string(),
+                "--map".to_string(),
+                "e1m1".to_string(),
+            ],
+            env: BTreeMap::new(),
+        },
+    ]
+}
+
+fn parse_debug_presets(contents: &str) -> Option<Vec<DebugPresetConfig>> {
+    let value = find_json_value(contents, "debug_presets")?;
+    parse_debug_presets_value(value)
+}
+
+fn parse_debug_presets_value(value: &str) -> Option<Vec<DebugPresetConfig>> {
+    let value = value.trim_start();
+    if !value.starts_with('[') {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut idx = 1;
+    let mut presets = Vec::new();
+    while idx < bytes.len() {
+        idx = skip_whitespace(bytes, idx);
+        if idx >= bytes.len() {
+            return None;
+        }
+        match bytes[idx] {
+            b']' => return Some(presets),
+            b',' => {
+                idx += 1;
+                continue;
+            }
+            b'{' => {
+                let slice = &value[idx..];
+                let (object, consumed) = parse_json_object_token(slice)?;
+                let preset = parse_debug_preset_object(&object)?;
+                presets.push(preset);
+                idx += consumed;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn parse_debug_preset_object(contents: &str) -> Option<DebugPresetConfig> {
+    let name = parse_json_string_value(find_json_value(contents, "name")?)?;
+    let description = parse_json_string_value(find_json_value(contents, "description")?)?;
+    let extra_args = parse_json_string_array(find_json_value(contents, "extra_args")?)?;
+    let env = parse_json_string_map(find_json_value(contents, "env")?)?;
+    Some(DebugPresetConfig {
+        name,
+        description,
+        extra_args,
+        env,
+    })
 }
 
 fn parse_json_optional_string(contents: &str, key: &str) -> Option<Option<String>> {
@@ -372,6 +485,134 @@ fn parse_json_token(value: &str) -> Option<&str> {
     }
 }
 
+fn parse_json_string_token(value: &str) -> Option<(String, usize)> {
+    let value = value.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut escaped = false;
+    for (offset, ch) in value.char_indices() {
+        if escaped {
+            match ch {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                _ => out.push(ch),
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some((out, offset + 2)),
+            _ => out.push(ch),
+        }
+    }
+    None
+}
+
+fn parse_json_string_array(value: &str) -> Option<Vec<String>> {
+    let value = value.trim_start();
+    if !value.starts_with('[') {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut idx = 1;
+    let mut items = Vec::new();
+    while idx < bytes.len() {
+        idx = skip_whitespace(bytes, idx);
+        if idx >= bytes.len() {
+            return None;
+        }
+        match bytes[idx] {
+            b']' => return Some(items),
+            b',' => idx += 1,
+            b'"' => {
+                let (item, consumed) = parse_json_string_token(&value[idx..])?;
+                items.push(item);
+                idx += consumed;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn parse_json_string_map(value: &str) -> Option<BTreeMap<String, String>> {
+    let value = value.trim_start();
+    if !value.starts_with('{') {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let mut idx = 1;
+    let mut map = BTreeMap::new();
+    while idx < bytes.len() {
+        idx = skip_whitespace(bytes, idx);
+        if idx >= bytes.len() {
+            return None;
+        }
+        match bytes[idx] {
+            b'}' => return Some(map),
+            b',' => idx += 1,
+            b'"' => {
+                let (key, consumed) = parse_json_string_token(&value[idx..])?;
+                idx += consumed;
+                idx = skip_whitespace(bytes, idx);
+                if bytes.get(idx)? != &b':' {
+                    return None;
+                }
+                idx += 1;
+                idx = skip_whitespace(bytes, idx);
+                let (val, consumed) = parse_json_string_token(&value[idx..])?;
+                idx += consumed;
+                map.insert(key, val);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn parse_json_object_token(value: &str) -> Option<(String, usize)> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in value.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = idx + 1;
+                    return Some((value[..end].to_string(), end));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn skip_whitespace(bytes: &[u8], mut idx: usize) -> usize {
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    idx
+}
+
 fn push_string(output: &mut String, key: &str, value: &str, comma: bool) {
     let escaped = json_escape(value);
     output.push_str(&format!("  \"{}\": \"{}\"", key, escaped));
@@ -433,6 +674,100 @@ fn push_opt_number<T: std::fmt::Display>(
 
 fn push_float(output: &mut String, key: &str, value: f32, comma: bool) {
     output.push_str(&format!("  \"{}\": {}", key, format_float(value)));
+    if comma {
+        output.push(',');
+    }
+    output.push('\n');
+}
+
+fn push_debug_presets(output: &mut String, presets: &[DebugPresetConfig], comma: bool) {
+    output.push_str("  \"debug_presets\": [\n");
+    for (index, preset) in presets.iter().enumerate() {
+        output.push_str("    {\n");
+        push_string_indented(output, "name", &preset.name, true, "      ");
+        push_string_indented(output, "description", &preset.description, true, "      ");
+        push_string_array_indented(output, "extra_args", &preset.extra_args, true, "      ");
+        push_env_map_indented(output, "env", &preset.env, false, "      ");
+        output.push_str("    }");
+        if index + 1 < presets.len() {
+            output.push(',');
+        }
+        output.push('\n');
+    }
+    output.push_str("  ]");
+    if comma {
+        output.push(',');
+    }
+    output.push('\n');
+}
+
+fn push_string_indented(output: &mut String, key: &str, value: &str, comma: bool, indent: &str) {
+    let escaped = json_escape(value);
+    output.push_str(&format!("{indent}\"{}\": \"{}\"", key, escaped));
+    if comma {
+        output.push(',');
+    }
+    output.push('\n');
+}
+
+fn push_string_array_indented(
+    output: &mut String,
+    key: &str,
+    values: &[String],
+    comma: bool,
+    indent: &str,
+) {
+    output.push_str(&format!("{indent}\"{}\": [", key));
+    if values.is_empty() {
+        output.push(']');
+    } else {
+        output.push('\n');
+        for (index, value) in values.iter().enumerate() {
+            output.push_str(indent);
+            output.push_str("  \"");
+            output.push_str(&json_escape(value));
+            output.push('"');
+            if index + 1 < values.len() {
+                output.push(',');
+            }
+            output.push('\n');
+        }
+        output.push_str(indent);
+        output.push(']');
+    }
+    if comma {
+        output.push(',');
+    }
+    output.push('\n');
+}
+
+fn push_env_map_indented(
+    output: &mut String,
+    key: &str,
+    env: &BTreeMap<String, String>,
+    comma: bool,
+    indent: &str,
+) {
+    output.push_str(&format!("{indent}\"{}\": {{", key));
+    if env.is_empty() {
+        output.push('}');
+    } else {
+        output.push('\n');
+        for (index, (env_key, env_value)) in env.iter().enumerate() {
+            output.push_str(indent);
+            output.push_str("  \"");
+            output.push_str(&json_escape(env_key));
+            output.push_str("\": \"");
+            output.push_str(&json_escape(env_value));
+            output.push('"');
+            if index + 1 < env.len() {
+                output.push(',');
+            }
+            output.push('\n');
+        }
+        output.push_str(indent);
+        output.push('}');
+    }
     if comma {
         output.push(',');
     }
