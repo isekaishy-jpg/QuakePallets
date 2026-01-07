@@ -1,4 +1,6 @@
 # CHECKLIST 2 — UI + High-Quality Text + Resolution/DPI Verification (egui + glyphon)
+Status: Complete
+
 
 ## Objective
 Deliver a stable UI and text stack that enables:
@@ -167,22 +169,26 @@ You must be able to validate UI/text across a matrix without manual resizing.
 
 ---
 
-## D5 — Performance measurement and budgets (so “not slow” is provable)
-- [ ] Add CPU timing scopes:
+## D5 ? Performance measurement and budgets (so ?not slow? is provable)
+- [x] Add CPU timing scopes:
   - egui build time
   - glyphon queue/layout time
   - glyphon render time
-- [ ] Establish initial budgets (documented, adjustable):
-  - egui: < X ms at 1080p typical scene
-  - glyphon: < Y ms for HUD+console with N glyphs
-- [ ] Add stress mode:
+- [x] Establish initial budgets (documented, adjustable):
+  - egui: <= 2.0 ms at 1080p typical scene
+  - glyphon prepare: <= 3.0 ms for HUD+console
+  - glyphon render: <= 2.0 ms for HUD+console
+- [x] Add stress mode (console `perf_stress` or `stress_text`):
   - console contains 5k+ lines
   - 50k+ glyphs on screen (worst case)
   - rapid text edits for 5 seconds (typing simulation)
+- [x] Add perf reporting controls:
+  - `perf` prints last timings to console
+  - `perf_hud` toggles HUD overlay
 
 **DoD**
-- [ ] Under stress mode, frame time remains stable (no unbounded growth).
-- [ ] Atlas churn is bounded (no continuous re-upload of the same glyphs).
+- [x] Under stress mode, frame time remains stable (no unbounded growth).
+- [x] Atlas churn is bounded (no continuous re-upload of the same glyphs).
 
 ---
 

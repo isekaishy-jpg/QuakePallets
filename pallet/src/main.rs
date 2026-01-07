@@ -21,7 +21,8 @@ use platform_winit::{
 };
 use render_wgpu::{
     FrameCapture, ImageData, MeshData, MeshVertex, RenderCaptureError, RenderError, TextBounds,
-    TextFontSystem, TextLayer, TextOverlay, TextPosition, TextStyle, TextViewport, YuvImageView,
+    TextFontSystem, TextLayer, TextOverlay, TextOverlayTimings, TextPosition, TextStyle,
+    TextViewport, YuvImageView,
 };
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
@@ -55,6 +56,7 @@ const HUD_FONT_SIZE: f32 = 16.0;
 const HUD_FONT_SIZE_SMALL: f32 = 14.0;
 const CONSOLE_FONT_SIZE: f32 = 14.0;
 const HUD_TEXT_COLOR: [f32; 4] = [0.9, 0.95, 1.0, 1.0];
+const BUILD_TEXT: &str = concat!("build: ", env!("CARGO_PKG_VERSION"));
 const CONSOLE_TEXT_COLOR: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
 const CONSOLE_BG_COLOR: [f32; 4] = [0.05, 0.05, 0.08, 0.75];
 const CONSOLE_SEPARATOR_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.9];
@@ -75,6 +77,18 @@ const UI_REGRESSION_LOG_LINE_COUNT: usize = 24;
 const UI_REGRESSION_FPS: f32 = 144.0;
 const UI_REGRESSION_SIM_RATE: f32 = 60.0;
 const UI_REGRESSION_NET_RATE: f32 = 30.0;
+const PERF_BUDGET_EGUI_MS: f32 = 2.0;
+const PERF_BUDGET_GLYPHON_PREP_MS: f32 = 3.0;
+const PERF_BUDGET_GLYPHON_RENDER_MS: f32 = 2.0;
+const PERF_HUD_UPDATE_MS: u64 = 250;
+const PERF_HUD_EPS_MS: f32 = 0.1;
+const PERF_HUD_LINES: usize = 4;
+const HUD_STATS_UPDATE_MS: u64 = 250;
+const STRESS_GLYPH_TARGET: usize = 50_000;
+const STRESS_LOG_LINES: usize = 5_000;
+const STRESS_EDIT_DURATION_MS: u64 = 5_000;
+const STRESS_EDIT_INTERVAL_MS: u64 = 50;
+const STRESS_FONT_BASE: f32 = 8.0;
 const BOOT_FULLSCREEN_STARTUP_MS: u64 = 300;
 const BOOT_FULLSCREEN_SETTLE_MS: u64 = 120;
 const BOOT_PRESENT_WARMUP: usize = 2;
@@ -1040,19 +1054,20 @@ impl ConsoleLogCache {
         encoder: &mut wgpu::CommandEncoder,
         log_overlay: &mut TextOverlay,
         update: ConsoleLogUpdate,
-    ) {
+    ) -> TextOverlayTimings {
+        let mut timings = TextOverlayTimings::default();
         if update.size[0] == 0 || update.size[1] == 0 {
             self.size = update.size;
             self.texture = None;
             self.view = None;
             self.bind_group = None;
             self.last_params = Some(update.params);
-            return;
+            return timings;
         }
         self.ensure_texture(device, update.size);
         let view = match self.view.as_ref() {
             Some(view) => view,
-            None => return,
+            None => return timings,
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("pallet.console_log.cache.pass"),
@@ -1073,7 +1088,7 @@ impl ConsoleLogCache {
             occlusion_query_set: None,
             timestamp_writes: None,
         });
-        log_overlay.flush_layers(
+        timings = log_overlay.flush_layers_with_timings(
             &mut pass,
             update.viewport,
             device,
@@ -1081,6 +1096,7 @@ impl ConsoleLogCache {
             &[TextLayer::ConsoleLog],
         );
         self.last_params = Some(update.params);
+        timings
     }
 
     fn draw<'pass>(
@@ -1175,6 +1191,12 @@ struct HudState {
     frame_count: u32,
     last_sample: Instant,
     fps: f32,
+    stats_text: Arc<str>,
+    stats_last_update: Instant,
+    stats_dirty: bool,
+    stats_fps: f32,
+    stats_sim: f32,
+    stats_net: f32,
 }
 
 impl HudState {
@@ -1183,6 +1205,12 @@ impl HudState {
             frame_count: 0,
             last_sample: now,
             fps: 0.0,
+            stats_text: Arc::from(""),
+            stats_last_update: now,
+            stats_dirty: true,
+            stats_fps: -1.0,
+            stats_sim: -1.0,
+            stats_net: -1.0,
         }
     }
 
@@ -1194,8 +1222,171 @@ impl HudState {
             self.fps = self.frame_count as f32 / secs;
             self.frame_count = 0;
             self.last_sample = now;
+            self.stats_dirty = true;
         }
         self.fps
+    }
+
+    fn mark_stats_dirty(&mut self) {
+        self.stats_dirty = true;
+    }
+
+    fn stats_text(&mut self, now: Instant, fps: f32, sim_rate: f32, net_rate: f32) -> Arc<str> {
+        let elapsed = now.saturating_duration_since(self.stats_last_update);
+        if self.stats_dirty || elapsed >= Duration::from_millis(HUD_STATS_UPDATE_MS) {
+            self.stats_last_update = now;
+            self.stats_dirty = false;
+            let fps_display = fps.round();
+            let sim_display = sim_rate.round();
+            let net_display = net_rate.round();
+            if fps_display != self.stats_fps
+                || sim_display != self.stats_sim
+                || net_display != self.stats_net
+            {
+                self.stats_fps = fps_display;
+                self.stats_sim = sim_display;
+                self.stats_net = net_display;
+                self.stats_text = Arc::from(format!(
+                    "fps: {:>4.0}\nsim: {:>4.0} hz\nnet: {:>4.0} hz",
+                    fps_display, sim_display, net_display
+                ));
+            }
+        }
+        Arc::clone(&self.stats_text)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PerfTimings {
+    egui_build_ms: f32,
+    glyphon_prepare_ms: f32,
+    glyphon_render_ms: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PerfBudgets {
+    egui_ms: f32,
+    glyphon_prepare_ms: f32,
+    glyphon_render_ms: f32,
+}
+
+impl Default for PerfBudgets {
+    fn default() -> Self {
+        Self {
+            egui_ms: PERF_BUDGET_EGUI_MS,
+            glyphon_prepare_ms: PERF_BUDGET_GLYPHON_PREP_MS,
+            glyphon_render_ms: PERF_BUDGET_GLYPHON_RENDER_MS,
+        }
+    }
+}
+
+struct StressState {
+    end_at: Instant,
+    edit_end: Instant,
+    next_edit: Instant,
+    edit_index: usize,
+    glyph_text: Arc<str>,
+    font_px: f32,
+    line_height: f32,
+    cols: usize,
+    rows: usize,
+    glyphs: usize,
+}
+
+struct PerfState {
+    show_overlay: bool,
+    budgets: PerfBudgets,
+    last: PerfTimings,
+    stress: Option<StressState>,
+    stress_requested: bool,
+    hud_text: Arc<str>,
+    hud_last_update: Instant,
+    hud_dirty: bool,
+    hud_snapshot: PerfHudSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PerfHudSnapshot {
+    egui_ms: f32,
+    glyphon_prepare_ms: f32,
+    glyphon_render_ms: f32,
+    stress_glyphs: usize,
+    stress_cols: usize,
+    stress_rows: usize,
+}
+
+impl PerfState {
+    fn new() -> Self {
+        Self {
+            show_overlay: false,
+            budgets: PerfBudgets::default(),
+            last: PerfTimings::default(),
+            stress: None,
+            stress_requested: false,
+            hud_text: Arc::from(""),
+            hud_last_update: Instant::now(),
+            hud_dirty: true,
+            hud_snapshot: PerfHudSnapshot::default(),
+        }
+    }
+
+    fn update(&mut self, timings: PerfTimings) {
+        self.last = timings;
+    }
+
+    fn toggle_overlay(&mut self) {
+        self.show_overlay = !self.show_overlay;
+        self.hud_dirty = true;
+    }
+
+    fn hud_text(&mut self, now: Instant) -> Arc<str> {
+        let elapsed = now.saturating_duration_since(self.hud_last_update);
+        if self.hud_dirty || elapsed >= Duration::from_millis(PERF_HUD_UPDATE_MS) {
+            self.hud_last_update = now;
+            self.hud_dirty = false;
+            let display = PerfTimings {
+                egui_build_ms: quantize_ms(self.last.egui_build_ms),
+                glyphon_prepare_ms: quantize_ms(self.last.glyphon_prepare_ms),
+                glyphon_render_ms: quantize_ms(self.last.glyphon_render_ms),
+            };
+            let (stress_glyphs, stress_cols, stress_rows) =
+                if let Some(stress) = self.stress.as_ref() {
+                    (stress.glyphs, stress.cols, stress.rows)
+                } else {
+                    (0, 0, 0)
+                };
+            let snapshot = PerfHudSnapshot {
+                egui_ms: display.egui_build_ms,
+                glyphon_prepare_ms: display.glyphon_prepare_ms,
+                glyphon_render_ms: display.glyphon_render_ms,
+                stress_glyphs,
+                stress_cols,
+                stress_rows,
+            };
+            if snapshot != self.hud_snapshot {
+                self.hud_snapshot = snapshot;
+                let lines = perf_summary_lines_with(self.budgets, display, self.stress.as_ref());
+                let mut text = lines[0].clone();
+                for line in lines.iter().skip(1) {
+                    text.push('\n');
+                    text.push_str(line);
+                }
+                self.hud_text = Arc::from(text);
+            }
+        }
+        Arc::clone(&self.hud_text)
+    }
+
+    fn request_stress_toggle(&mut self) -> bool {
+        if self.stress.is_some() || self.stress_requested {
+            self.stress = None;
+            self.stress_requested = false;
+            false
+        } else {
+            self.stress_requested = true;
+            self.hud_dirty = true;
+            true
+        }
     }
 }
 
@@ -2384,6 +2575,7 @@ fn main() {
     });
     let mut ui_regression_done = false;
     let mut hud = HudState::new(Instant::now());
+    let mut perf = PerfState::new();
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
     let mut fly_mode = false;
@@ -2586,6 +2778,7 @@ fn main() {
                             is_repeat,
                             &input_router,
                             &mut console,
+                            &mut perf,
                             &mut ui_state,
                             window,
                             &mut input,
@@ -2772,6 +2965,7 @@ fn main() {
                         window.set_ime_allowed(false);
                     }
                     console.update(now);
+                    update_text_stress(&mut perf, &mut console, now);
                     window.set_ime_allowed(console.is_interactive());
                     let mut finish_input_script = false;
                     if let Some(scripted) = input_script.as_mut() {
@@ -2834,6 +3028,7 @@ fn main() {
                                         false,
                                         &input_router,
                                         &mut console,
+                                        &mut perf,
                                         &mut ui_state,
                                         window,
                                         &mut input,
@@ -2877,6 +3072,7 @@ fn main() {
                                         false,
                                         &input_router,
                                         &mut console,
+                                        &mut perf,
                                         &mut ui_state,
                                         window,
                                         &mut input,
@@ -2902,6 +3098,7 @@ fn main() {
                                         false,
                                         &input_router,
                                         &mut console,
+                                        &mut perf,
                                         &mut ui_state,
                                         window,
                                         &mut input,
@@ -2934,6 +3131,7 @@ fn main() {
                                         false,
                                         &input_router,
                                         &mut console,
+                                        &mut perf,
                                         &mut ui_state,
                                         window,
                                         &mut input,
@@ -2959,6 +3157,7 @@ fn main() {
                                         false,
                                         &input_router,
                                         &mut console,
+                                        &mut perf,
                                         &mut ui_state,
                                         window,
                                         &mut input,
@@ -3019,6 +3218,7 @@ fn main() {
                         resolution,
                         audio_available: audio.is_some(),
                     };
+                    let egui_start = Instant::now();
                     let mut ui_regression_checks =
                         ui_regression.as_ref().map(|_| UiRegressionChecks::new(resolution.ui_points));
                     let mut ui_ctx = ui_facade.begin_frame(frame_input);
@@ -3029,6 +3229,7 @@ fn main() {
                         checks.record_ui_bounds(ui_ctx.egui_ctx.used_rect());
                     }
                     let ui_draw = ui_facade.end_frame(ui_ctx);
+                    let egui_build_ms = egui_start.elapsed().as_secs_f32() * 1000.0;
                     input_router.update_ui_focus(
                         ui_draw.output.wants_keyboard,
                         ui_draw.output.wants_pointer,
@@ -3417,6 +3618,10 @@ fn main() {
                     }
 
                     let font_scale = (resolution.dpi_scale * settings.ui_scale).max(0.1);
+                    if perf.stress_requested {
+                        start_text_stress(&mut perf, &mut console, resolution, font_scale, now);
+                        perf.stress_requested = false;
+                    }
                     let pre_video_blackout = video.is_some() && !video_frame_visible;
                     let show_hud = if ui_regression.is_some() {
                         true
@@ -3435,6 +3640,7 @@ fn main() {
                             color: HUD_TEXT_COLOR,
                         };
                         let (fps, sim_rate, net_rate) = if ui_regression.is_some() {
+                            hud.mark_stats_dirty();
                             (UI_REGRESSION_FPS, UI_REGRESSION_SIM_RATE, UI_REGRESSION_NET_RATE)
                         } else {
                             (
@@ -3443,10 +3649,7 @@ fn main() {
                                 if loopback.is_some() { 60.0 } else { 0.0 },
                             )
                         };
-                        let hud_stats_text = format!(
-                            "fps: {:>4.0}\nsim: {:>4.0} hz\nnet: {:>4.0} hz",
-                            fps, sim_rate, net_rate
-                        );
+                        let hud_stats_text = hud.stats_text(now, fps, sim_rate, net_rate);
                         let hud_margin = (16.0 * font_scale).round().max(1.0);
                         let hud_line_height =
                             (hud_font_px * LINE_HEIGHT_SCALE).round().max(1.0);
@@ -3471,7 +3674,6 @@ fn main() {
                             },
                             hud_stats_text,
                         );
-                        let build_text = format!("build: {}", env!("CARGO_PKG_VERSION"));
                         hud_overlay.queue(
                             TextLayer::Hud,
                             hud_small_style,
@@ -3483,8 +3685,30 @@ fn main() {
                                 width: resolution.physical_px[0] as f32,
                                 height: build_line_height,
                             },
-                            build_text,
+                            BUILD_TEXT,
                         );
+                        if perf.show_overlay {
+                            let perf_text = perf.hud_text(now);
+                            let perf_line_height =
+                                (hud_small_px * LINE_HEIGHT_SCALE).round().max(1.0);
+                            let perf_height = perf_line_height * PERF_HUD_LINES as f32;
+                            let perf_y = (hud_origin.y - perf_height - hud_margin)
+                                .max(hud_margin)
+                                .round();
+                            hud_overlay.queue(
+                                TextLayer::Hud,
+                                hud_small_style,
+                                TextPosition {
+                                    x: hud_margin,
+                                    y: perf_y,
+                                },
+                                TextBounds {
+                                    width: resolution.physical_px[0] as f32,
+                                    height: perf_height,
+                                },
+                                perf_text,
+                            );
+                        }
                         if let Some(checks) = ui_regression_checks.as_mut() {
                             checks.record_min_font(hud_font_px);
                             checks.record_min_font(hud_small_px);
@@ -3877,22 +4101,43 @@ fn main() {
                             }
                         }
                     }
+                    if !pre_video_blackout {
+                        if let Some(stress) = perf.stress.as_ref() {
+                            let stress_style = TextStyle {
+                                font_size: stress.font_px,
+                                color: [0.85, 0.85, 0.9, 0.35],
+                            };
+                            let stress_height = stress.line_height * stress.rows as f32;
+                            text_overlay.queue(
+                                TextLayer::Stress,
+                                stress_style,
+                                TextPosition { x: 0.0, y: 0.0 },
+                                TextBounds {
+                                    width: resolution.physical_px[0] as f32,
+                                    height: stress_height.max(1.0),
+                                },
+                                stress.glyph_text.clone(),
+                            );
+                        }
+                    }
 
                     let draw_ui = ui_state.menu_open;
                     let draw_text_overlay = !pre_video_blackout;
+                    let mut glyphon_timings = TextOverlayTimings::default();
                     let render_overlay = |device: &wgpu::Device,
                                           queue: &wgpu::Queue,
                                           encoder: &mut wgpu::CommandEncoder,
                                           view: &wgpu::TextureView,
                                           _format: wgpu::TextureFormat| {
                         if let Some(update) = console_log_update {
-                            console_log_cache.update(
+                            let timings = console_log_cache.update(
                                 device,
                                 queue,
                                 encoder,
                                 &mut console_log_overlay,
                                 update,
                             );
+                            glyphon_timings.add(timings);
                         }
                         ui_facade.render(device, queue, encoder, view, &ui_draw, draw_ui);
                         if draw_text_overlay {
@@ -3914,20 +4159,22 @@ fn main() {
                                         occlusion_query_set: None,
                                         timestamp_writes: None,
                                     });
-                                hud_overlay.flush_layers(
+                                let timings = hud_overlay.flush_layers_with_timings(
                                     &mut pass,
                                     text_viewport,
                                     device,
                                     queue,
                                     &[TextLayer::Hud],
                                 );
-                                text_overlay.flush_layers(
+                                glyphon_timings.add(timings);
+                                let timings = text_overlay.flush_layers_with_timings(
                                     &mut pass,
                                     text_viewport,
                                     device,
                                     queue,
-                                    &[TextLayer::ConsoleBackground],
+                                    &[TextLayer::Stress, TextLayer::ConsoleBackground],
                                 );
+                                glyphon_timings.add(timings);
                             }
                             let mut pass =
                                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3952,13 +4199,14 @@ fn main() {
                                     resolution.physical_px,
                                 );
                             }
-                            text_overlay.flush_layers(
+                            let timings = text_overlay.flush_layers_with_timings(
                                 &mut pass,
                                 text_viewport,
                                 device,
                                 queue,
                                 &[TextLayer::Console, TextLayer::ConsoleMenu, TextLayer::Ui],
                             );
+                            glyphon_timings.add(timings);
                         }
                     };
 
@@ -3968,6 +4216,11 @@ fn main() {
                         }
                         match renderer.render_with_overlay_and_capture(render_overlay, capture) {
                             Ok(()) => {
+                                perf.update(PerfTimings {
+                                    egui_build_ms,
+                                    glyphon_prepare_ms: glyphon_timings.prepare_ms,
+                                    glyphon_render_ms: glyphon_timings.render_ms,
+                                });
                                 if boot.on_present(now, window) && boot_apply_fullscreen {
                                     apply_window_settings(window, &settings);
                                     renderer.resize(renderer.window_inner_size());
@@ -4036,6 +4289,11 @@ fn main() {
 
                     match renderer.render_with_overlay(render_overlay) {
                         Ok(()) => {
+                            perf.update(PerfTimings {
+                                egui_build_ms,
+                                glyphon_prepare_ms: glyphon_timings.prepare_ms,
+                                glyphon_render_ms: glyphon_timings.render_ms,
+                            });
                             if boot.on_present(now, window) && boot_apply_fullscreen {
                                 apply_window_settings(window, &settings);
                                 renderer.resize(renderer.window_inner_size());
@@ -4363,6 +4621,143 @@ fn setup_ui_regression(
     }
 }
 
+fn fill_log_lines(console: &mut ConsoleState, count: usize) {
+    let count = count.clamp(1, 20_000);
+    console.max_lines = console.max_lines.max(count);
+    console.clear_log();
+    for index in 0..count {
+        console.push_line(format!(
+            "logfill {:>5}: The quick brown fox jumps over the lazy dog.",
+            index + 1
+        ));
+    }
+    console.scroll_offset = 0.0;
+}
+
+fn build_stress_text(cols: usize, rows: usize) -> Arc<str> {
+    let pattern = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut text = String::with_capacity(rows.saturating_mul(cols + 1));
+    for row in 0..rows {
+        for col in 0..cols {
+            let index = (row + col) % pattern.len();
+            text.push(pattern[index] as char);
+        }
+        if row + 1 < rows {
+            text.push('\n');
+        }
+    }
+    Arc::from(text)
+}
+
+fn start_text_stress(
+    perf: &mut PerfState,
+    console: &mut ConsoleState,
+    resolution: ResolutionModel,
+    font_scale: f32,
+    now: Instant,
+) {
+    fill_log_lines(console, STRESS_LOG_LINES);
+    console.force_open(now);
+
+    let width = resolution.physical_px[0].max(1) as f32;
+    let height = resolution.physical_px[1].max(1) as f32;
+    let mut font_px = (STRESS_FONT_BASE * font_scale).round().max(4.0);
+    let (cols, rows, line_height, font_px) = loop {
+        let char_width = (font_px * CONSOLE_MENU_CHAR_WIDTH).max(1.0);
+        let line_height = (font_px * LINE_HEIGHT_SCALE).round().max(1.0);
+        let cols = (width / char_width).floor().max(1.0) as usize;
+        let mut rows = (height / line_height).floor().max(1.0) as usize;
+        let total = cols.saturating_mul(rows);
+        if total >= STRESS_GLYPH_TARGET || font_px <= 4.0 {
+            if total < STRESS_GLYPH_TARGET {
+                let needed_rows = STRESS_GLYPH_TARGET.div_ceil(cols);
+                rows = rows.max(needed_rows);
+            }
+            break (cols, rows, line_height, font_px);
+        }
+        font_px = (font_px - 1.0).max(4.0);
+    };
+    let glyphs = cols.saturating_mul(rows);
+    let glyph_text = build_stress_text(cols, rows);
+    let end_at = now + Duration::from_millis(STRESS_EDIT_DURATION_MS);
+    perf.stress = Some(StressState {
+        end_at,
+        edit_end: end_at,
+        next_edit: now,
+        edit_index: 0,
+        glyph_text,
+        font_px,
+        line_height,
+        cols,
+        rows,
+        glyphs,
+    });
+}
+
+fn update_text_stress(perf: &mut PerfState, console: &mut ConsoleState, now: Instant) {
+    let Some(stress) = perf.stress.as_mut() else {
+        return;
+    };
+    if now >= stress.end_at {
+        perf.stress = None;
+        perf.hud_dirty = true;
+        return;
+    }
+    if now >= stress.edit_end || now < stress.next_edit {
+        return;
+    }
+    let ch = ((stress.edit_index % 26) as u8 + b'a') as char;
+    console.buffer.push(ch);
+    if console.buffer.len() > 48 {
+        console.buffer.clear();
+    }
+    stress.edit_index = stress.edit_index.saturating_add(1);
+    stress.next_edit = now + Duration::from_millis(STRESS_EDIT_INTERVAL_MS);
+}
+
+fn perf_summary_lines(perf: &PerfState) -> [String; 4] {
+    perf_summary_lines_with(perf.budgets, perf.last, perf.stress.as_ref())
+}
+
+fn quantize_ms(value: f32) -> f32 {
+    if PERF_HUD_EPS_MS <= 0.0 {
+        return value;
+    }
+    (value / PERF_HUD_EPS_MS).round() * PERF_HUD_EPS_MS
+}
+
+fn perf_summary_lines_with(
+    budgets: PerfBudgets,
+    timings: PerfTimings,
+    stress: Option<&StressState>,
+) -> [String; 4] {
+    [
+        format!(
+            "perf egui: {:>4.2} ms (<= {:.2})",
+            timings.egui_build_ms, budgets.egui_ms
+        ),
+        format!(
+            "perf glyphon prep: {:>4.2} ms (<= {:.2})",
+            timings.glyphon_prepare_ms, budgets.glyphon_prepare_ms
+        ),
+        format!(
+            "perf glyphon render: {:>4.2} ms (<= {:.2})",
+            timings.glyphon_render_ms, budgets.glyphon_render_ms
+        ),
+        format!(
+            "perf stress: {}",
+            if let Some(stress) = stress {
+                format!(
+                    "on ({} glyphs, {}x{})",
+                    stress.glyphs, stress.cols, stress.rows
+                )
+            } else {
+                "off".to_string()
+            }
+        ),
+    ]
+}
+
 fn egui_min_font_px(ctx: &egui::Context) -> f32 {
     let ppp = ctx.pixels_per_point().max(0.001);
     ctx.style()
@@ -4542,23 +4937,56 @@ fn console_quad_index_bytes(indices: &[u16]) -> Vec<u8> {
     bytes
 }
 
-fn handle_console_command(console: &mut ConsoleState, command: &str, args: &[String]) -> bool {
+fn handle_console_command(
+    console: &mut ConsoleState,
+    perf: &mut PerfState,
+    command: &str,
+    args: &[String],
+) -> bool {
     match command {
         "logfill" => {
             let count = args
                 .first()
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(5000)
-                .clamp(1, 20000);
-            console.max_lines = console.max_lines.max(count);
-            console.clear_log();
-            for index in 0..count {
-                console.push_line(format!(
-                    "logfill {:>5}: The quick brown fox jumps over the lazy dog.",
-                    index + 1
-                ));
+                .unwrap_or(5_000)
+                .clamp(1, 20_000);
+            fill_log_lines(console, count);
+            true
+        }
+        "perf" => {
+            for line in perf_summary_lines(perf) {
+                console.push_line(line);
             }
-            console.scroll_offset = 0.0;
+            true
+        }
+        "perf_hud" => {
+            let toggle = match args.first().map(|value| value.as_str()) {
+                Some("on") => {
+                    perf.show_overlay = true;
+                    true
+                }
+                Some("off") => {
+                    perf.show_overlay = false;
+                    false
+                }
+                _ => {
+                    perf.toggle_overlay();
+                    perf.show_overlay
+                }
+            };
+            console.push_line(format!(
+                "perf hud overlay: {}",
+                if toggle { "on" } else { "off" }
+            ));
+            true
+        }
+        "stress_text" | "perf_stress" => {
+            if perf.request_stress_toggle() {
+                console.resume_mouse_look = true;
+                console.push_line("stress: starting (5s)".to_string());
+            } else {
+                console.push_line("stress: stopped".to_string());
+            }
             true
         }
         _ => false,
@@ -4966,6 +5394,7 @@ fn handle_non_video_key_input(
     is_repeat: bool,
     input_router: &InputRouter,
     console: &mut ConsoleState,
+    perf: &mut PerfState,
     ui_state: &mut UiState,
     window: &Window,
     input: &mut InputState,
@@ -5043,7 +5472,7 @@ fn handle_non_video_key_input(
                             println!("> {}", line);
                             console.push_line(format!("> {}", line));
                             if let Some((command, args)) = parse_command_line(&line) {
-                                if !handle_console_command(console, &command, &args) {
+                                if !handle_console_command(console, perf, &command, &args) {
                                     if let Some(script) = script.as_mut() {
                                         match script.engine.run_command(&command, &args) {
                                             Ok(true) => {}

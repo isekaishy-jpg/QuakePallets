@@ -87,6 +87,7 @@ pub enum TextLayer {
     Console,
     ConsoleLog,
     ConsoleMenu,
+    Stress,
     Ui,
 }
 
@@ -168,6 +169,19 @@ pub struct TextOverlay {
     rect_pipeline: Arc<RenderPipeline>,
     rect_vertex_buffer: Arc<WgpuBuffer>,
     rect_vertex_capacity: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextOverlayTimings {
+    pub prepare_ms: f32,
+    pub render_ms: f32,
+}
+
+impl TextOverlayTimings {
+    pub fn add(&mut self, other: Self) {
+        self.prepare_ms += other.prepare_ms;
+        self.render_ms += other.render_ms;
+    }
 }
 
 impl TextOverlay {
@@ -270,10 +284,22 @@ impl TextOverlay {
         queue: &Queue,
         layers: &[TextLayer],
     ) {
+        let _ = self.flush_layers_with_timings(pass, viewport, device, queue, layers);
+    }
+
+    pub fn flush_layers_with_timings<'pass>(
+        &'pass mut self,
+        pass: &mut RenderPass<'pass>,
+        viewport: TextViewport,
+        device: &Device,
+        queue: &Queue,
+        layers: &[TextLayer],
+    ) -> TextOverlayTimings {
+        let mut timings = TextOverlayTimings::default();
         if viewport.physical_px[0] == 0 || viewport.physical_px[1] == 0 {
             self.queued.clear();
             self.rects.clear();
-            return;
+            return timings;
         }
 
         let mut queued = Vec::new();
@@ -299,9 +325,10 @@ impl TextOverlay {
         self.rects = remaining_rects;
 
         if queued.is_empty() && rects.is_empty() {
-            return;
+            return timings;
         }
 
+        let prepare_start = std::time::Instant::now();
         let mut rect_vertex_count = 0u32;
         if !rects.is_empty() {
             let mut vertices = Vec::with_capacity(rects.len() * 6);
@@ -371,7 +398,10 @@ impl TextOverlay {
                     .family(Family::SansSerif)
                     .color(color_from_f32(item.style.color))
                     .metadata(layer_order(item.layer) as usize);
-                let shaping = if matches!(item.layer, TextLayer::Console | TextLayer::ConsoleLog) {
+                let shaping = if matches!(
+                    item.layer,
+                    TextLayer::Console | TextLayer::ConsoleLog | TextLayer::Stress
+                ) {
                     Shaping::Basic
                 } else {
                     Shaping::Advanced
@@ -428,7 +458,9 @@ impl TextOverlay {
                 text_ready = true;
             }
         }
+        timings.prepare_ms = prepare_start.elapsed().as_secs_f32() * 1000.0;
 
+        let render_start = std::time::Instant::now();
         if rect_vertex_count > 0 {
             pass.set_pipeline(&self.rect_pipeline);
             pass.set_vertex_buffer(0, self.rect_vertex_buffer.slice(..));
@@ -437,6 +469,8 @@ impl TextOverlay {
         if text_ready {
             let _ = self.renderer.render(&self.atlas, pass);
         }
+        timings.render_ms = render_start.elapsed().as_secs_f32() * 1000.0;
+        timings
     }
 }
 
@@ -495,10 +529,11 @@ fn layer_order(layer: TextLayer) -> u8 {
     match layer {
         TextLayer::Hud => 0,
         TextLayer::Ui => 1,
-        TextLayer::ConsoleBackground => 2,
-        TextLayer::Console => 3,
-        TextLayer::ConsoleMenu => 4,
-        TextLayer::ConsoleLog => 5,
+        TextLayer::Stress => 2,
+        TextLayer::ConsoleBackground => 3,
+        TextLayer::Console => 4,
+        TextLayer::ConsoleMenu => 5,
+        TextLayer::ConsoleLog => 6,
     }
 }
 
