@@ -393,6 +393,7 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -434,5 +435,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn jobs_panic_sets_sticky_error() {
+        observability::clear_sticky_error();
+        let jobs = Jobs::new(JobsConfig::inline());
+        jobs.submit(JobQueue::Cpu, || -> () { panic!("boom") }, |_| {})
+            .unwrap();
+        let sticky = observability::sticky_error();
+        assert!(sticky.is_some());
     }
 }

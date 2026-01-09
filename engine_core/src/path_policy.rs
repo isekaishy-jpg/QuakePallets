@@ -7,6 +7,7 @@ pub enum ConfigKind {
     Playlist,
     Script,
     Cvars,
+    Mounts,
 }
 
 impl ConfigKind {
@@ -15,6 +16,7 @@ impl ConfigKind {
             ConfigKind::Playlist => "playlists",
             ConfigKind::Script => "scripts",
             ConfigKind::Cvars => "cvars",
+            ConfigKind::Mounts => "mounts",
         }
     }
 
@@ -23,6 +25,7 @@ impl ConfigKind {
             ConfigKind::Playlist => "PALLET_CONFIG_OVERRIDE_PLAYLIST",
             ConfigKind::Script => "PALLET_CONFIG_OVERRIDE_SCRIPT",
             ConfigKind::Cvars => "PALLET_CONFIG_OVERRIDE_CVARS",
+            ConfigKind::Mounts => "PALLET_CONFIG_OVERRIDE_MOUNTS",
         }
     }
 }

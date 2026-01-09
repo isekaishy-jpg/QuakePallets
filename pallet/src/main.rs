@@ -11,6 +11,7 @@ use audio::AudioEngine;
 use client::{Client, ClientInput};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
+use engine_core::mount_manifest::{load_mount_manifest, MountManifestEntry};
 use engine_core::observability;
 use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
 use engine_core::vfs::{MountKind, Vfs, VfsError};
@@ -334,6 +335,7 @@ struct CliArgs {
     dev_root: Option<PathBuf>,
     user_config_root: Option<PathBuf>,
     mounts: Vec<MountSpec>,
+    mount_manifests: Vec<String>,
     show_image: Option<String>,
     map: Option<String>,
     play_movie: Option<PathBuf>,
@@ -2354,7 +2356,7 @@ fn main() {
         user_config_root: args.user_config_root.clone(),
     });
 
-    let quake_vfs = match build_mounts(&args) {
+    let quake_vfs = match build_mounts(&args, &path_policy) {
         Ok(vfs) => vfs,
         Err(err) => {
             eprintln!("{}", err.message);
@@ -2649,7 +2651,9 @@ fn main() {
         let vfs = match quake_vfs.as_deref() {
             Some(vfs) => vfs,
             None => {
-                eprintln!("--show-image requires mounts (use --quake-dir or --mount-dir)");
+                eprintln!(
+                    "--show-image requires mounts (use --quake-dir, --mount-*, or --mount-manifest)"
+                );
                 print_usage();
                 std::process::exit(EXIT_USAGE);
             }
@@ -2671,7 +2675,7 @@ fn main() {
 
     if let Some(map) = args.map.as_deref() {
         if quake_vfs.is_none() {
-            eprintln!("--map requires mounts (use --quake-dir or --mount-dir)");
+            eprintln!("--map requires mounts (use --quake-dir, --mount-*, or --mount-manifest)");
             print_usage();
             std::process::exit(EXIT_USAGE);
         }
@@ -4527,6 +4531,7 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
     let mut dev_root = None;
     let mut user_config_root = None;
     let mut mounts = Vec::new();
+    let mut mount_manifests = Vec::new();
     let mut show_image = None;
     let mut map = None;
     let mut play_movie = None;
@@ -4605,6 +4610,12 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
                     mount_point,
                     path: PathBuf::from(path),
                 });
+            }
+            "--mount-manifest" => {
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--mount-manifest expects a name or path".into())
+                })?;
+                mount_manifests.push(value);
             }
             "--show-image" => {
                 let value = args
@@ -4769,6 +4780,7 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
         dev_root,
         user_config_root,
         mounts,
+        mount_manifests,
         show_image,
         map,
         play_movie,
@@ -4781,7 +4793,7 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
 }
 
 fn print_usage() {
-    eprintln!("usage: pallet [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--content-root <path>] [--dev-root <path>] [--config-root <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <name>] [--script <name>] [--input-script] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
+    eprintln!("usage: pallet [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--mount-manifest <name-or-path>] [--content-root <path>] [--dev-root <path>] [--config-root <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <name>] [--script <name>] [--input-script] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script demo.lua");
@@ -4789,6 +4801,9 @@ fn print_usage() {
     eprintln!("example: pallet --playlist movies_playlist.txt");
     eprintln!("example: pallet --mount-pk3 raw/q3 \"C:\\\\Quake3\\\\baseq3\\\\pak0.pk3\" --show-image raw/q3/gfx/2d/console.tga");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --input-script");
+    eprintln!(
+        "example: pallet --mount-manifest default.txt --show-image raw/quake/gfx/conback.lmp"
+    );
     eprintln!("example: pallet --ui-regression-shot ui_regression/shot.png --ui-regression-res 1920x1080 --ui-regression-dpi 1.0 --ui-regression-ui-scale 1.0 --ui-regression-screen main");
 }
 
@@ -5532,13 +5547,16 @@ fn quake_vpath(path: &str) -> String {
     }
 }
 
-fn build_mounts(args: &CliArgs) -> Result<Option<Arc<Vfs>>, ExitError> {
-    if args.quake_dir.is_none() && args.mounts.is_empty() {
+fn build_mounts(args: &CliArgs, path_policy: &PathPolicy) -> Result<Option<Arc<Vfs>>, ExitError> {
+    if args.quake_dir.is_none() && args.mounts.is_empty() && args.mount_manifests.is_empty() {
         return Ok(None);
     }
     let mut vfs = Vfs::new();
     for spec in &args.mounts {
         add_mount_spec(&mut vfs, spec)?;
+    }
+    for manifest in &args.mount_manifests {
+        load_manifest_mounts(&mut vfs, path_policy, manifest)?;
     }
     if let Some(quake_dir) = args.quake_dir.as_ref() {
         mount_quake_dir(&mut vfs, quake_dir)?;
@@ -5566,6 +5584,37 @@ fn add_mount_spec(vfs: &mut Vfs, spec: &MountSpec) -> Result<(), ExitError> {
                 spec.path.display(),
                 err
             ),
+        )
+    })
+}
+
+fn load_manifest_mounts(
+    vfs: &mut Vfs,
+    path_policy: &PathPolicy,
+    manifest: &str,
+) -> Result<(), ExitError> {
+    let resolved = path_policy
+        .resolve_config_file(ConfigKind::Mounts, manifest)
+        .map_err(|err| ExitError::new(EXIT_USAGE, err))?;
+    println!("{}", resolved.describe());
+    let entries =
+        load_mount_manifest(&resolved.path).map_err(|err| ExitError::new(EXIT_USAGE, err))?;
+    for entry in &entries {
+        add_manifest_entry(vfs, entry)?;
+    }
+    Ok(())
+}
+
+fn add_manifest_entry(vfs: &mut Vfs, entry: &MountManifestEntry) -> Result<(), ExitError> {
+    let spec = MountSpec {
+        kind: entry.kind,
+        mount_point: entry.mount_point.clone(),
+        path: entry.path.clone(),
+    };
+    add_mount_spec(vfs, &spec).map_err(|err| {
+        ExitError::new(
+            err.code,
+            format!("mount manifest line {}: {}", entry.line, err.message),
         )
     })
 }

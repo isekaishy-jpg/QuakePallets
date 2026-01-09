@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use compat_quake::pak::{self, PakFile};
+use engine_core::mount_manifest::{load_mount_manifest, MountManifestEntry};
+use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
 use engine_core::vfs::{MountKind, Vfs};
 
 const EXIT_SUCCESS: i32 = 0;
@@ -117,6 +119,9 @@ struct VfsStatArgs {
         action = ArgAction::Append
     )]
     mount_pk3: Vec<String>,
+
+    #[arg(long, value_name = "NAME_OR_PATH", action = ArgAction::Append)]
+    mount_manifest: Vec<String>,
 
     #[arg(value_name = "VPATH")]
     vpath: String,
@@ -398,6 +403,33 @@ fn run_vfs_stat(args: VfsStatArgs) -> i32 {
         }
     }
 
+    if !args.mount_manifest.is_empty() {
+        let path_policy = PathPolicy::from_overrides(PathOverrides::default());
+        for manifest in &args.mount_manifest {
+            let resolved = match path_policy.resolve_config_file(ConfigKind::Mounts, manifest) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    eprintln!("{}", err);
+                    return EXIT_USAGE;
+                }
+            };
+            println!("{}", resolved.describe());
+            let entries = match load_mount_manifest(&resolved.path) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    eprintln!("{}", err);
+                    return EXIT_USAGE;
+                }
+            };
+            for entry in &entries {
+                if let Err(err) = apply_manifest_entry(&mut vfs, entry) {
+                    eprintln!("{}", err);
+                    return EXIT_USAGE;
+                }
+            }
+        }
+    }
+
     if let Some(quake_dir) = args.quake_dir.as_ref() {
         if !quake_dir.is_dir() {
             eprintln!("quake dir not found: {}", quake_dir.display());
@@ -409,8 +441,8 @@ fn run_vfs_stat(args: VfsStatArgs) -> i32 {
         }
     }
 
-    if specs.is_empty() && args.quake_dir.is_none() {
-        eprintln!("no mounts configured (use --quake-dir or --mount-*)");
+    if specs.is_empty() && args.quake_dir.is_none() && args.mount_manifest.is_empty() {
+        eprintln!("no mounts configured (use --quake-dir, --mount-*, or --mount-manifest)");
         return EXIT_USAGE;
     }
 
@@ -470,6 +502,16 @@ fn apply_mount_spec(vfs: &mut Vfs, spec: &MountSpec) -> Result<(), String> {
             err
         )
     })
+}
+
+fn apply_manifest_entry(vfs: &mut Vfs, entry: &MountManifestEntry) -> Result<(), String> {
+    let spec = MountSpec {
+        kind: entry.kind,
+        mount_point: entry.mount_point.clone(),
+        path: entry.path.clone(),
+    };
+    apply_mount_spec(vfs, &spec)
+        .map_err(|err| format!("mount manifest line {}: {}", entry.line, err))
 }
 
 fn mount_quake_dir(vfs: &mut Vfs, quake_dir: &Path) -> Result<(), String> {

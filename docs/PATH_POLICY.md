@@ -12,11 +12,13 @@ content/
     playlists/
     scripts/
     cvars/
+    mounts/
 ```
 
 Config-like files belong under `content/config/...`. For example:
 - `content/config/playlists/movies_playlist.txt`
 - `content/config/scripts/demo.lua`
+- `content/config/mounts/default.txt`
 
 ## Dev override root
 `/.pallet/` (gitignored)
@@ -26,6 +28,7 @@ Config-like files belong under `content/config/...`. For example:
     playlists/
     scripts/
     cvars/
+    mounts/
 ```
 
 ## User config root
@@ -40,7 +43,7 @@ The engine resolves `content_root` in this order:
 2. Repo dev tree: `repo_root/content` when a `Cargo.toml` is found above the exe
 3. Packaged default: `<exe_dir>/content`
 
-## Config resolution order (playlist/scripts/cvars)
+## Config resolution order (playlist/scripts/cvars/mounts)
 For a given config name (or absolute path), resolution is deterministic:
 1. CLI absolute path (explicit override)
 2. Environment override (debug-only)

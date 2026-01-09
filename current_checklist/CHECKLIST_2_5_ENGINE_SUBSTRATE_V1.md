@@ -89,12 +89,12 @@ Create a minimal engine substrate that supports **raw content sources** (directo
 - [x] Define virtual roots for raw test content, e.g.:
   - [x] `raw/quake/...`
   - [x] `raw/q3/...`
-- [ ] Ensure the convention leaves room for future engine-native content roots (e.g., `content/...`).
+- [x] Ensure the convention leaves room for future engine-native content roots (e.g., `content/...`).
 
 ### Mount plan (not a package manager)
 - [x] Define how the app/tools specify raw mounts:
   - [x] CLI flags (dir/pak/pk3) and/or
-  - [ ] A simple mount manifest under `content/config/` (optional)
+- [x] A simple mount manifest under `content/config/`
 - [x] Make mount ordering explicit and reproducible.
 
 **DoD**

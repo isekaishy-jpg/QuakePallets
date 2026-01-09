@@ -1,0 +1,7 @@
+# Mount manifest: <dir|pak|pk3> <vroot> <path>
+# Entries are applied in order.
+#
+# Examples:
+# dir raw/quake "C:\Quake\id1"
+# pak raw/quake "C:\Quake\id1\pak0.pak"
+# pk3 raw/q3 "D:\Quake3\baseq3\pak0.pk3"

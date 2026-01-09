@@ -52,8 +52,9 @@ Exit codes:
   Extraction must write only to the user-provided output directory.
 
 ### `tools vfs`
-- `tools vfs stat [--quake-dir <PATH>] [--mount-dir <VROOT> <PATH>] [--mount-pak <VROOT> <PATH>] [--mount-pk3 <VROOT> <PATH>] <VPATH>`
+- `tools vfs stat [--quake-dir <PATH>] [--mount-dir <VROOT> <PATH>] [--mount-pak <VROOT> <PATH>] [--mount-pk3 <VROOT> <PATH>] [--mount-manifest <NAME_OR_PATH>] <VPATH>`
   - reports size, hash, and mount provenance for a virtual path.
+  - `--mount-manifest` resolves via the path policy (e.g., `content/config/mounts/default.txt`).
 
 ## Future expansions (non-breaking)
 - `tools map inspect --quake-dir <PATH> --map <MAPNAME>`
