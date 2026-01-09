@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
 
@@ -13,9 +14,10 @@ use std::time::{Duration, Instant};
 use egui::{Color32, Context, TextEdit};
 use egui_wgpu::{Renderer as EguiRenderer, ScreenDescriptor};
 use egui_winit::State as EguiState;
-use platform_winit::{create_window, ControlFlow, Event, Window, WindowEvent};
+use platform_winit::{create_window, ControlFlow, Event, PhysicalPosition, Window, WindowEvent};
 use render_wgpu::RenderError;
 use winit::window::Icon;
+use winit::window::{CursorIcon, ResizeDirection};
 
 use config::{DebugPresetConfig, RunnerConfig};
 
@@ -23,6 +25,8 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const WINDOW_TITLE: &str = concat!("Pallet Runner GUI ", env!("CARGO_PKG_VERSION"));
 const WINDOW_WIDTH: u32 = 960;
 const WINDOW_HEIGHT: u32 = 640;
+const TITLE_BAR_HEIGHT: f32 = 28.0;
+const RESIZE_BORDER: f32 = 6.0;
 
 const STATUS_OK: Color32 = Color32::from_rgb(70, 200, 120);
 const STATUS_WARN: Color32 = Color32::from_rgb(220, 190, 80);
@@ -113,6 +117,9 @@ struct RunnerApp {
     browse_notice: Option<String>,
     metadata_status: Option<StatusLine>,
     metadata_details: Option<String>,
+    custom_maximized: bool,
+    last_windowed_size: winit::dpi::PhysicalSize<u32>,
+    last_windowed_pos: PhysicalPosition<i32>,
 }
 
 impl RunnerApp {
@@ -142,6 +149,9 @@ impl RunnerApp {
             browse_notice: None,
             metadata_status: None,
             metadata_details: None,
+            custom_maximized: false,
+            last_windowed_size: winit::dpi::PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+            last_windowed_pos: PhysicalPosition::new(0, 0),
         };
         app.validate_repo_root();
         app
@@ -637,6 +647,24 @@ impl RunnerApp {
                 args.push(path.to_string());
             }
         }
+        push_mount_pair_args(
+            &mut args,
+            "--mount-dir",
+            &self.config.pallet_mount_dir_vroot,
+            &self.config.pallet_mount_dir_path,
+        );
+        push_mount_pair_args(
+            &mut args,
+            "--mount-pak",
+            &self.config.pallet_mount_pak_vroot,
+            &self.config.pallet_mount_pak_path,
+        );
+        push_mount_pair_args(
+            &mut args,
+            "--mount-pk3",
+            &self.config.pallet_mount_pk3_vroot,
+            &self.config.pallet_mount_pk3_path,
+        );
         if self.config.input_script {
             args.push("--input-script".to_string());
         }
@@ -743,6 +771,28 @@ impl RunnerApp {
                 }
             }
         }
+        for warning in [
+            mount_pair_warning(
+                "--mount-dir",
+                &self.config.pallet_mount_dir_vroot,
+                &self.config.pallet_mount_dir_path,
+            ),
+            mount_pair_warning(
+                "--mount-pak",
+                &self.config.pallet_mount_pak_vroot,
+                &self.config.pallet_mount_pak_path,
+            ),
+            mount_pair_warning(
+                "--mount-pk3",
+                &self.config.pallet_mount_pk3_vroot,
+                &self.config.pallet_mount_pk3_path,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            warnings.push(warning);
+        }
         warnings
     }
 
@@ -764,6 +814,7 @@ impl RunnerApp {
         self.server_process.poll();
         self.client_process.poll();
         self.checks_process.poll();
+        self.handle_resize_drag(ctx, window);
         self.ui_title_bar(ctx, window);
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(format!("Pallet Runner GUI {}", APP_VERSION));
@@ -840,9 +891,8 @@ impl RunnerApp {
     }
 
     fn ui_title_bar(&mut self, ctx: &Context, window: &Window) {
-        let title_bar_height = 28.0;
         egui::TopBottomPanel::top("title_bar")
-            .exact_height(title_bar_height)
+            .exact_height(TITLE_BAR_HEIGHT)
             .show(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
@@ -873,6 +923,35 @@ impl RunnerApp {
                     let _ = window.drag_window();
                 }
             });
+    }
+
+    fn handle_resize_drag(&self, ctx: &Context, window: &Window) {
+        if window.is_maximized() || self.custom_maximized {
+            window.set_cursor_icon(CursorIcon::Default);
+            return;
+        }
+        let pos = ctx.input(|input| input.pointer.hover_pos());
+        let Some(pos) = pos else {
+            window.set_cursor_icon(CursorIcon::Default);
+            return;
+        };
+        let rect = ctx.screen_rect();
+        let direction = resize_direction(rect, pos);
+        window.set_cursor_icon(match direction {
+            Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => CursorIcon::NwseResize,
+            Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => CursorIcon::NeswResize,
+            Some(ResizeDirection::West | ResizeDirection::East) => CursorIcon::EwResize,
+            Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
+            None => CursorIcon::Default,
+        });
+        let pressed = ctx.input(|input| input.pointer.primary_pressed());
+        if !pressed {
+            return;
+        }
+        let Some(direction) = direction else {
+            return;
+        };
+        let _ = window.drag_resize_window(direction);
     }
 
     fn ui_pallet(&mut self, ui: &mut egui::Ui, ctx: &Context) {
@@ -982,6 +1061,30 @@ impl RunnerApp {
                 mount_manifest = path.display().to_string();
                 update_optional_string(&mut self.config.mount_manifest, &mount_manifest);
             }
+            ui.label("Mount dir");
+            vfs_mount_row(
+                ui,
+                &mut self.config.pallet_mount_dir_vroot,
+                &mut self.config.pallet_mount_dir_path,
+                "Select mount directory",
+                None,
+            );
+            ui.label("Mount pak");
+            vfs_mount_row(
+                ui,
+                &mut self.config.pallet_mount_pak_vroot,
+                &mut self.config.pallet_mount_pak_path,
+                "Select pak file",
+                Some("Pak files (*.pak)|*.pak|All files (*.*)|*.*"),
+            );
+            ui.label("Mount pk3");
+            vfs_mount_row(
+                ui,
+                &mut self.config.pallet_mount_pk3_vroot,
+                &mut self.config.pallet_mount_pk3_path,
+                "Select pk3 file",
+                Some("PK3 files (*.pk3)|*.pk3|All files (*.*)|*.*"),
+            );
             let mut input_script = self.config.input_script;
             if ui.checkbox(&mut input_script, "Input script").changed() {
                 self.config.input_script = input_script;
@@ -1472,6 +1575,44 @@ fn update_optional_string(target: &mut Option<String>, value: &str) {
     }
 }
 
+fn push_mount_pair_args(
+    args: &mut Vec<String>,
+    flag: &str,
+    vroot: &Option<String>,
+    path: &Option<String>,
+) {
+    let vroot = vroot
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let path = path
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if let (Some(vroot), Some(path)) = (vroot, path) {
+        args.push(flag.to_string());
+        args.push(vroot.to_string());
+        args.push(path.to_string());
+    }
+}
+
+fn mount_pair_warning(flag: &str, vroot: &Option<String>, path: &Option<String>) -> Option<String> {
+    let vroot_set = vroot
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let path_set = path
+        .as_deref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .is_some();
+    match (vroot_set, path_set) {
+        (true, false) | (false, true) => Some(format!("{} expects both vroot and path.", flag)),
+        _ => None,
+    }
+}
+
 fn push_mount_pair(
     command: &mut Command,
     flag: &str,
@@ -1533,6 +1674,32 @@ fn vfs_mount_row(
 fn render_log_lines(ui: &mut egui::Ui, logs: &VecDeque<String>) {
     for line in logs {
         ui.add(egui::Label::new(egui::RichText::new(line).monospace()).wrap());
+    }
+}
+
+fn resize_direction(rect: egui::Rect, pos: egui::Pos2) -> Option<ResizeDirection> {
+    let left = pos.x <= rect.left() + RESIZE_BORDER;
+    let right = pos.x >= rect.right() - RESIZE_BORDER;
+    let top = pos.y <= rect.top() + RESIZE_BORDER;
+    let bottom = pos.y >= rect.bottom() - RESIZE_BORDER;
+    if left && top {
+        Some(ResizeDirection::NorthWest)
+    } else if right && top {
+        Some(ResizeDirection::NorthEast)
+    } else if left && bottom {
+        Some(ResizeDirection::SouthWest)
+    } else if right && bottom {
+        Some(ResizeDirection::SouthEast)
+    } else if left {
+        Some(ResizeDirection::West)
+    } else if right {
+        Some(ResizeDirection::East)
+    } else if top {
+        Some(ResizeDirection::North)
+    } else if bottom {
+        Some(ResizeDirection::South)
+    } else {
+        None
     }
 }
 
@@ -1622,6 +1789,7 @@ impl ProcessLane {
             return Err("Process already running.".to_string());
         }
         self.clear();
+        configure_child_process(&mut command);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1875,6 +2043,7 @@ fn main() {
     let mut app = RunnerApp::new();
     let start_time = Instant::now();
     let mut last_frame = start_time;
+    let mut pending_resize = false;
 
     window.set_visible(true);
 
@@ -1890,12 +2059,36 @@ fn main() {
                         elwt.exit();
                     }
                     WindowEvent::Resized(size) => {
-                        renderer.resize(size);
+                        if size.width > 0 && size.height > 0 {
+                            if !app.custom_maximized {
+                                app.last_windowed_size = size;
+                            }
+                            renderer.resize(size);
+                            pending_resize = false;
+                        }
                     }
                     WindowEvent::ScaleFactorChanged { .. } => {
-                        renderer.resize(renderer.window_inner_size());
+                        let size = renderer.window_inner_size();
+                        if size.width > 0 && size.height > 0 {
+                            renderer.resize(size);
+                            pending_resize = false;
+                        }
+                    }
+                    WindowEvent::Moved(position) => {
+                        if !app.custom_maximized {
+                            app.last_windowed_pos = position;
+                        }
                     }
                     WindowEvent::RedrawRequested => {
+                        let size = window.inner_size();
+                        if size.width == 0 || size.height == 0 {
+                            return;
+                        }
+                        if pending_resize {
+                            renderer.resize(size);
+                            pending_resize = false;
+                            return;
+                        }
                         let now = Instant::now();
                         let time_seconds = (now - start_time).as_secs_f64();
                         let _dt = now - last_frame;
@@ -1907,7 +2100,31 @@ fn main() {
                             match action {
                                 WindowAction::Minimize => window.set_minimized(true),
                                 WindowAction::MaximizeToggle => {
-                                    window.set_maximized(!window.is_maximized())
+                                    // TODO(runner): Custom maximize resizes the window, but the UI layout
+                                    // does not expand; needs follow-up before enabling real maximize behavior.
+                                    if app.custom_maximized {
+                                        app.custom_maximized = false;
+                                        let _ = window.request_inner_size(app.last_windowed_size);
+                                        window.set_outer_position(app.last_windowed_pos);
+                                        pending_resize = true;
+                                    } else if window.is_maximized() {
+                                        window.set_maximized(false);
+                                        pending_resize = true;
+                                    } else {
+                                        app.custom_maximized = true;
+                                        app.last_windowed_size = window.inner_size();
+                                        if let Ok(position) = window.outer_position() {
+                                            app.last_windowed_pos = position;
+                                        }
+                                        if let Some(monitor) = window
+                                            .current_monitor()
+                                            .or_else(|| window.primary_monitor())
+                                        {
+                                            window.set_outer_position(monitor.position());
+                                            let _ = window.request_inner_size(monitor.size());
+                                        }
+                                        pending_resize = true;
+                                    }
                                 }
                                 WindowAction::Close => {
                                     app.stop_all_processes();
@@ -1926,7 +2143,10 @@ fn main() {
                         match render_result {
                             Ok(()) => {}
                             Err(RenderError::Lost | RenderError::Outdated) => {
-                                renderer.resize(renderer.window_inner_size());
+                                let size = renderer.window_inner_size();
+                                if size.width > 0 && size.height > 0 {
+                                    renderer.resize(size);
+                                }
                             }
                             Err(RenderError::OutOfMemory) => {
                                 eprintln!("render error: out of memory");
@@ -1995,18 +2215,39 @@ fn decode_png_icon(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 }
 
 #[cfg(windows)]
+fn configure_powershell(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.arg("-NoProfile").arg("-WindowStyle").arg("Hidden");
+}
+
+#[cfg(windows)]
+fn configure_child_process(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_child_process(_command: &mut Command) {}
+
+#[cfg(windows)]
 fn browse_for_repo_root(current_dir: Option<&Path>) -> Option<PathBuf> {
     const SCRIPT: &str = r#"
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.Description = 'Select Pallet repo root'
 $dialog.ShowNewFolderButton = $false
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-    Write-Output $dialog.SelectedPath
-}
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        Write-Output $dialog.SelectedPath
+    }
 "#;
     let mut command = Command::new("powershell");
-    command.arg("-NoProfile").arg("-Command").arg(SCRIPT);
+    configure_powershell(&mut command);
+    command.arg("-Command").arg(SCRIPT);
     if let Some(dir) = current_dir {
         command.current_dir(dir);
     }
@@ -2041,13 +2282,13 @@ $dialog.Multiselect = $false
 if ($env:RUNNER_PICKER_TITLE) { $dialog.Title = $env:RUNNER_PICKER_TITLE }
 if ($env:RUNNER_PICKER_FILTER) { $dialog.Filter = $env:RUNNER_PICKER_FILTER }
 if ($env:RUNNER_PICKER_INITIAL_DIR) { $dialog.InitialDirectory = $env:RUNNER_PICKER_INITIAL_DIR }
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-    Write-Output $dialog.FileName
-}
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        Write-Output $dialog.FileName
+    }
 "#;
     let mut command = Command::new("powershell");
+    configure_powershell(&mut command);
     command
-        .arg("-NoProfile")
         .arg("-Command")
         .arg(SCRIPT)
         .env("RUNNER_PICKER_TITLE", title);
@@ -2087,13 +2328,13 @@ Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 if ($env:RUNNER_PICKER_TITLE) { $dialog.Description = $env:RUNNER_PICKER_TITLE }
 if ($env:RUNNER_PICKER_INITIAL_DIR) { $dialog.SelectedPath = $env:RUNNER_PICKER_INITIAL_DIR }
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-    Write-Output $dialog.SelectedPath
-}
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        Write-Output $dialog.SelectedPath
+    }
 "#;
     let mut command = Command::new("powershell");
+    configure_powershell(&mut command);
     command
-        .arg("-NoProfile")
         .arg("-Command")
         .arg(SCRIPT)
         .env("RUNNER_PICKER_TITLE", title);

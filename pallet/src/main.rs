@@ -2383,6 +2383,7 @@ fn main() {
         WindowMode::Fullscreen
     };
     let mut window_focused = true;
+    let mut focus_resume_mouse_look = false;
     let mut console_fullscreen_override = false;
     let mut focus_fullscreen_override = false;
     let mut pending_video_prewarm = args.play_movie.is_some() || args.playlist.is_some();
@@ -3038,6 +3039,7 @@ fn main() {
                 }
                 WindowEvent::Focused(false) => {
                     window_focused = false;
+                    focus_resume_mouse_look = mouse_look;
                     mouse_look = false;
                     mouse_grabbed = set_cursor_mode(window, mouse_look);
                     if settings.window_mode == WindowMode::Fullscreen
@@ -3082,6 +3084,15 @@ fn main() {
                         pending_resize_clear = true;
                         console_fullscreen_override = false;
                     }
+                    if focus_resume_mouse_look
+                        && scene_active
+                        && !ui_state.menu_open
+                        && !console.is_blocking()
+                    {
+                        mouse_look = true;
+                        mouse_grabbed = set_cursor_mode(window, mouse_look);
+                    }
+                    focus_resume_mouse_look = false;
                 }
                 WindowEvent::RedrawRequested => {
                     let now = Instant::now();
@@ -3433,6 +3444,8 @@ fn main() {
                             match result {
                                 Ok(()) => {
                                     ui_state.close_menu();
+                                    mouse_look = true;
+                                    mouse_grabbed = set_cursor_mode(window, mouse_look);
                                 }
                                 Err(err) => {
                                     eprintln!("{}", err.message);
@@ -5666,14 +5679,11 @@ fn open_console(
     console: &mut ConsoleState,
     ui_state: &mut UiState,
     window: &Window,
-    settings: &Settings,
-    console_fullscreen_override: &mut bool,
     input: &mut InputState,
     mouse_look: &mut bool,
     mouse_grabbed: &mut bool,
 ) {
     let now = Instant::now();
-    enable_console_fullscreen_override(window, settings, console_fullscreen_override);
     console.caret_epoch = now;
     console.open(now);
     console.resume_mouse_look = *mouse_look;
@@ -5761,16 +5771,7 @@ fn handle_non_video_key_input(
                     true,
                 );
             } else {
-                open_console(
-                    console,
-                    ui_state,
-                    window,
-                    settings,
-                    console_fullscreen_override,
-                    input,
-                    mouse_look,
-                    mouse_grabbed,
-                );
+                open_console(console, ui_state, window, input, mouse_look, mouse_grabbed);
             }
         }
         return true;

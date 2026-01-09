@@ -8,5 +8,5 @@ license = "MIT OR Apache-2.0"
 path = "src/lib.rs"
 
 [dependencies]
-compat_quake = { path = "../compat_quake" }
+compat_quake = { path = "../compat_quake", version = "0.1.0" }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }

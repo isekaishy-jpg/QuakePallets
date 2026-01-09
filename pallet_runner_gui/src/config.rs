@@ -35,6 +35,12 @@ pub struct RunnerConfig {
     pub play_movie: Option<String>,
     pub script_path: Option<String>,
     pub mount_manifest: Option<String>,
+    pub pallet_mount_dir_vroot: Option<String>,
+    pub pallet_mount_dir_path: Option<String>,
+    pub pallet_mount_pak_vroot: Option<String>,
+    pub pallet_mount_pak_path: Option<String>,
+    pub pallet_mount_pk3_vroot: Option<String>,
+    pub pallet_mount_pk3_path: Option<String>,
     pub input_script: bool,
     pub smoke_mode: String,
     pub smoke_ticks: Option<u32>,
@@ -80,6 +86,12 @@ impl Default for RunnerConfig {
             play_movie: None,
             script_path: None,
             mount_manifest: None,
+            pallet_mount_dir_vroot: None,
+            pallet_mount_dir_path: None,
+            pallet_mount_pak_vroot: None,
+            pallet_mount_pak_path: None,
+            pallet_mount_pk3_vroot: None,
+            pallet_mount_pk3_path: None,
             input_script: false,
             smoke_mode: DEFAULT_SMOKE_MODE.to_string(),
             smoke_ticks: None,
@@ -170,6 +182,42 @@ impl RunnerConfig {
             &mut body,
             "mount_manifest",
             self.mount_manifest.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "pallet_mount_dir_vroot",
+            self.pallet_mount_dir_vroot.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "pallet_mount_dir_path",
+            self.pallet_mount_dir_path.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "pallet_mount_pak_vroot",
+            self.pallet_mount_pak_vroot.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "pallet_mount_pak_path",
+            self.pallet_mount_pak_path.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "pallet_mount_pk3_vroot",
+            self.pallet_mount_pk3_vroot.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "pallet_mount_pk3_path",
+            self.pallet_mount_pk3_path.as_deref(),
             true,
         );
         push_bool(&mut body, "input_script", self.input_script, true);
@@ -310,6 +358,24 @@ fn parse_config(contents: &str) -> Option<RunnerConfig> {
     }
     if let Some(value) = parse_json_optional_string(contents, "mount_manifest") {
         config.mount_manifest = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "pallet_mount_dir_vroot") {
+        config.pallet_mount_dir_vroot = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "pallet_mount_dir_path") {
+        config.pallet_mount_dir_path = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "pallet_mount_pak_vroot") {
+        config.pallet_mount_pak_vroot = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "pallet_mount_pak_path") {
+        config.pallet_mount_pak_path = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "pallet_mount_pk3_vroot") {
+        config.pallet_mount_pk3_vroot = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "pallet_mount_pk3_path") {
+        config.pallet_mount_pk3_path = value;
     }
     if let Some(value) = parse_json_bool(contents, "input_script") {
         config.input_script = value;
