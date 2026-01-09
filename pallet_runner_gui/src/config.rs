@@ -34,11 +34,21 @@ pub struct RunnerConfig {
     pub show_image: Option<String>,
     pub play_movie: Option<String>,
     pub script_path: Option<String>,
+    pub mount_manifest: Option<String>,
     pub input_script: bool,
     pub smoke_mode: String,
     pub smoke_ticks: Option<u32>,
     pub smoke_headless: bool,
     pub pak_out_dir: Option<String>,
+    pub vfs_vpath: String,
+    pub vfs_mount_manifest: Option<String>,
+    pub vfs_use_quake_dir: bool,
+    pub vfs_mount_dir_vroot: Option<String>,
+    pub vfs_mount_dir_path: Option<String>,
+    pub vfs_mount_pak_vroot: Option<String>,
+    pub vfs_mount_pak_path: Option<String>,
+    pub vfs_mount_pk3_vroot: Option<String>,
+    pub vfs_mount_pk3_path: Option<String>,
     pub server_bind: String,
     pub server_tick_ms: u64,
     pub server_snapshot_stride: u32,
@@ -69,11 +79,21 @@ impl Default for RunnerConfig {
             show_image: None,
             play_movie: None,
             script_path: None,
+            mount_manifest: None,
             input_script: false,
             smoke_mode: DEFAULT_SMOKE_MODE.to_string(),
             smoke_ticks: None,
             smoke_headless: false,
             pak_out_dir: None,
+            vfs_vpath: String::new(),
+            vfs_mount_manifest: None,
+            vfs_use_quake_dir: false,
+            vfs_mount_dir_vroot: None,
+            vfs_mount_dir_path: None,
+            vfs_mount_pak_vroot: None,
+            vfs_mount_pak_path: None,
+            vfs_mount_pk3_vroot: None,
+            vfs_mount_pk3_path: None,
             server_bind: DEFAULT_NET_BIND.to_string(),
             server_tick_ms: 16,
             server_snapshot_stride: 1,
@@ -146,11 +166,61 @@ impl RunnerConfig {
         push_opt_string(&mut body, "show_image", self.show_image.as_deref(), true);
         push_opt_string(&mut body, "play_movie", self.play_movie.as_deref(), true);
         push_opt_string(&mut body, "script_path", self.script_path.as_deref(), true);
+        push_opt_string(
+            &mut body,
+            "mount_manifest",
+            self.mount_manifest.as_deref(),
+            true,
+        );
         push_bool(&mut body, "input_script", self.input_script, true);
         push_string(&mut body, "smoke_mode", &self.smoke_mode, true);
         push_opt_number(&mut body, "smoke_ticks", self.smoke_ticks, true);
         push_bool(&mut body, "smoke_headless", self.smoke_headless, true);
         push_opt_string(&mut body, "pak_out_dir", self.pak_out_dir.as_deref(), true);
+        push_string(&mut body, "vfs_vpath", &self.vfs_vpath, true);
+        push_opt_string(
+            &mut body,
+            "vfs_mount_manifest",
+            self.vfs_mount_manifest.as_deref(),
+            true,
+        );
+        push_bool(&mut body, "vfs_use_quake_dir", self.vfs_use_quake_dir, true);
+        push_opt_string(
+            &mut body,
+            "vfs_mount_dir_vroot",
+            self.vfs_mount_dir_vroot.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "vfs_mount_dir_path",
+            self.vfs_mount_dir_path.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "vfs_mount_pak_vroot",
+            self.vfs_mount_pak_vroot.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "vfs_mount_pak_path",
+            self.vfs_mount_pak_path.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "vfs_mount_pk3_vroot",
+            self.vfs_mount_pk3_vroot.as_deref(),
+            true,
+        );
+        push_opt_string(
+            &mut body,
+            "vfs_mount_pk3_path",
+            self.vfs_mount_pk3_path.as_deref(),
+            true,
+        );
         push_string(&mut body, "server_bind", &self.server_bind, true);
         push_number(&mut body, "server_tick_ms", self.server_tick_ms, true);
         push_number(
@@ -238,6 +308,9 @@ fn parse_config(contents: &str) -> Option<RunnerConfig> {
     if let Some(value) = parse_json_optional_string(contents, "script_path") {
         config.script_path = value;
     }
+    if let Some(value) = parse_json_optional_string(contents, "mount_manifest") {
+        config.mount_manifest = value;
+    }
     if let Some(value) = parse_json_bool(contents, "input_script") {
         config.input_script = value;
     }
@@ -252,6 +325,33 @@ fn parse_config(contents: &str) -> Option<RunnerConfig> {
     }
     if let Some(value) = parse_json_optional_string(contents, "pak_out_dir") {
         config.pak_out_dir = value;
+    }
+    if let Some(value) = parse_json_string(contents, "vfs_vpath") {
+        config.vfs_vpath = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "vfs_mount_manifest") {
+        config.vfs_mount_manifest = value;
+    }
+    if let Some(value) = parse_json_bool(contents, "vfs_use_quake_dir") {
+        config.vfs_use_quake_dir = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "vfs_mount_dir_vroot") {
+        config.vfs_mount_dir_vroot = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "vfs_mount_dir_path") {
+        config.vfs_mount_dir_path = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "vfs_mount_pak_vroot") {
+        config.vfs_mount_pak_vroot = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "vfs_mount_pak_path") {
+        config.vfs_mount_pak_path = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "vfs_mount_pk3_vroot") {
+        config.vfs_mount_pk3_vroot = value;
+    }
+    if let Some(value) = parse_json_optional_string(contents, "vfs_mount_pk3_path") {
+        config.vfs_mount_pk3_path = value;
     }
     if let Some(value) = parse_json_string(contents, "server_bind") {
         config.server_bind = value;

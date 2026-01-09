@@ -9,6 +9,13 @@ This file enumerates all runner-GUI-relevant commands and knobs currently availa
 
 ## Pallet CLI flags (main app)
 - `--quake-dir <path>`
+- `--mount-dir <vroot> <path>`
+- `--mount-pak <vroot> <path>`
+- `--mount-pk3 <vroot> <path>`
+- `--mount-manifest <name-or-path>`
+- `--content-root <path>`
+- `--dev-root <path>`
+- `--config-root <path>`
 - `--show-image <asset>`
 - `--map <name>`
 - `--play-movie <file>`
@@ -28,6 +35,7 @@ This file enumerates all runner-GUI-relevant commands and knobs currently availa
 - `tools pak list --quake-dir <path>`
 - `tools pak extract --quake-dir <path> --out <dir>`
 - `tools ui-regression [--out-dir <dir>]`
+- `tools vfs stat [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--mount-manifest <name-or-path>] <vpath>`
 
 ## Other binaries with CLI args
 

@@ -19,7 +19,8 @@ use winit::window::Icon;
 
 use config::{DebugPresetConfig, RunnerConfig};
 
-const WINDOW_TITLE: &str = "Pallet Runner GUI";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const WINDOW_TITLE: &str = concat!("Pallet Runner GUI ", env!("CARGO_PKG_VERSION"));
 const WINDOW_WIDTH: u32 = 960;
 const WINDOW_HEIGHT: u32 = 640;
 
@@ -323,6 +324,51 @@ impl RunnerApp {
         Ok(command)
     }
 
+    fn build_tools_vfs_stat_command(&self) -> Result<Command, String> {
+        let mut command = self
+            .command_in_repo_root("cargo")
+            .ok_or_else(|| "Repo root is required to run tools.".to_string())?;
+        let vpath = self.config.vfs_vpath.trim();
+        if vpath.is_empty() {
+            return Err("VFS vpath is required.".to_string());
+        }
+        command.arg("run").arg("-p").arg("tools").arg("--");
+        command.arg("vfs").arg("stat");
+        if self.config.vfs_use_quake_dir {
+            let quake_dir = self.config.quake_dir.trim();
+            if quake_dir.is_empty() {
+                return Err("--quake-dir is required when enabled.".to_string());
+            }
+            command.arg("--quake-dir").arg(quake_dir);
+        }
+        if let Some(manifest) = self.config.vfs_mount_manifest.as_ref() {
+            let manifest = manifest.trim();
+            if !manifest.is_empty() {
+                command.arg("--mount-manifest").arg(manifest);
+            }
+        }
+        push_mount_pair(
+            &mut command,
+            "--mount-dir",
+            self.config.vfs_mount_dir_vroot.as_deref(),
+            self.config.vfs_mount_dir_path.as_deref(),
+        )?;
+        push_mount_pair(
+            &mut command,
+            "--mount-pak",
+            self.config.vfs_mount_pak_vroot.as_deref(),
+            self.config.vfs_mount_pak_path.as_deref(),
+        )?;
+        push_mount_pair(
+            &mut command,
+            "--mount-pk3",
+            self.config.vfs_mount_pk3_vroot.as_deref(),
+            self.config.vfs_mount_pk3_path.as_deref(),
+        )?;
+        command.arg(vpath);
+        Ok(command)
+    }
+
     fn run_tools_smoke(&mut self) {
         match self.build_tools_smoke_command() {
             Ok(command) => {
@@ -351,6 +397,19 @@ impl RunnerApp {
 
     fn run_tools_pak_extract(&mut self) {
         match self.build_tools_pak_extract_command() {
+            Ok(command) => {
+                if let Err(err) = self.tools_process.start(command) {
+                    self.tools_process.push_system(err);
+                }
+            }
+            Err(err) => {
+                self.tools_process.push_system(err);
+            }
+        }
+    }
+
+    fn run_tools_vfs_stat(&mut self) {
+        match self.build_tools_vfs_stat_command() {
             Ok(command) => {
                 if let Err(err) = self.tools_process.start(command) {
                     self.tools_process.push_system(err);
@@ -571,6 +630,13 @@ impl RunnerApp {
                 args.push(path.to_string());
             }
         }
+        if let Some(path) = self.config.mount_manifest.as_ref() {
+            let path = path.trim();
+            if !path.is_empty() {
+                args.push("--mount-manifest".to_string());
+                args.push(path.to_string());
+            }
+        }
         if self.config.input_script {
             args.push("--input-script".to_string());
         }
@@ -700,7 +766,7 @@ impl RunnerApp {
         self.checks_process.poll();
         self.ui_title_bar(ctx, window);
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Pallet Runner GUI");
+            ui.heading(format!("Pallet Runner GUI {}", APP_VERSION));
             ui.add_space(8.0);
             ui.label("Repo Root");
             ui.horizontal(|ui| {
@@ -896,6 +962,26 @@ impl RunnerApp {
                 script_path = path.display().to_string();
                 update_optional_string(&mut self.config.script_path, &script_path);
             }
+            ui.label("Mount manifest");
+            let manifest_initial = self.initial_dir_for_path(self.config.mount_manifest.as_deref());
+            let mut mount_manifest = self.config.mount_manifest.clone().unwrap_or_default();
+            let mut manifest_pick = None;
+            ui.horizontal(|ui| {
+                if ui.text_edit_singleline(&mut mount_manifest).changed() {
+                    update_optional_string(&mut self.config.mount_manifest, &mount_manifest);
+                }
+                if ui.button("Browse...").clicked() {
+                    manifest_pick = browse_for_file(
+                        manifest_initial.as_deref(),
+                        "Select mount manifest",
+                        Some("Manifest files (*.txt)|*.txt|All files (*.*)|*.*"),
+                    );
+                }
+            });
+            if let Some(path) = manifest_pick {
+                mount_manifest = path.display().to_string();
+                update_optional_string(&mut self.config.mount_manifest, &mount_manifest);
+            }
             let mut input_script = self.config.input_script;
             if ui.checkbox(&mut input_script, "Input script").changed() {
                 self.config.input_script = input_script;
@@ -1053,6 +1139,70 @@ impl RunnerApp {
                 .clicked()
             {
                 self.run_tools_pak_extract();
+            }
+        });
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label("VFS stat");
+        let mut vfs_vpath = self.config.vfs_vpath.clone();
+        if ui.text_edit_singleline(&mut vfs_vpath).changed() {
+            self.config.vfs_vpath = vfs_vpath;
+        }
+        let mut use_quake_dir = self.config.vfs_use_quake_dir;
+        if ui.checkbox(&mut use_quake_dir, "Mount Quake dir").changed() {
+            self.config.vfs_use_quake_dir = use_quake_dir;
+        }
+        ui.label("Mount manifest");
+        let manifest_initial = self.initial_dir_for_path(self.config.vfs_mount_manifest.as_deref());
+        let mut vfs_manifest = self.config.vfs_mount_manifest.clone().unwrap_or_default();
+        let mut manifest_pick = None;
+        ui.horizontal(|ui| {
+            if ui.text_edit_singleline(&mut vfs_manifest).changed() {
+                update_optional_string(&mut self.config.vfs_mount_manifest, &vfs_manifest);
+            }
+            if ui.button("Browse...").clicked() {
+                manifest_pick = browse_for_file(
+                    manifest_initial.as_deref(),
+                    "Select mount manifest",
+                    Some("Manifest files (*.txt)|*.txt|All files (*.*)|*.*"),
+                );
+            }
+        });
+        if let Some(path) = manifest_pick {
+            vfs_manifest = path.display().to_string();
+            update_optional_string(&mut self.config.vfs_mount_manifest, &vfs_manifest);
+        }
+        ui.label("Mount dir");
+        vfs_mount_row(
+            ui,
+            &mut self.config.vfs_mount_dir_vroot,
+            &mut self.config.vfs_mount_dir_path,
+            "Select mount directory",
+            None,
+        );
+        ui.label("Mount pak");
+        vfs_mount_row(
+            ui,
+            &mut self.config.vfs_mount_pak_vroot,
+            &mut self.config.vfs_mount_pak_path,
+            "Select pak file",
+            Some("Pak files (*.pak)|*.pak|All files (*.*)|*.*"),
+        );
+        ui.label("Mount pk3");
+        vfs_mount_row(
+            ui,
+            &mut self.config.vfs_mount_pk3_vroot,
+            &mut self.config.vfs_mount_pk3_path,
+            "Select pk3 file",
+            Some("PK3 files (*.pk3)|*.pk3|All files (*.*)|*.*"),
+        );
+        ui.horizontal(|ui| {
+            let can_run = self.repo_root.is_some();
+            if ui
+                .add_enabled(can_run, egui::Button::new("Run VFS Stat"))
+                .clicked()
+            {
+                self.run_tools_vfs_stat();
             }
         });
         ui.add_space(6.0);
@@ -1319,6 +1469,64 @@ fn update_optional_string(target: &mut Option<String>, value: &str) {
         *target = None;
     } else {
         *target = Some(trimmed.to_string());
+    }
+}
+
+fn push_mount_pair(
+    command: &mut Command,
+    flag: &str,
+    vroot: Option<&str>,
+    path: Option<&str>,
+) -> Result<(), String> {
+    let vroot = vroot
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let path = path
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    match (vroot, path) {
+        (Some(vroot), Some(path)) => {
+            command.arg(flag).arg(vroot).arg(path);
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => Err(format!("{} expects both vroot and path.", flag)),
+    }
+}
+
+fn vfs_mount_row(
+    ui: &mut egui::Ui,
+    vroot: &mut Option<String>,
+    path: &mut Option<String>,
+    picker_title: &str,
+    picker_filter: Option<&str>,
+) {
+    let mut vroot_value = vroot.clone().unwrap_or_default();
+    let mut path_value = path.clone().unwrap_or_default();
+    let mut pick = None;
+    ui.horizontal(|ui| {
+        if ui
+            .add(egui::TextEdit::singleline(&mut vroot_value).desired_width(120.0))
+            .changed()
+        {
+            update_optional_string(vroot, &vroot_value);
+        }
+        if ui
+            .add(egui::TextEdit::singleline(&mut path_value).desired_width(320.0))
+            .changed()
+        {
+            update_optional_string(path, &path_value);
+        }
+        if ui.button("Browse...").clicked() {
+            pick = match picker_filter {
+                Some(filter) => browse_for_file(None, picker_title, Some(filter)),
+                None => browse_for_folder(None, picker_title),
+            };
+        }
+    });
+    if let Some(path_pick) = pick {
+        path_value = path_pick.display().to_string();
+        update_optional_string(path, &path_value);
     }
 }
 
