@@ -95,6 +95,7 @@ Create a minimal engine substrate that supports **raw content sources** (directo
 - [x] Define how the app/tools specify raw mounts:
   - [x] CLI flags (dir/pak/pk3) and/or
 - [x] A simple mount manifest under `content/config/`
+- [x] Manifest relative paths rebase to the manifest directory (CWD-independent)
 - [x] Make mount ordering explicit and reproducible.
 
 **DoD**

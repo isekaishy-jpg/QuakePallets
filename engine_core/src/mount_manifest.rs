@@ -13,10 +13,13 @@ pub struct MountManifestEntry {
 pub fn load_mount_manifest(path: &Path) -> Result<Vec<MountManifestEntry>, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|err| format!("mount manifest read failed ({}): {}", path.display(), err))?;
-    parse_mount_manifest(&contents)
+    let mut entries = parse_mount_manifest(&contents)?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    rebase_relative_paths(&mut entries, base_dir);
+    Ok(entries)
 }
 
-pub fn parse_mount_manifest(contents: &str) -> Result<Vec<MountManifestEntry>, String> {
+fn parse_mount_manifest(contents: &str) -> Result<Vec<MountManifestEntry>, String> {
     let mut entries = Vec::new();
     for (index, raw_line) in contents.lines().enumerate() {
         let line_no = index + 1;
@@ -92,6 +95,15 @@ fn parse_mount_kind(value: &str) -> Option<MountKind> {
     }
 }
 
+fn rebase_relative_paths(entries: &mut [MountManifestEntry], base_dir: &Path) {
+    for entry in entries {
+        if entry.path.is_absolute() {
+            continue;
+        }
+        entry.path = base_dir.join(&entry.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +122,14 @@ pk3 raw/q3 "D:\Quake3\baseq3\pak0.pk3"
         assert_eq!(entries[1].kind, MountKind::Pak);
         assert_eq!(entries[2].kind, MountKind::Pk3);
         assert_eq!(entries[0].mount_point, "raw/quake");
+    }
+
+    #[test]
+    fn rebase_manifest_paths() {
+        let input = "dir raw/quake id1\n";
+        let mut entries = parse_mount_manifest(input).expect("parse ok");
+        let base = Path::new("C:\\Quake");
+        rebase_relative_paths(&mut entries, base);
+        assert_eq!(entries[0].path, base.join("id1"));
     }
 }

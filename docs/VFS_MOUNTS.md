@@ -41,6 +41,7 @@ followed by any `--quake-dir` mounts.
 - `<dir|pak|pk3> <vroot> <path>`
 - Lines can be commented with `#`
 - Quote paths with spaces using `"..."`
+- Relative paths resolve against the manifest file's directory
 
 Example:
 ```
