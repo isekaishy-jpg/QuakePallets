@@ -11,8 +11,9 @@ use audio::AudioEngine;
 use client::{Client, ClientInput};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
-use compat_quake::pak::{self, PakFile};
-use engine_core::vfs::{Vfs, VfsError};
+use engine_core::observability;
+use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
+use engine_core::vfs::{MountKind, Vfs, VfsError};
 use net_transport::{LoopbackTransport, Transport, TransportConfig};
 use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Fullscreen, Ime,
@@ -52,6 +53,7 @@ const EXIT_BSP: i32 = 13;
 const EXIT_SCENE: i32 = 14;
 const EXIT_UI_REGRESSION: i32 = 20;
 const DEFAULT_SFX: &str = "sound/misc/menu1.wav";
+const QUAKE_VROOT: &str = "raw/quake";
 const HUD_FONT_SIZE: f32 = 16.0;
 const HUD_FONT_SIZE_SMALL: f32 = 14.0;
 const CONSOLE_FONT_SIZE: f32 = 14.0;
@@ -328,11 +330,15 @@ impl UiRegressionChecks {
 
 struct CliArgs {
     quake_dir: Option<PathBuf>,
+    content_root: Option<PathBuf>,
+    dev_root: Option<PathBuf>,
+    user_config_root: Option<PathBuf>,
+    mounts: Vec<MountSpec>,
     show_image: Option<String>,
     map: Option<String>,
     play_movie: Option<PathBuf>,
-    playlist: Option<PathBuf>,
-    script: Option<PathBuf>,
+    playlist: Option<String>,
+    script: Option<String>,
     input_script: bool,
     ui_regression: Option<UiRegressionArgs>,
     debug_resolution: bool,
@@ -341,6 +347,12 @@ struct CliArgs {
 enum ArgParseError {
     Help,
     Message(String),
+}
+
+struct MountSpec {
+    kind: MountKind,
+    mount_point: String,
+    path: PathBuf,
 }
 
 struct ExitError {
@@ -361,7 +373,7 @@ impl ExitError {
 fn enter_map_scene(
     renderer: &mut render_wgpu::Renderer,
     window: &Window,
-    quake_dir: &Path,
+    quake_vfs: Option<&Vfs>,
     map: &str,
     audio: Option<&Rc<AudioEngine>>,
     camera: &mut CameraState,
@@ -371,7 +383,10 @@ fn enter_map_scene(
     mouse_grabbed: &mut bool,
     loopback: &mut Option<LoopbackNet>,
 ) -> Result<(), ExitError> {
-    let (mesh, bounds, scene_collision, spawn) = load_bsp_scene(quake_dir, map)?;
+    let vfs = quake_vfs.ok_or_else(|| {
+        ExitError::new(EXIT_QUAKE_DIR, "quake mounts not configured for map load")
+    })?;
+    let (mesh, bounds, scene_collision, spawn) = load_bsp_scene(vfs, map)?;
 
     renderer.clear_textured_quad();
     renderer
@@ -407,7 +422,7 @@ fn enter_map_scene(
     };
 
     if let Some(audio) = audio {
-        match load_music_track(quake_dir) {
+        match load_music_track(vfs) {
             Ok(Some(track)) => {
                 if let Err(err) = audio.play_music(track.data) {
                     eprintln!("{}", err);
@@ -1462,16 +1477,16 @@ struct ScriptEntity {
 struct ScriptHostState {
     next_id: u32,
     entities: Vec<ScriptEntity>,
-    quake_dir: Option<PathBuf>,
+    quake_vfs: Option<Arc<Vfs>>,
     audio: Option<Rc<AudioEngine>>,
 }
 
 impl ScriptHostState {
-    fn new(quake_dir: Option<PathBuf>, audio: Option<Rc<AudioEngine>>) -> Self {
+    fn new(quake_vfs: Option<Arc<Vfs>>, audio: Option<Rc<AudioEngine>>) -> Self {
         Self {
             next_id: 1,
             entities: Vec::new(),
-            quake_dir,
+            quake_vfs,
             audio,
         }
     }
@@ -1503,11 +1518,11 @@ impl ScriptHostState {
             .audio
             .as_ref()
             .ok_or_else(|| "audio disabled".to_string())?;
-        let quake_dir = self
-            .quake_dir
-            .as_ref()
-            .ok_or_else(|| "quake dir is required for play_sound".to_string())?;
-        let data = load_wav_sfx(quake_dir, &asset).map_err(|err| err.message)?;
+        let quake_vfs = self
+            .quake_vfs
+            .as_deref()
+            .ok_or_else(|| "quake mounts are required for play_sound".to_string())?;
+        let data = load_wav_sfx(quake_vfs, &asset).map_err(|err| err.message)?;
         audio
             .play_wav(data)
             .map_err(|err| format!("play_sound failed: {}", err))?;
@@ -2319,6 +2334,7 @@ impl SceneCollision {
 }
 
 fn main() {
+    observability::install_panic_hook();
     let args = match parse_args() {
         Ok(args) => args,
         Err(ArgParseError::Help) => {
@@ -2329,6 +2345,20 @@ fn main() {
             eprintln!("{}", message);
             print_usage();
             std::process::exit(EXIT_USAGE);
+        }
+    };
+
+    let path_policy = PathPolicy::from_overrides(PathOverrides {
+        content_root: args.content_root.clone(),
+        dev_override_root: args.dev_root.clone(),
+        user_config_root: args.user_config_root.clone(),
+    });
+
+    let quake_vfs = match build_mounts(&args) {
+        Ok(vfs) => vfs,
+        Err(err) => {
+            eprintln!("{}", err.message);
+            std::process::exit(err.code);
         }
     };
 
@@ -2429,8 +2459,8 @@ fn main() {
         }
     };
     let mut sfx_data = None;
-    if let (Some(_), Some(quake_dir)) = (audio.as_ref(), args.quake_dir.as_ref()) {
-        match load_wav_sfx(quake_dir, DEFAULT_SFX) {
+    if let (Some(_), Some(vfs)) = (audio.as_ref(), quake_vfs.as_deref()) {
+        match load_wav_sfx(vfs, DEFAULT_SFX) {
             Ok(data) => sfx_data = Some(data),
             Err(err) => eprintln!("{}", err.message),
         }
@@ -2468,8 +2498,16 @@ fn main() {
         last_audio_ms: 0,
         last_video_ms: 0,
     };
-    let mut playlist_entries = if let Some(playlist_path) = args.playlist.as_ref() {
-        match load_playlist(playlist_path) {
+    let mut playlist_entries = if let Some(playlist_name) = args.playlist.as_deref() {
+        let resolved = match path_policy.resolve_config_file(ConfigKind::Playlist, playlist_name) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                eprintln!("{}", err);
+                std::process::exit(EXIT_USAGE);
+            }
+        };
+        println!("{}", resolved.describe());
+        match load_playlist(&resolved.path) {
             Ok(list) => list,
             Err(err) => {
                 eprintln!("{}", err.message);
@@ -2516,9 +2554,17 @@ fn main() {
     }
 
     let mut script: Option<ScriptRuntime> = None;
-    if let Some(script_path) = args.script.as_ref() {
+    if let Some(script_name) = args.script.as_deref() {
+        let resolved = match path_policy.resolve_config_file(ConfigKind::Script, script_name) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                eprintln!("{}", err);
+                std::process::exit(EXIT_USAGE);
+            }
+        };
+        println!("{}", resolved.describe());
         let host_state = Rc::new(RefCell::new(ScriptHostState::new(
-            args.quake_dir.clone(),
+            quake_vfs.clone(),
             audio.clone(),
         )));
         let spawn_state = Rc::clone(&host_state);
@@ -2537,7 +2583,7 @@ fn main() {
                 std::process::exit(EXIT_USAGE);
             }
         };
-        if let Err(err) = engine.load_file(script_path) {
+        if let Err(err) = engine.load_file(&resolved.path) {
             eprintln!("script load failed: {}", err);
             std::process::exit(EXIT_USAGE);
         }
@@ -2597,19 +2643,19 @@ fn main() {
     let mut mouse_grabbed = false;
     let mut ignore_cursor_move = false;
     let mut was_mouse_look = false;
-    let mut pending_map: Option<(PathBuf, String)> = None;
+    let mut pending_map: Option<String> = None;
 
     if let Some(asset) = args.show_image.as_deref() {
-        let quake_dir = match args.quake_dir.as_ref() {
-            Some(path) => path,
+        let vfs = match quake_vfs.as_deref() {
+            Some(vfs) => vfs,
             None => {
-                eprintln!("--quake-dir is required when using --show-image");
+                eprintln!("--show-image requires mounts (use --quake-dir or --mount-dir)");
                 print_usage();
                 std::process::exit(EXIT_USAGE);
             }
         };
 
-        let image = match load_lmp_image(quake_dir, asset) {
+        let image = match load_lmp_image(vfs, asset) {
             Ok(image) => image,
             Err(err) => {
                 eprintln!("{}", err.message);
@@ -2624,15 +2670,12 @@ fn main() {
     }
 
     if let Some(map) = args.map.as_deref() {
-        let quake_dir = match args.quake_dir.as_ref() {
-            Some(path) => path,
-            None => {
-                eprintln!("--quake-dir is required when using --map");
-                print_usage();
-                std::process::exit(EXIT_USAGE);
-            }
-        };
-        pending_map = Some((quake_dir.to_path_buf(), map.to_string()));
+        if quake_vfs.is_none() {
+            eprintln!("--map requires mounts (use --quake-dir or --mount-dir)");
+            print_usage();
+            std::process::exit(EXIT_USAGE);
+        }
+        pending_map = Some(map.to_string());
     }
 
     if video.is_none() && args.show_image.is_none() {
@@ -3072,11 +3115,11 @@ fn main() {
                                         scripted.next_at =
                                             now + Duration::from_millis(INPUT_SCRIPT_STEP_DELAY_MS);
                                     } else if !scene_active {
-                                        if let Some((quake_dir, map)) = pending_map.take() {
+                                        if let Some(map) = pending_map.take() {
                                             match enter_map_scene(
                                                 &mut renderer,
                                                 window,
-                                                &quake_dir,
+                                                quake_vfs.as_deref(),
                                                 &map,
                                                 audio.as_ref(),
                                                 &mut camera,
@@ -3091,14 +3134,14 @@ fn main() {
                                                 }
                                                 Err(err) => {
                                                     eprintln!("{}", err.message);
-                                                    pending_map = Some((quake_dir, map));
+                                                    pending_map = Some(map);
                                                     finish_input_script = true;
                                                 }
                                             }
                                         } else {
                                             if !scripted.reported_missing_map {
                                                 eprintln!(
-                                                    "input script requires --map and --quake-dir"
+                                                    "input script requires --map and mounts"
                                                 );
                                                 scripted.reported_missing_map = true;
                                             }
@@ -3369,11 +3412,11 @@ fn main() {
                         skip_render = true;
                     }
                     if ui_draw.output.start_requested {
-                        if let Some((quake_dir, map)) = pending_map.take() {
+                        if let Some(map) = pending_map.take() {
                             let result = enter_map_scene(
                                 &mut renderer,
                                 window,
-                                &quake_dir,
+                                quake_vfs.as_deref(),
                                 &map,
                                 audio.as_ref(),
                                 &mut camera,
@@ -3389,7 +3432,7 @@ fn main() {
                                 }
                                 Err(err) => {
                                     eprintln!("{}", err.message);
-                                    pending_map = Some((quake_dir, map));
+                                    pending_map = Some(map);
                                 }
                             }
                         } else {
@@ -4480,6 +4523,10 @@ fn main() {
 
 fn parse_args() -> Result<CliArgs, ArgParseError> {
     let mut quake_dir = None;
+    let mut content_root = None;
+    let mut dev_root = None;
+    let mut user_config_root = None;
+    let mut mounts = Vec::new();
     let mut show_image = None;
     let mut map = None;
     let mut play_movie = None;
@@ -4502,6 +4549,63 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
                     .ok_or_else(|| ArgParseError::Message("--quake-dir expects a path".into()))?;
                 quake_dir = Some(PathBuf::from(value));
             }
+            "--content-root" => {
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--content-root expects a path".into())
+                })?;
+                content_root = Some(PathBuf::from(value));
+            }
+            "--dev-root" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--dev-root expects a path".into()))?;
+                dev_root = Some(PathBuf::from(value));
+            }
+            "--config-root" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--config-root expects a path".into()))?;
+                user_config_root = Some(PathBuf::from(value));
+            }
+            "--mount-dir" => {
+                let mount_point = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--mount-dir expects a mount point".into())
+                })?;
+                let path = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--mount-dir expects a path".into()))?;
+                mounts.push(MountSpec {
+                    kind: MountKind::Dir,
+                    mount_point,
+                    path: PathBuf::from(path),
+                });
+            }
+            "--mount-pak" => {
+                let mount_point = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--mount-pak expects a mount point".into())
+                })?;
+                let path = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--mount-pak expects a path".into()))?;
+                mounts.push(MountSpec {
+                    kind: MountKind::Pak,
+                    mount_point,
+                    path: PathBuf::from(path),
+                });
+            }
+            "--mount-pk3" => {
+                let mount_point = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--mount-pk3 expects a mount point".into())
+                })?;
+                let path = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--mount-pk3 expects a path".into()))?;
+                mounts.push(MountSpec {
+                    kind: MountKind::Pk3,
+                    mount_point,
+                    path: PathBuf::from(path),
+                });
+            }
             "--show-image" => {
                 let value = args
                     .next()
@@ -4521,16 +4625,16 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
                 play_movie = Some(PathBuf::from(value));
             }
             "--playlist" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| ArgParseError::Message("--playlist expects a path".into()))?;
-                playlist = Some(PathBuf::from(value));
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--playlist expects a name or path".into())
+                })?;
+                playlist = Some(value);
             }
             "--script" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| ArgParseError::Message("--script expects a path".into()))?;
-                script = Some(PathBuf::from(value));
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--script expects a name or path".into())
+                })?;
+                script = Some(value);
             }
             "--input-script" => {
                 input_script = true;
@@ -4661,6 +4765,10 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
 
     Ok(CliArgs {
         quake_dir,
+        content_root,
+        dev_root,
+        user_config_root,
+        mounts,
         show_image,
         map,
         play_movie,
@@ -4673,12 +4781,13 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
 }
 
 fn print_usage() {
-    eprintln!("usage: pallet [--quake-dir <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <file>] [--script <path>] [--input-script] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
+    eprintln!("usage: pallet [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--content-root <path>] [--dev-root <path>] [--config-root <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <name>] [--script <name>] [--input-script] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
-    eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script scripts/demo.lua");
+    eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script demo.lua");
     eprintln!("example: pallet --play-movie intro.ogv");
     eprintln!("example: pallet --playlist movies_playlist.txt");
+    eprintln!("example: pallet --mount-pk3 raw/q3 \"C:\\\\Quake3\\\\baseq3\\\\pak0.pk3\" --show-image raw/q3/gfx/2d/console.tga");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --input-script");
     eprintln!("example: pallet --ui-regression-shot ui_regression/shot.png --ui-regression-res 1920x1080 --ui-regression-dpi 1.0 --ui-regression-ui-scale 1.0 --ui-regression-screen main");
 }
@@ -5105,37 +5214,39 @@ fn handle_console_command(
             }
             true
         }
+        "sticky_error" => {
+            match observability::sticky_error() {
+                Some(message) => console.push_line(format!("sticky error: {}", message)),
+                None => console.push_line("sticky error: <none>".to_string()),
+            }
+            true
+        }
         _ => false,
     }
 }
 
-fn load_wav_sfx(quake_dir: &Path, asset: &str) -> Result<Vec<u8>, ExitError> {
-    let (pak, pak_path) = load_pak_from_quake_dir(quake_dir)?;
+fn load_wav_sfx(vfs: &Vfs, asset: &str) -> Result<Vec<u8>, ExitError> {
     let asset_name = normalize_asset_name(asset);
-    let wav_bytes = pak
-        .entry_data(&asset_name)
-        .map_err(|err| ExitError::new(EXIT_PAK, format!("asset lookup failed: {}", err)))?
-        .ok_or_else(|| {
-            ExitError::new(
-                EXIT_PAK,
-                format!("asset not found in pak0.pak: {}", asset_name),
-            )
-        })?;
-    println!("loaded {} from {}", asset_name, pak_path.display());
-    Ok(wav_bytes.to_vec())
+    let vpath = quake_vpath(&asset_name);
+    let (wav_bytes, provenance) = vfs.read_with_provenance(&vpath).map_err(|err| {
+        ExitError::new(EXIT_PAK, format!("asset read failed ({}): {}", vpath, err))
+    })?;
+    println!(
+        "loaded {} from {} ({})",
+        asset_name,
+        provenance.source.display(),
+        provenance.kind
+    );
+    Ok(wav_bytes)
 }
 
-fn load_music_track(quake_dir: &Path) -> Result<Option<MusicTrack>, ExitError> {
-    let mut vfs = Vfs::new();
-    vfs.add_root(quake_dir);
-    for dir in ["id1/music", "music"] {
-        if let Some(track) = find_music_in_dir(&vfs, dir)? {
+fn load_music_track(vfs: &Vfs) -> Result<Option<MusicTrack>, ExitError> {
+    for dir in [quake_vpath("music")] {
+        if let Some(track) = find_music_in_dir(vfs, &dir)? {
             return Ok(Some(track));
         }
     }
-
-    let (pak, _) = load_pak_from_quake_dir(quake_dir)?;
-    Ok(find_music_in_pak(&pak))
+    Ok(None)
 }
 
 fn find_music_in_dir(vfs: &Vfs, dir: &str) -> Result<Option<MusicTrack>, ExitError> {
@@ -5159,59 +5270,41 @@ fn find_music_in_dir(vfs: &Vfs, dir: &str) -> Result<Option<MusicTrack>, ExitErr
 
     if let Some(name) = candidates.into_iter().next() {
         let path = format!("{}/{}", dir, name);
-        return match vfs.read(&path) {
-            Ok(data) => Ok(Some(MusicTrack { name: path, data })),
-            Err(err) => Err(ExitError::new(
-                EXIT_PAK,
-                format!("music read failed: {}", err),
-            )),
-        };
+        let (data, provenance) = vfs
+            .read_with_provenance(&path)
+            .map_err(|err| ExitError::new(EXIT_PAK, format!("music read failed: {}", err)))?;
+        println!(
+            "loaded music {} from {} ({})",
+            path,
+            provenance.source.display(),
+            provenance.kind
+        );
+        return Ok(Some(MusicTrack { name: path, data }));
     }
 
     Ok(None)
 }
 
-fn find_music_in_pak(pak: &PakFile) -> Option<MusicTrack> {
-    let mut candidates: Vec<String> = pak
-        .entries()
-        .iter()
-        .filter(|entry| entry.name.starts_with("music/"))
-        .map(|entry| entry.name.clone())
-        .filter(|name| name.to_lowercase().ends_with(".ogg"))
-        .collect();
-    candidates.sort();
-
-    for name in candidates {
-        if let Ok(Some(bytes)) = pak.entry_data(&name) {
-            return Some(MusicTrack {
-                name,
-                data: bytes.to_vec(),
-            });
-        }
-    }
-    None
-}
-
-fn load_lmp_image(quake_dir: &Path, asset: &str) -> Result<ImageData, ExitError> {
-    let (pak, pak_path) = load_pak_from_quake_dir(quake_dir)?;
-    let palette_bytes = pak
-        .entry_data("gfx/palette.lmp")
-        .map_err(|err| ExitError::new(EXIT_PAK, format!("palette lookup failed: {}", err)))?
-        .ok_or_else(|| ExitError::new(EXIT_PAK, "palette not found in pak0.pak"))?;
-    let palette = lmp::parse_palette(palette_bytes)
+fn load_lmp_image(vfs: &Vfs, asset: &str) -> Result<ImageData, ExitError> {
+    let palette_path = quake_vpath("gfx/palette.lmp");
+    let palette_bytes = vfs.read(&palette_path).map_err(|err| {
+        ExitError::new(
+            EXIT_PAK,
+            format!("palette lookup failed ({}): {}", palette_path, err),
+        )
+    })?;
+    let palette = lmp::parse_palette(&palette_bytes)
         .map_err(|err| ExitError::new(EXIT_IMAGE, format!("palette parse failed: {}", err)))?;
 
     let asset_name = normalize_asset_name(asset);
-    let image_bytes = pak
-        .entry_data(&asset_name)
-        .map_err(|err| ExitError::new(EXIT_PAK, format!("asset lookup failed: {}", err)))?
-        .ok_or_else(|| {
-            ExitError::new(
-                EXIT_PAK,
-                format!("asset not found in pak0.pak: {}", asset_name),
-            )
-        })?;
-    let image = lmp::parse_lmp_image(image_bytes)
+    let image_path = quake_vpath(&asset_name);
+    let (image_bytes, provenance) = vfs.read_with_provenance(&image_path).map_err(|err| {
+        ExitError::new(
+            EXIT_PAK,
+            format!("asset lookup failed ({}): {}", image_path, err),
+        )
+    })?;
+    let image = lmp::parse_lmp_image(&image_bytes)
         .map_err(|err| ExitError::new(EXIT_IMAGE, format!("image parse failed: {}", err)))?;
     let rgba = image.to_rgba8(&palette);
     let image = ImageData::new(image.width, image.height, rgba)
@@ -5220,7 +5313,7 @@ fn load_lmp_image(quake_dir: &Path, asset: &str) -> Result<ImageData, ExitError>
     println!(
         "loaded {} from {} ({}x{})",
         asset_name,
-        pak_path.display(),
+        provenance.source.display(),
         image.width,
         image.height
     );
@@ -5229,29 +5322,29 @@ fn load_lmp_image(quake_dir: &Path, asset: &str) -> Result<ImageData, ExitError>
 }
 
 fn load_bsp_scene(
-    quake_dir: &Path,
+    vfs: &Vfs,
     map: &str,
 ) -> Result<(MeshData, Bounds, SceneCollision, Option<SpawnPoint>), ExitError> {
-    let (pak, pak_path) = load_pak_from_quake_dir(quake_dir)?;
     let map_name = normalize_map_asset(map);
-    let bsp_bytes = pak
-        .entry_data(&map_name)
-        .map_err(|err| ExitError::new(EXIT_PAK, format!("map lookup failed: {}", err)))?
-        .ok_or_else(|| {
-            ExitError::new(EXIT_PAK, format!("map not found in pak0.pak: {}", map_name))
-        })?;
-    let bsp = bsp::parse_bsp(bsp_bytes)
+    let map_path = quake_vpath(&map_name);
+    let (bsp_bytes, provenance) = vfs.read_with_provenance(&map_path).map_err(|err| {
+        ExitError::new(
+            EXIT_PAK,
+            format!("map lookup failed ({}): {}", map_path, err),
+        )
+    })?;
+    let bsp = bsp::parse_bsp(&bsp_bytes)
         .map_err(|err| ExitError::new(EXIT_BSP, format!("bsp parse failed: {}", err)))?;
 
     println!(
         "loaded {} from {} ({} vertices, {} faces)",
         map_name,
-        pak_path.display(),
+        provenance.source.display(),
         bsp.vertices.len(),
         bsp.faces.len()
     );
 
-    let spawn = bsp::parse_spawn(bsp_bytes, &bsp.header)
+    let spawn = bsp::parse_spawn(&bsp_bytes, &bsp.header)
         .map_err(|err| ExitError::new(EXIT_BSP, format!("bsp spawn parse failed: {}", err)))?;
 
     let (mesh, bounds, collision) = build_scene_mesh(&bsp)?;
@@ -5411,37 +5504,6 @@ fn build_scene_mesh(bsp: &Bsp) -> Result<(MeshData, Bounds, SceneCollision), Exi
     ))
 }
 
-fn load_pak_from_quake_dir(quake_dir: &Path) -> Result<(PakFile, PathBuf), ExitError> {
-    if !quake_dir.is_dir() {
-        return Err(ExitError::new(
-            EXIT_QUAKE_DIR,
-            format!("quake dir not found: {}", quake_dir.display()),
-        ));
-    }
-
-    let mut vfs = Vfs::new();
-    vfs.add_root(quake_dir);
-
-    let (virtual_path, pak_path) = if vfs.exists("id1/pak0.pak") {
-        ("id1/pak0.pak", quake_dir.join("id1").join("pak0.pak"))
-    } else if vfs.exists("pak0.pak") {
-        ("pak0.pak", quake_dir.join("pak0.pak"))
-    } else {
-        return Err(ExitError::new(
-            EXIT_PAK,
-            format!("pak0.pak not found under {}", quake_dir.display()),
-        ));
-    };
-
-    let data = vfs
-        .read(virtual_path)
-        .map_err(|err| ExitError::new(EXIT_PAK, format!("pak read failed: {}", err)))?;
-    let pak = pak::parse_pak(data)
-        .map_err(|err| ExitError::new(EXIT_PAK, format!("pak parse failed: {}", err)))?;
-
-    Ok((pak, pak_path))
-}
-
 fn normalize_asset_name(name: &str) -> String {
     let normalized = name.replace('\\', "/");
     normalized
@@ -5459,6 +5521,95 @@ fn normalize_map_asset(name: &str) -> String {
         normalized.push_str(".bsp");
     }
     format!("maps/{}", normalized)
+}
+
+fn quake_vpath(path: &str) -> String {
+    let normalized = normalize_asset_name(path);
+    if normalized.starts_with("raw/") {
+        normalized
+    } else {
+        format!("{}/{}", QUAKE_VROOT, normalized)
+    }
+}
+
+fn build_mounts(args: &CliArgs) -> Result<Option<Arc<Vfs>>, ExitError> {
+    if args.quake_dir.is_none() && args.mounts.is_empty() {
+        return Ok(None);
+    }
+    let mut vfs = Vfs::new();
+    for spec in &args.mounts {
+        add_mount_spec(&mut vfs, spec)?;
+    }
+    if let Some(quake_dir) = args.quake_dir.as_ref() {
+        mount_quake_dir(&mut vfs, quake_dir)?;
+    }
+    Ok(Some(Arc::new(vfs)))
+}
+
+fn add_mount_spec(vfs: &mut Vfs, spec: &MountSpec) -> Result<(), ExitError> {
+    let result = match spec.kind {
+        MountKind::Dir => vfs.add_dir_mount(&spec.mount_point, &spec.path),
+        MountKind::Pak => vfs.add_pak_mount(&spec.mount_point, &spec.path),
+        MountKind::Pk3 => vfs.add_pk3_mount(&spec.mount_point, &spec.path),
+    };
+    result.map_err(|err| {
+        let code = match spec.kind {
+            MountKind::Dir => EXIT_USAGE,
+            MountKind::Pak | MountKind::Pk3 => EXIT_PAK,
+        };
+        ExitError::new(
+            code,
+            format!(
+                "mount {} {} from {} failed: {}",
+                spec.kind,
+                spec.mount_point,
+                spec.path.display(),
+                err
+            ),
+        )
+    })
+}
+
+fn mount_quake_dir(vfs: &mut Vfs, quake_dir: &Path) -> Result<(), ExitError> {
+    if !quake_dir.is_dir() {
+        return Err(ExitError::new(
+            EXIT_QUAKE_DIR,
+            format!("quake dir not found: {}", quake_dir.display()),
+        ));
+    }
+    let base_dir = {
+        let id1 = quake_dir.join("id1");
+        if id1.is_dir() {
+            id1
+        } else {
+            quake_dir.to_path_buf()
+        }
+    };
+
+    vfs.add_dir_mount(QUAKE_VROOT, &base_dir).map_err(|err| {
+        ExitError::new(
+            EXIT_QUAKE_DIR,
+            format!("quake dir mount failed ({}): {}", base_dir.display(), err),
+        )
+    })?;
+
+    let mut pak_paths = Vec::new();
+    for index in 0..10 {
+        let path = base_dir.join(format!("pak{}.pak", index));
+        if path.is_file() {
+            pak_paths.push((index, path));
+        }
+    }
+    pak_paths.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in pak_paths {
+        vfs.add_pak_mount(QUAKE_VROOT, &path).map_err(|err| {
+            ExitError::new(
+                EXIT_PAK,
+                format!("quake pak mount failed ({}): {}", path.display(), err),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

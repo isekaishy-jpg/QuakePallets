@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use engine_core::path_policy::user_config_root;
+
 const SETTINGS_VERSION: u32 = 1;
 const MIN_UI_SCALE: f32 = 0.75;
 const MAX_UI_SCALE: f32 = 2.0;
@@ -149,19 +151,7 @@ impl Settings {
 }
 
 fn settings_path() -> PathBuf {
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata).join("Pallet").join("settings.cfg");
-    }
-    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(config).join("pallet").join("settings.cfg");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("pallet")
-            .join("settings.cfg");
-    }
-    PathBuf::from("pallet_settings.cfg")
+    user_config_root().join("settings.cfg")
 }
 
 fn parse_resolution(value: &str) -> Option<[u32; 2]> {

@@ -1,3 +1,4 @@
 /target/
 ui_regression/
 dist/
+.pallet/

@@ -51,6 +51,10 @@ Exit codes:
 - `tools pak extract --quake-dir <PATH> --out <DIR>`  
   Extraction must write only to the user-provided output directory.
 
+### `tools vfs`
+- `tools vfs stat [--quake-dir <PATH>] [--mount-dir <VROOT> <PATH>] [--mount-pak <VROOT> <PATH>] [--mount-pk3 <VROOT> <PATH>] <VPATH>`
+  - reports size, hash, and mount provenance for a virtual path.
+
 ## Future expansions (non-breaking)
 - `tools map inspect --quake-dir <PATH> --map <MAPNAME>`
 - `tools assets validate --quake-dir <PATH>`
