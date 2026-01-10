@@ -8,7 +8,7 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
 pub use text_overlay::{
-    TextBounds, TextFontSystem, TextLayer, TextOverlay, TextOverlayTimings, TextPosition,
+    TextBounds, TextFontSystem, TextLayer, TextOverlay, TextOverlayTimings, TextPosition, TextSpan,
     TextStyle, TextViewport,
 };
 pub use wgpu::SurfaceError as RenderError;

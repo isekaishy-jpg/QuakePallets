@@ -69,6 +69,12 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load() -> Self {
+        let config_path = config_path();
+        if let Ok(contents) = fs::read_to_string(&config_path) {
+            if let Some(settings) = Self::parse(&contents) {
+                return settings;
+            }
+        }
         let path = settings_path();
         let Ok(contents) = fs::read_to_string(&path) else {
             return Self::default();
@@ -77,21 +83,10 @@ impl Settings {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let path = settings_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let data = format!(
-            "version={}\nui_scale={:.3}\nvsync={}\nmaster_volume={:.3}\nwindow_mode={}\nresolution={}x{}\n",
-            SETTINGS_VERSION,
-            self.ui_scale,
-            self.vsync,
-            self.master_volume,
-            self.window_mode.as_str(),
-            self.resolution[0],
-            self.resolution[1],
-        );
-        fs::write(path, data)
+        let data = format_settings_lines(self);
+        write_config_lines(&settings_path(), &data)?;
+        merge_config_lines(&config_path(), &data)?;
+        Ok(())
     }
 
     fn parse(contents: &str) -> Option<Self> {
@@ -102,7 +97,9 @@ impl Settings {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (key, value) = line.split_once('=')?;
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
             let key = key.trim();
             let value = value.trim();
             match key {
@@ -152,6 +149,71 @@ impl Settings {
 
 fn settings_path() -> PathBuf {
     user_config_root().join("settings.cfg")
+}
+
+fn config_path() -> PathBuf {
+    user_config_root().join("config.cfg")
+}
+
+fn format_settings_lines(settings: &Settings) -> Vec<String> {
+    vec![
+        format!("version={}", SETTINGS_VERSION),
+        format!("ui_scale={:.3}", settings.ui_scale),
+        format!("vsync={}", settings.vsync),
+        format!("master_volume={:.3}", settings.master_volume),
+        format!("window_mode={}", settings.window_mode.as_str()),
+        format!(
+            "resolution={}x{}",
+            settings.resolution[0], settings.resolution[1]
+        ),
+    ]
+}
+
+fn write_config_lines(path: &PathBuf, lines: &[String]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut data = lines.join("\n");
+    data.push('\n');
+    fs::write(path, data)
+}
+
+fn merge_config_lines(path: &PathBuf, settings_lines: &[String]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut merged = Vec::new();
+    let contents = fs::read_to_string(path).unwrap_or_default();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            merged.push(line.to_string());
+            continue;
+        }
+        let Some((key, _)) = trimmed.split_once('=') else {
+            merged.push(line.to_string());
+            continue;
+        };
+        let key = key.trim();
+        if let Some(replacement) = settings_lines
+            .iter()
+            .find(|candidate| candidate.starts_with(&format!("{key}=")))
+        {
+            if seen.insert(key.to_string()) {
+                merged.push(replacement.clone());
+            }
+        } else {
+            merged.push(line.to_string());
+        }
+    }
+    for line in settings_lines {
+        let key = line.split('=').next().unwrap_or("").trim();
+        if !key.is_empty() && seen.insert(key.to_string()) {
+            merged.push(line.clone());
+        }
+    }
+    write_config_lines(path, &merged)
 }
 
 fn parse_resolution(value: &str) -> Option<[u32; 2]> {

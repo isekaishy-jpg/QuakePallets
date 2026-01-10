@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod control_plane;
 pub mod jobs;
 pub mod logging;
 pub mod mount_manifest;

@@ -8,6 +8,7 @@ pub enum ConfigKind {
     Script,
     Cvars,
     Mounts,
+    Console,
 }
 
 impl ConfigKind {
@@ -17,6 +18,7 @@ impl ConfigKind {
             ConfigKind::Script => "scripts",
             ConfigKind::Cvars => "cvars",
             ConfigKind::Mounts => "mounts",
+            ConfigKind::Console => "console",
         }
     }
 
@@ -26,6 +28,7 @@ impl ConfigKind {
             ConfigKind::Script => "PALLET_CONFIG_OVERRIDE_SCRIPT",
             ConfigKind::Cvars => "PALLET_CONFIG_OVERRIDE_CVARS",
             ConfigKind::Mounts => "PALLET_CONFIG_OVERRIDE_MOUNTS",
+            ConfigKind::Console => "PALLET_CONFIG_OVERRIDE_CONSOLE",
         }
     }
 }

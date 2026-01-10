@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -118,6 +120,12 @@ pub struct TextBounds {
     pub height: f32,
 }
 
+#[derive(Clone, Debug)]
+pub struct TextSpan {
+    pub text: Arc<str>,
+    pub color: [f32; 4],
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TextViewport {
     pub physical_px: [u32; 2],
@@ -132,6 +140,8 @@ struct QueuedText {
     position: TextPosition,
     bounds: TextBounds,
     text: Arc<str>,
+    spans: Option<Vec<TextSpan>>,
+    spans_hash: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +166,7 @@ struct CachedBuffer {
     bounds: (f32, f32),
     color: [f32; 4],
     layer: TextLayer,
+    spans_hash: Option<u64>,
 }
 
 pub struct TextOverlay {
@@ -236,6 +247,29 @@ impl TextOverlay {
             position,
             bounds,
             text: text.into(),
+            spans: None,
+            spans_hash: None,
+        });
+    }
+
+    pub fn queue_rich(
+        &mut self,
+        layer: TextLayer,
+        style: TextStyle,
+        position: TextPosition,
+        bounds: TextBounds,
+        raw_text: impl Into<Arc<str>>,
+        spans: Vec<TextSpan>,
+    ) {
+        let spans_hash = Some(hash_text_spans(&spans));
+        self.queued.push(QueuedText {
+            layer,
+            style,
+            position,
+            bounds,
+            text: raw_text.into(),
+            spans: Some(spans),
+            spans_hash,
         });
     }
 
@@ -371,6 +405,7 @@ impl TextOverlay {
                     bounds: (0.0, 0.0),
                     color: [0.0, 0.0, 0.0, 0.0],
                     layer: TextLayer::Hud,
+                    spans_hash: None,
                 });
             }
         }
@@ -392,13 +427,16 @@ impl TextOverlay {
             }
             let needs_text = cached.text.as_ref() != item.text.as_ref()
                 || cached.color != item.style.color
-                || cached.layer != item.layer;
+                || cached.layer != item.layer
+                || cached.spans_hash != item.spans_hash;
             if needs_text {
                 let attrs = Attrs::new()
                     .family(Family::SansSerif)
                     .color(color_from_f32(item.style.color))
                     .metadata(layer_order(item.layer) as usize);
-                let shaping = if matches!(
+                let shaping = if item.spans.is_some() {
+                    Shaping::Advanced
+                } else if matches!(
                     item.layer,
                     TextLayer::Console | TextLayer::ConsoleLog | TextLayer::Stress
                 ) {
@@ -406,12 +444,28 @@ impl TextOverlay {
                 } else {
                     Shaping::Advanced
                 };
-                cached
-                    .buffer
-                    .set_text(&mut font_system, item.text.as_ref(), attrs, shaping);
+                if let Some(spans) = &item.spans {
+                    let mut rich_spans = Vec::with_capacity(spans.len());
+                    for span in spans {
+                        let span_attrs = Attrs::new()
+                            .family(Family::SansSerif)
+                            .color(color_from_f32(span.color))
+                            .metadata(layer_order(item.layer) as usize);
+                        rich_spans.push((span.text.as_ref(), span_attrs));
+                    }
+                    cached
+                        .buffer
+                        .borrow_with(&mut font_system)
+                        .set_rich_text(rich_spans, shaping);
+                } else {
+                    cached
+                        .buffer
+                        .set_text(&mut font_system, item.text.as_ref(), attrs, shaping);
+                }
                 cached.text = item.text.clone();
                 cached.color = item.style.color;
                 cached.layer = item.layer;
+                cached.spans_hash = item.spans_hash;
             }
         }
 
@@ -579,6 +633,18 @@ fn to_ndc(x: f32, y: f32, width: f32, height: f32) -> (f32, f32) {
     let nx = (x / width) * 2.0 - 1.0;
     let ny = 1.0 - (y / height) * 2.0;
     (nx, ny)
+}
+
+fn hash_text_spans(spans: &[TextSpan]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    spans.len().hash(&mut hasher);
+    for span in spans {
+        span.text.as_ref().hash(&mut hasher);
+        for value in span.color {
+            value.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn rect_vertex_bytes(vertices: &[RectVertex]) -> Vec<u8> {

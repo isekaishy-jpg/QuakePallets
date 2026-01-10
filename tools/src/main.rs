@@ -4,6 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use compat_quake::pak::{self, PakFile};
+use engine_core::control_plane::{
+    register_core_commands, register_core_cvars, register_pallet_command_specs, CommandRegistry,
+    CvarRegistry,
+};
 use engine_core::mount_manifest::{load_mount_manifest, MountManifestEntry};
 use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
 use engine_core::vfs::{MountKind, Vfs};
@@ -28,6 +32,7 @@ enum Commands {
     Pak(PakArgs),
     UiRegression(UiRegressionArgs),
     Vfs(VfsArgs),
+    Console(ConsoleArgs),
 }
 
 #[derive(Parser)]
@@ -84,6 +89,18 @@ struct UiRegressionArgs {
 struct VfsArgs {
     #[command(subcommand)]
     command: VfsCommand,
+}
+
+#[derive(Parser)]
+struct ConsoleArgs {
+    #[command(subcommand)]
+    command: ConsoleCommand,
+}
+
+#[derive(Subcommand)]
+enum ConsoleCommand {
+    DumpCvars,
+    DumpCmds,
 }
 
 #[derive(Subcommand)]
@@ -160,6 +177,7 @@ fn main() {
         Commands::Pak(args) => run_pak(args),
         Commands::UiRegression(args) => run_ui_regression(args),
         Commands::Vfs(args) => run_vfs(args),
+        Commands::Console(args) => run_console(args),
     };
     std::process::exit(exit_code);
 }
@@ -375,6 +393,41 @@ fn run_vfs(args: VfsArgs) -> i32 {
     match args.command {
         VfsCommand::Stat(args) => run_vfs_stat(args),
     }
+}
+
+fn run_console(args: ConsoleArgs) -> i32 {
+    match args.command {
+        ConsoleCommand::DumpCvars => console_dump_cvars(),
+        ConsoleCommand::DumpCmds => console_dump_cmds(),
+    }
+}
+
+fn console_dump_cvars() -> i32 {
+    let mut cvars = CvarRegistry::new();
+    if let Err(err) = register_core_cvars(&mut cvars) {
+        eprintln!("cvar registry init failed: {}", err);
+        return EXIT_USAGE;
+    }
+    println!("cvars:");
+    for entry in cvars.list() {
+        println!("{} = {}", entry.def.name, entry.value.display());
+    }
+    EXIT_SUCCESS
+}
+
+fn console_dump_cmds() -> i32 {
+    let mut commands: CommandRegistry<()> = CommandRegistry::new();
+    if let Err(err) = register_core_commands(&mut commands)
+        .and_then(|_| register_pallet_command_specs(&mut commands))
+    {
+        eprintln!("command registry init failed: {}", err);
+        return EXIT_USAGE;
+    }
+    println!("commands:");
+    for spec in commands.list_specs() {
+        println!("{} - {}", spec.name, spec.help);
+    }
+    EXIT_SUCCESS
 }
 
 fn run_vfs_stat(args: VfsStatArgs) -> i32 {

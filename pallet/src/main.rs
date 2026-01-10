@@ -11,6 +11,10 @@ use audio::AudioEngine;
 use client::{Client, ClientInput};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
+use engine_core::control_plane::{
+    register_core_commands, register_core_cvars, register_pallet_command_specs, CommandArgs,
+    CommandOutput, CommandRegistry, CoreCvars, CvarId, CvarRegistry, ExecPathResolver,
+};
 use engine_core::mount_manifest::{load_mount_manifest, MountManifestEntry};
 use engine_core::observability;
 use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
@@ -23,7 +27,7 @@ use platform_winit::{
 };
 use render_wgpu::{
     FrameCapture, ImageData, MeshData, MeshVertex, RenderCaptureError, RenderError, TextBounds,
-    TextFontSystem, TextLayer, TextOverlay, TextOverlayTimings, TextPosition, TextStyle,
+    TextFontSystem, TextLayer, TextOverlay, TextOverlayTimings, TextPosition, TextSpan, TextStyle,
     TextViewport, YuvImageView,
 };
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
@@ -60,12 +64,20 @@ const HUD_FONT_SIZE_SMALL: f32 = 14.0;
 const CONSOLE_FONT_SIZE: f32 = 14.0;
 const HUD_TEXT_COLOR: [f32; 4] = [0.9, 0.95, 1.0, 1.0];
 const BUILD_TEXT: &str = concat!("build: ", env!("CARGO_PKG_VERSION"));
-const CONSOLE_TEXT_COLOR: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
+const CONSOLE_TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const CONSOLE_BG_COLOR: [f32; 4] = [0.05, 0.05, 0.08, 0.75];
 const CONSOLE_SEPARATOR_COLOR: [f32; 4] = [0.95, 0.95, 0.95, 0.9];
 const CONSOLE_SELECTION_COLOR: [f32; 4] = [0.2, 0.4, 0.8, 0.35];
 const CONSOLE_MENU_BG_COLOR: [f32; 4] = [0.08, 0.1, 0.14, 0.95];
 const CONSOLE_MENU_TEXT_COLOR: [f32; 4] = [0.95, 0.95, 0.98, 1.0];
+const CONSOLE_COLOR_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+const CONSOLE_COLOR_RED: [f32; 4] = [0.95, 0.25, 0.25, 1.0];
+const CONSOLE_COLOR_ORANGE: [f32; 4] = [0.95, 0.55, 0.2, 1.0];
+const CONSOLE_COLOR_YELLOW: [f32; 4] = [0.95, 0.85, 0.2, 1.0];
+const CONSOLE_COLOR_GREEN: [f32; 4] = [0.35, 0.9, 0.35, 1.0];
+const CONSOLE_COLOR_BLUE: [f32; 4] = [0.35, 0.6, 0.95, 1.0];
+const CONSOLE_COLOR_INDIGO: [f32; 4] = [0.45, 0.45, 0.95, 1.0];
+const CONSOLE_COLOR_VIOLET: [f32; 4] = [0.8, 0.45, 0.95, 1.0];
 const CONSOLE_MENU_PADDING: f32 = 4.0;
 const CONSOLE_MENU_CHAR_WIDTH: f32 = 0.6;
 const CONSOLE_TOAST_DURATION_MS: u64 = 1200;
@@ -475,7 +487,7 @@ struct ConsoleState {
     log: VecDeque<String>,
     max_lines: usize,
     log_revision: u64,
-    visible_cache: Option<ConsoleVisibleCache>,
+    welcome_shown: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -514,14 +526,6 @@ impl ConsoleMenuBounds {
 struct ConsoleToast {
     text: String,
     expires_at: Instant,
-}
-
-#[derive(Clone, Debug)]
-struct ConsoleVisibleCache {
-    start: usize,
-    lines: usize,
-    revision: u64,
-    text: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -588,7 +592,7 @@ impl Default for ConsoleState {
             log: VecDeque::new(),
             max_lines: 256,
             log_revision: 0,
-            visible_cache: None,
+            welcome_shown: false,
         }
     }
 }
@@ -867,42 +871,12 @@ impl ConsoleState {
 
     fn bump_log_revision(&mut self) {
         self.log_revision = self.log_revision.wrapping_add(1);
-        self.visible_cache = None;
     }
 
     fn clear_log(&mut self) {
         self.log.clear();
         self.bump_log_revision();
         self.clear_selection();
-    }
-
-    fn visible_text(&mut self, start: usize, lines: usize) -> Arc<str> {
-        if self.log.is_empty() || lines == 0 || start >= self.log.len() {
-            return Arc::from("");
-        }
-        let lines = lines.min(self.log.len().saturating_sub(start));
-        if let Some(cache) = &self.visible_cache {
-            if cache.start == start && cache.lines == lines && cache.revision == self.log_revision {
-                return cache.text.clone();
-            }
-        }
-        let mut text = String::new();
-        for index in start..start + lines {
-            if let Some(line) = self.log.get(index) {
-                if index > start {
-                    text.push('\n');
-                }
-                text.push_str(line);
-            }
-        }
-        let text: Arc<str> = Arc::from(text);
-        self.visible_cache = Some(ConsoleVisibleCache {
-            start,
-            lines,
-            revision: self.log_revision,
-            text: text.clone(),
-        });
-        text
     }
 
     fn push_line(&mut self, line: impl Into<String>) {
@@ -932,6 +906,131 @@ impl ConsoleState {
         }
         self.bump_log_revision();
     }
+}
+
+impl CommandOutput for ConsoleState {
+    fn push_line(&mut self, line: String) {
+        ConsoleState::push_line(self, line);
+    }
+
+    fn clear(&mut self) {
+        self.clear_log();
+    }
+
+    fn set_max_lines(&mut self, max: usize) {
+        self.max_lines = self.max_lines.max(max);
+    }
+
+    fn reset_scroll(&mut self) {
+        self.scroll_offset = 0.0;
+    }
+}
+
+const CONSOLE_WELCOME_FILE: &str = "console_welcome.txt";
+
+fn push_console_welcome(console: &mut ConsoleState, path_policy: &PathPolicy) {
+    if console.welcome_shown {
+        return;
+    }
+    console.welcome_shown = true;
+    if let Some(lines) = load_console_welcome_lines(path_policy) {
+        for line in lines {
+            console.push_line(line);
+        }
+        return;
+    }
+    console.push_line("^8Welcome to the Pallet console.".to_string());
+    console.push_line(
+        "^8Colors: ^0black ^1red ^2orange ^3yellow ^4green ^5blue ^6indigo ^7violet ^8white"
+            .to_string(),
+    );
+    console.push_line("^8Use caret (^) + a digit 0-8 before text to change color.".to_string());
+    console.push_line("^8Example: ^1ye^8s ^2or^3an^4ge".to_string());
+}
+
+fn load_console_welcome_lines(path_policy: &PathPolicy) -> Option<Vec<String>> {
+    let resolved = path_policy
+        .resolve_config_file(ConfigKind::Console, CONSOLE_WELCOME_FILE)
+        .ok()?;
+    let contents = std::fs::read_to_string(&resolved.path).ok()?;
+    Some(contents.lines().map(|line| line.to_string()).collect())
+}
+
+#[derive(Clone, Debug)]
+struct ConsoleSpan {
+    text: String,
+    color: [f32; 4],
+}
+
+fn console_color_from_code(code: char) -> Option<[f32; 4]> {
+    match code {
+        '0' => Some(CONSOLE_COLOR_BLACK),
+        '1' => Some(CONSOLE_COLOR_RED),
+        '2' => Some(CONSOLE_COLOR_ORANGE),
+        '3' => Some(CONSOLE_COLOR_YELLOW),
+        '4' => Some(CONSOLE_COLOR_GREEN),
+        '5' => Some(CONSOLE_COLOR_BLUE),
+        '6' => Some(CONSOLE_COLOR_INDIGO),
+        '7' => Some(CONSOLE_COLOR_VIOLET),
+        '8' => Some(CONSOLE_TEXT_COLOR),
+        _ => None,
+    }
+}
+
+fn push_console_span(spans: &mut Vec<ConsoleSpan>, text: String, color: [f32; 4]) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut() {
+        if last.color == color {
+            last.text.push_str(&text);
+            return;
+        }
+    }
+    spans.push(ConsoleSpan { text, color });
+}
+
+fn append_console_spans_for_line(
+    line: &str,
+    default_color: [f32; 4],
+    spans: &mut Vec<ConsoleSpan>,
+) {
+    let mut current_color = default_color;
+    let mut current_text = String::new();
+    let mut trailing_codes = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '^' {
+            if let Some(next) = chars.peek().copied() {
+                if let Some(color) = console_color_from_code(next) {
+                    push_console_span(spans, std::mem::take(&mut current_text), current_color);
+                    trailing_codes.push('^');
+                    trailing_codes.push(next);
+                    chars.next();
+                    current_color = color;
+                    continue;
+                }
+            }
+        }
+        if !trailing_codes.is_empty() {
+            trailing_codes.clear();
+        }
+        current_text.push(ch);
+    }
+    push_console_span(spans, current_text, current_color);
+    if !trailing_codes.is_empty() {
+        push_console_span(spans, trailing_codes, default_color);
+    }
+}
+
+fn finalize_console_spans(spans: Vec<ConsoleSpan>) -> Vec<TextSpan> {
+    spans
+        .into_iter()
+        .map(|span| TextSpan {
+            text: Arc::from(span.text),
+            color: span.color,
+        })
+        .collect()
 }
 
 #[repr(C)]
@@ -1352,11 +1451,6 @@ impl PerfState {
         self.last = timings;
     }
 
-    fn toggle_overlay(&mut self) {
-        self.show_overlay = !self.show_overlay;
-        self.hud_dirty = true;
-    }
-
     fn hud_text(&mut self, now: Instant) -> Arc<str> {
         let elapsed = now.saturating_duration_since(self.hud_last_update);
         if self.hud_dirty || elapsed >= Duration::from_millis(PERF_HUD_UPDATE_MS) {
@@ -1396,13 +1490,29 @@ impl PerfState {
     }
 
     fn request_stress_toggle(&mut self) -> bool {
-        if self.stress.is_some() || self.stress_requested {
-            self.stress = None;
-            self.stress_requested = false;
-            false
-        } else {
+        let enable = !self.stress_enabled();
+        self.set_stress_enabled(enable);
+        enable
+    }
+
+    fn stress_enabled(&self) -> bool {
+        self.stress.is_some() || self.stress_requested
+    }
+
+    fn set_stress_enabled(&mut self, enabled: bool) -> bool {
+        if enabled {
+            if self.stress_enabled() {
+                return false;
+            }
             self.stress_requested = true;
             self.hud_dirty = true;
+            true
+        } else {
+            if !self.stress_enabled() {
+                return false;
+            }
+            self.stress = None;
+            self.stress_requested = false;
             true
         }
     }
@@ -2637,6 +2747,17 @@ fn main() {
     let mut ui_regression_done = false;
     let mut hud = HudState::new(Instant::now());
     let mut perf = PerfState::new();
+    let mut cvars = CvarRegistry::new();
+    let core_cvars = match register_core_cvars(&mut cvars) {
+        Ok(core_cvars) => core_cvars,
+        Err(err) => {
+            eprintln!("cvar registry init failed: {}", err);
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+    if let Some(value) = cvar_bool(&cvars, core_cvars.dbg_perf_hud) {
+        perf.show_overlay = value;
+    }
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
     let mut fly_mode = false;
@@ -2879,6 +3000,9 @@ fn main() {
                             &input_router,
                             &mut console,
                             &mut perf,
+                            &mut cvars,
+                            &core_cvars,
+                            &path_policy,
                             &mut ui_state,
                             window,
                             &settings,
@@ -3183,6 +3307,9 @@ fn main() {
                                         &input_router,
                                         &mut console,
                                         &mut perf,
+                                        &mut cvars,
+                                        &core_cvars,
+                                        &path_policy,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3222,16 +3349,19 @@ fn main() {
                                     scripted.advance(now);
                                 }
                                 3 => {
-                                    let _ = handle_non_video_key_input(
-                                        KeyCode::Escape,
-                                        true,
-                                        false,
-                                        &input_router,
-                                        &mut console,
-                                        &mut perf,
-                                        &mut ui_state,
-                                        window,
-                                        &settings,
+                                let _ = handle_non_video_key_input(
+                                    KeyCode::Escape,
+                                    true,
+                                    false,
+                                    &input_router,
+                                    &mut console,
+                                    &mut perf,
+                                    &mut cvars,
+                                    &core_cvars,
+                                    &path_policy,
+                                    &mut ui_state,
+                                    window,
+                                    &settings,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -3250,16 +3380,19 @@ fn main() {
                                     scripted.advance(now);
                                 }
                                 4 => {
-                                    let _ = handle_non_video_key_input(
-                                        KeyCode::Backquote,
-                                        true,
-                                        false,
-                                        &input_router,
-                                        &mut console,
-                                        &mut perf,
-                                        &mut ui_state,
-                                        window,
-                                        &settings,
+                                let _ = handle_non_video_key_input(
+                                    KeyCode::Backquote,
+                                    true,
+                                    false,
+                                    &input_router,
+                                    &mut console,
+                                    &mut perf,
+                                    &mut cvars,
+                                    &core_cvars,
+                                    &path_policy,
+                                    &mut ui_state,
+                                    window,
+                                    &settings,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -3292,6 +3425,9 @@ fn main() {
                                         &input_router,
                                         &mut console,
                                         &mut perf,
+                                        &mut cvars,
+                                        &core_cvars,
+                                        &path_policy,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3320,6 +3456,9 @@ fn main() {
                                         &input_router,
                                         &mut console,
                                         &mut perf,
+                                        &mut cvars,
+                                        &core_cvars,
+                                        &path_policy,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -4106,10 +4245,32 @@ fn main() {
                                                 }
                                             }
                                         }
-                                        let visible_text =
-                                            console.visible_text(start, draw_lines);
-                                        if !visible_text.is_empty() {
-                                            console_log_overlay.queue(
+                                        let mut raw_text = String::new();
+                                        let mut spans = Vec::new();
+                                        for line_offset in 0..draw_lines {
+                                            if line_offset > 0 {
+                                                raw_text.push('\n');
+                                                push_console_span(
+                                                    &mut spans,
+                                                    "\n".to_string(),
+                                                    CONSOLE_TEXT_COLOR,
+                                                );
+                                            }
+                                            let line_index = start + line_offset;
+                                            let line = console
+                                                .log
+                                                .get(line_index)
+                                                .map(|value| value.as_str())
+                                                .unwrap_or("");
+                                            raw_text.push_str(line);
+                                            append_console_spans_for_line(
+                                                line,
+                                                CONSOLE_TEXT_COLOR,
+                                                &mut spans,
+                                            );
+                                        }
+                                        if !raw_text.is_empty() {
+                                            console_log_overlay.queue_rich(
                                                 TextLayer::ConsoleLog,
                                                 console_style,
                                                 TextPosition {
@@ -4121,7 +4282,8 @@ fn main() {
                                                     height: (layout_log_text_height + y_offset)
                                                         .max(1.0),
                                                 },
-                                                visible_text,
+                                                raw_text,
+                                                finalize_console_spans(spans),
                                             );
                                         }
                                         console_log_update = Some(ConsoleLogUpdate {
@@ -4255,8 +4417,27 @@ fn main() {
                                 } else {
                                     " "
                                 };
-                                let input_line = format!("> {}{}", console.buffer, caret);
-                                text_overlay.queue(
+                                let mut raw_text = String::new();
+                                raw_text.push_str("> ");
+                                raw_text.push_str(&console.buffer);
+                                raw_text.push_str(caret);
+                                let mut spans = Vec::new();
+                                push_console_span(
+                                    &mut spans,
+                                    "> ".to_string(),
+                                    CONSOLE_TEXT_COLOR,
+                                );
+                                append_console_spans_for_line(
+                                    &console.buffer,
+                                    CONSOLE_TEXT_COLOR,
+                                    &mut spans,
+                                );
+                                push_console_span(
+                                    &mut spans,
+                                    caret.to_string(),
+                                    CONSOLE_TEXT_COLOR,
+                                );
+                                text_overlay.queue_rich(
                                     TextLayer::Console,
                                     console_style,
                                     TextPosition {
@@ -4267,7 +4448,8 @@ fn main() {
                                         width: text_width,
                                         height: line_height,
                                     },
-                                    input_line,
+                                    raw_text,
+                                    finalize_console_spans(spans),
                                 );
                             }
                         }
@@ -5123,13 +5305,6 @@ fn key_name(code: KeyCode) -> String {
     }
 }
 
-fn parse_command_line(line: &str) -> Option<(String, Vec<String>)> {
-    let mut parts = line.split_whitespace();
-    let command = parts.next()?.to_string();
-    let args = parts.map(|part| part.to_string()).collect();
-    Some((command, args))
-}
-
 fn console_quad_vertices(
     rect: ConsoleLogRect,
     surface_size: [u32; 2],
@@ -5190,66 +5365,198 @@ fn console_quad_index_bytes(indices: &[u16]) -> Vec<u8> {
     bytes
 }
 
-fn handle_console_command(
+struct PalletCommandUser<'a> {
+    perf: &'a mut PerfState,
+    script: Option<&'a mut ScriptRuntime>,
+    path_policy: &'a PathPolicy,
+}
+
+impl<'a> ExecPathResolver for PalletCommandUser<'a> {
+    fn resolve_exec_path(&self, input: &str) -> Result<PathBuf, String> {
+        let resolved = self
+            .path_policy
+            .resolve_config_file(ConfigKind::Script, input)?;
+        Ok(resolved.path)
+    }
+}
+
+fn dispatch_console_line(
+    line: &str,
     console: &mut ConsoleState,
     perf: &mut PerfState,
-    command: &str,
-    args: &[String],
-) -> bool {
-    match command {
-        "logfill" => {
+    cvars: &mut CvarRegistry,
+    core_cvars: &CoreCvars,
+    script: Option<&mut ScriptRuntime>,
+    path_policy: &PathPolicy,
+) {
+    let dispatch_result = match build_command_registry(core_cvars) {
+        Ok(mut commands) => {
+            let mut user = PalletCommandUser {
+                perf,
+                script,
+                path_policy,
+            };
+            commands.dispatch_line(line, cvars, console, &mut user)
+        }
+        Err(err) => {
+            console.push_line(format!("error: {}", err));
+            return;
+        }
+    };
+    if let Err(err) = dispatch_result {
+        console.push_line(format!("error: {}", err));
+    }
+    apply_cvar_changes(cvars, perf, core_cvars);
+}
+
+fn build_command_registry<'a>(
+    core_cvars: &'a CoreCvars,
+) -> Result<CommandRegistry<'a, PalletCommandUser<'a>>, String> {
+    let mut commands: CommandRegistry<'a, PalletCommandUser<'a>> = CommandRegistry::new();
+    register_core_commands(&mut commands)?;
+    register_pallet_command_specs(&mut commands)?;
+
+    let perf_hud_id = core_cvars.dbg_perf_hud;
+    commands.set_handler(
+        "logfill",
+        Box::new(|ctx, args| {
             let count = args
-                .first()
+                .positional(0)
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(5_000)
                 .clamp(1, 20_000);
-            fill_log_lines(console, count);
-            true
-        }
-        "perf" => {
-            for line in perf_summary_lines(perf) {
-                console.push_line(line);
+            ctx.output.set_max_lines(count);
+            ctx.output.clear();
+            for index in 0..count {
+                ctx.output.push_line(format!(
+                    "logfill {:>5}: The quick brown fox jumps over the lazy dog.",
+                    index + 1
+                ));
             }
-            true
-        }
-        "perf_hud" => {
-            let toggle = match args.first().map(|value| value.as_str()) {
-                Some("on") => {
-                    perf.show_overlay = true;
-                    true
-                }
-                Some("off") => {
-                    perf.show_overlay = false;
-                    false
-                }
-                _ => {
-                    perf.toggle_overlay();
-                    perf.show_overlay
-                }
+            ctx.output.reset_scroll();
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "perf",
+        Box::new(|ctx, _args| {
+            for line in perf_summary_lines(ctx.user.perf) {
+                ctx.output.push_line(line);
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "perf_hud",
+        Box::new(move |ctx, args| {
+            let current = cvar_bool(ctx.cvars, perf_hud_id).unwrap_or(false);
+            let next = match parse_toggle_arg(args)? {
+                Some(value) => value,
+                None => !current,
             };
-            console.push_line(format!(
+            ctx.cvars.set(
+                perf_hud_id,
+                engine_core::control_plane::CvarValue::Bool(next),
+            )?;
+            ctx.output.push_line(format!(
                 "perf hud overlay: {}",
-                if toggle { "on" } else { "off" }
+                if next { "on" } else { "off" }
             ));
-            true
-        }
-        "stress_text" | "perf_stress" => {
-            if perf.request_stress_toggle() {
-                console.resume_mouse_look = true;
-                console.push_line("stress: starting (5s)".to_string());
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "perf_stress",
+        Box::new(|ctx, args| {
+            let (enabled, changed) = match parse_toggle_arg(args)? {
+                Some(value) => (value, ctx.user.perf.set_stress_enabled(value)),
+                None => (ctx.user.perf.request_stress_toggle(), true),
+            };
+            if !changed {
+                ctx.output.push_line(if enabled {
+                    "stress: already running".to_string()
+                } else {
+                    "stress: already stopped".to_string()
+                });
+            } else if enabled {
+                ctx.output.push_line("stress: starting (5s)".to_string());
             } else {
-                console.push_line("stress: stopped".to_string());
+                ctx.output.push_line("stress: stopped".to_string());
             }
-            true
-        }
-        "sticky_error" => {
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "stress_text",
+        Box::new(|ctx, args| {
+            let (enabled, changed) = match parse_toggle_arg(args)? {
+                Some(value) => (value, ctx.user.perf.set_stress_enabled(value)),
+                None => (ctx.user.perf.request_stress_toggle(), true),
+            };
+            if !changed {
+                ctx.output.push_line(if enabled {
+                    "stress: already running".to_string()
+                } else {
+                    "stress: already stopped".to_string()
+                });
+            } else if enabled {
+                ctx.output.push_line("stress: starting (5s)".to_string());
+            } else {
+                ctx.output.push_line("stress: stopped".to_string());
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "sticky_error",
+        Box::new(|ctx, _args| {
             match observability::sticky_error() {
-                Some(message) => console.push_line(format!("sticky error: {}", message)),
-                None => console.push_line("sticky error: <none>".to_string()),
+                Some(message) => ctx.output.push_line(format!("sticky error: {}", message)),
+                None => ctx.output.push_line("sticky error: <none>".to_string()),
             }
-            true
+            Ok(())
+        }),
+    )?;
+    commands.set_fallback(Box::new(|ctx, name, args| {
+        if let Some(script) = ctx.user.script.as_deref_mut() {
+            match script.engine.run_command(name, args.raw_tokens()) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(format!("unknown command: {}", name)),
+                Err(err) => Err(format!("lua command failed: {}", err)),
+            }
+        } else {
+            Err(format!("unknown command: {}", name))
         }
-        _ => false,
+    }));
+    Ok(commands)
+}
+
+fn apply_cvar_changes(cvars: &mut CvarRegistry, perf: &mut PerfState, core: &CoreCvars) {
+    for id in cvars.take_dirty() {
+        if id == core.dbg_perf_hud {
+            if let Some(value) = cvar_bool(cvars, id) {
+                perf.show_overlay = value;
+                perf.hud_dirty = true;
+            }
+        }
+    }
+}
+
+fn cvar_bool(cvars: &CvarRegistry, id: CvarId) -> Option<bool> {
+    match cvars.get(id)?.value {
+        engine_core::control_plane::CvarValue::Bool(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn parse_toggle_arg(args: &CommandArgs) -> Result<Option<bool>, String> {
+    match args.positional(0) {
+        Some(value) => match value {
+            "1" => Ok(Some(true)),
+            "0" => Ok(Some(false)),
+            _ => Err(format!("expected 0/1, got {}", value)),
+        },
+        None => Ok(None),
     }
 }
 
@@ -5682,12 +5989,14 @@ fn open_console(
     input: &mut InputState,
     mouse_look: &mut bool,
     mouse_grabbed: &mut bool,
+    path_policy: &PathPolicy,
 ) {
     let now = Instant::now();
     console.caret_epoch = now;
     console.open(now);
     console.resume_mouse_look = *mouse_look;
     console.buffer.clear();
+    push_console_welcome(console, path_policy);
     ui_state.console_open = console.is_blocking();
     *input = InputState::default();
     *mouse_look = false;
@@ -5735,6 +6044,9 @@ fn handle_non_video_key_input(
     input_router: &InputRouter,
     console: &mut ConsoleState,
     perf: &mut PerfState,
+    cvars: &mut CvarRegistry,
+    core_cvars: &CoreCvars,
+    path_policy: &PathPolicy,
     ui_state: &mut UiState,
     window: &Window,
     settings: &Settings,
@@ -5771,7 +6083,15 @@ fn handle_non_video_key_input(
                     true,
                 );
             } else {
-                open_console(console, ui_state, window, input, mouse_look, mouse_grabbed);
+                open_console(
+                    console,
+                    ui_state,
+                    window,
+                    input,
+                    mouse_look,
+                    mouse_grabbed,
+                    path_policy,
+                );
             }
         }
         return true;
@@ -5819,32 +6139,15 @@ fn handle_non_video_key_input(
                         if !line.is_empty() {
                             println!("> {}", line);
                             console.push_line(format!("> {}", line));
-                            if let Some((command, args)) = parse_command_line(&line) {
-                                if !handle_console_command(console, perf, &command, &args) {
-                                    if let Some(script) = script.as_mut() {
-                                        match script.engine.run_command(&command, &args) {
-                                            Ok(true) => {}
-                                            Ok(false) => {
-                                                eprintln!("unknown script command: {}", command);
-                                                console.push_line(format!(
-                                                    "unknown script command: {}",
-                                                    command
-                                                ));
-                                            }
-                                            Err(err) => {
-                                                eprintln!("lua command failed: {}", err);
-                                                console.push_line(format!(
-                                                    "lua command failed: {}",
-                                                    err
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        eprintln!("no script loaded");
-                                        console.push_line("no script loaded");
-                                    }
-                                }
-                            }
+                            dispatch_console_line(
+                                &line,
+                                console,
+                                perf,
+                                cvars,
+                                core_cvars,
+                                script.as_mut(),
+                                path_policy,
+                            );
                         }
                     }
                     KeyCode::Backspace => {
