@@ -25,6 +25,9 @@ ci: fmt clippy test deny
 build:
   cargo build --all-features
 
+package-dev *args:
+  cargo run -p tools --all-features -- content build {{args}}
+
 run *args:
   cargo run -p pallet --all-features -- {{args}}
 

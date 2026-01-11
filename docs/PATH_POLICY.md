@@ -10,15 +10,20 @@ the repo content tree, or explicit overrides.
 content/
   config/
     playlists/
-    scripts/
+    scripts/   # exec/cfg scripts
     cvars/
     mounts/
+    console/
+  script/
 ```
 
 Config-like files belong under `content/config/...`. For example:
 - `content/config/playlists/movies_playlist.txt`
-- `content/config/scripts/demo.lua`
 - `content/config/mounts/default.txt`
+- `content/config/scripts/control_plane_checklist_2_9.cfg`
+
+Lua scripts belong under `content/script/...`. For example:
+- `content/script/demo.lua`
 
 ## Dev override root
 `/.pallet/` (gitignored)
@@ -29,6 +34,9 @@ Config-like files belong under `content/config/...`. For example:
     scripts/
     cvars/
     mounts/
+    console/
+  content/
+    script/
 ```
 
 ## User config root

@@ -1,23 +1,37 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use audio::AudioEngine;
 use client::{Client, ClientInput};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
+use engine_core::asset_id::AssetKey;
+use engine_core::asset_manager::{
+    AssetBudgetTag, AssetEntrySnapshot, AssetManager, AssetPriority, AssetStatus, BlobAsset,
+    ConfigAsset, QuakeRawAsset, RequestOpts, ScriptAsset, TextAsset, TextureAsset,
+};
+use engine_core::asset_resolver::{
+    AssetLayer, AssetResolver, AssetSource, ResolveReport, ResolvedLocation, ResolvedPath,
+};
 use engine_core::control_plane::{
     register_core_commands, register_core_cvars, register_pallet_command_specs, CommandArgs,
-    CommandOutput, CommandRegistry, CoreCvars, CvarId, CvarRegistry, ExecPathResolver,
+    CommandOutput, CommandRegistry, CoreCvars, CvarId, CvarRegistry, ExecPathResolver, ExecSource,
+};
+use engine_core::jobs::{JobQueue, Jobs};
+use engine_core::level_manifest::{
+    discover_level_manifests, load_level_manifest, resolve_level_manifest_path, LevelManifest,
+    LevelManifestPath,
 };
 use engine_core::mount_manifest::{load_mount_manifest, MountManifestEntry};
 use engine_core::observability;
 use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
+use engine_core::quake_index::{QuakeEntry, QuakeIndex};
 use engine_core::vfs::{MountKind, Vfs, VfsError};
 use net_transport::{LoopbackTransport, Transport, TransportConfig};
 use platform_winit::{
@@ -28,7 +42,7 @@ use platform_winit::{
 use render_wgpu::{
     FrameCapture, ImageData, MeshData, MeshVertex, RenderCaptureError, RenderError, TextBounds,
     TextFontSystem, TextLayer, TextOverlay, TextOverlayTimings, TextPosition, TextSpan, TextStyle,
-    TextViewport, YuvImageView,
+    TextViewport, UploadPriority, UploadQueue, YuvImageView,
 };
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
@@ -87,6 +101,8 @@ const CONSOLE_INPUT_PADDING: f32 = 0.5;
 const CONSOLE_INPUT_BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const CONSOLE_SLIDE_MS: u64 = 500;
 const CONSOLE_SELECTION_LINE_LIMIT: usize = 128;
+const ASSET_LIST_DEFAULT_LIMIT: usize = 200;
+const ASSET_LIST_MAX_LIMIT: usize = 1000;
 const UI_REGRESSION_MIN_FONT_PX: f32 = 9.0;
 const UI_REGRESSION_LOG_LINE_COUNT: usize = 24;
 const UI_REGRESSION_FPS: f32 = 144.0;
@@ -387,6 +403,7 @@ impl ExitError {
 fn enter_map_scene(
     renderer: &mut render_wgpu::Renderer,
     window: &Window,
+    asset_manager: &AssetManager,
     quake_vfs: Option<&Vfs>,
     map: &str,
     audio: Option<&Rc<AudioEngine>>,
@@ -400,7 +417,7 @@ fn enter_map_scene(
     let vfs = quake_vfs.ok_or_else(|| {
         ExitError::new(EXIT_QUAKE_DIR, "quake mounts not configured for map load")
     })?;
-    let (mesh, bounds, scene_collision, spawn) = load_bsp_scene(vfs, map)?;
+    let (mesh, bounds, scene_collision, spawn) = load_bsp_scene(asset_manager, map)?;
 
     renderer.clear_textured_quad();
     renderer
@@ -436,7 +453,7 @@ fn enter_map_scene(
     };
 
     if let Some(audio) = audio {
-        match load_music_track(vfs) {
+        match load_music_track(asset_manager, vfs) {
             Ok(Some(track)) => {
                 if let Err(err) = audio.play_music(track.data) {
                     eprintln!("{}", err);
@@ -926,14 +943,40 @@ impl CommandOutput for ConsoleState {
     }
 }
 
+#[derive(Clone)]
+struct ConsoleAsyncSender {
+    sender: mpsc::Sender<String>,
+}
+
+impl ConsoleAsyncSender {
+    fn send_line(&self, line: impl Into<String>) {
+        let _ = self.sender.send(line.into());
+    }
+
+    fn send_lines<I>(&self, lines: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for line in lines {
+            let _ = self.sender.send(line);
+        }
+    }
+}
+
+fn drain_console_async(receiver: &mpsc::Receiver<String>, console: &mut ConsoleState) {
+    while let Ok(line) = receiver.try_recv() {
+        console.push_line(line);
+    }
+}
+
 const CONSOLE_WELCOME_FILE: &str = "console_welcome.txt";
 
-fn push_console_welcome(console: &mut ConsoleState, path_policy: &PathPolicy) {
+fn push_console_welcome(console: &mut ConsoleState, asset_manager: &AssetManager) {
     if console.welcome_shown {
         return;
     }
     console.welcome_shown = true;
-    if let Some(lines) = load_console_welcome_lines(path_policy) {
+    if let Some(lines) = load_console_welcome_lines(asset_manager) {
         for line in lines {
             console.push_line(line);
         }
@@ -948,12 +991,83 @@ fn push_console_welcome(console: &mut ConsoleState, path_policy: &PathPolicy) {
     console.push_line("^8Example: ^1ye^8s ^2or^3an^4ge".to_string());
 }
 
-fn load_console_welcome_lines(path_policy: &PathPolicy) -> Option<Vec<String>> {
-    let resolved = path_policy
-        .resolve_config_file(ConfigKind::Console, CONSOLE_WELCOME_FILE)
+fn load_console_welcome_lines(asset_manager: &AssetManager) -> Option<Vec<String>> {
+    let key = AssetKey::from_parts(
+        "engine",
+        "config",
+        &format!("console/{}", CONSOLE_WELCOME_FILE),
+    )
+    .ok()?;
+    let handle = asset_manager.request::<ConfigAsset>(
+        key,
+        RequestOpts {
+            priority: AssetPriority::High,
+            budget_tag: AssetBudgetTag::Boot,
+        },
+    );
+    let asset = asset_manager
+        .await_ready(&handle, Duration::from_secs(2))
         .ok()?;
-    let contents = std::fs::read_to_string(&resolved.path).ok()?;
-    Some(contents.lines().map(|line| line.to_string()).collect())
+    Some(asset.text.lines().map(|line| line.to_string()).collect())
+}
+
+fn config_asset_key(subdir: &str, input: &str) -> Result<AssetKey, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("config input is empty".to_string());
+    }
+    if trimmed.contains(':') {
+        let key = AssetKey::parse(trimmed).map_err(|err| err.to_string())?;
+        if key.namespace() != "engine" || key.kind() != "config" {
+            return Err(format!(
+                "expected engine:config asset id (got {})",
+                key.canonical()
+            ));
+        }
+        return Ok(key);
+    }
+    let normalized = trimmed.replace('\\', "/");
+    let prefix = format!("{}/", subdir);
+    let path = if normalized.starts_with(&prefix) {
+        normalized
+    } else {
+        format!("{}/{}", subdir, normalized)
+    };
+    AssetKey::from_parts("engine", "config", &path).map_err(|err| err.to_string())
+}
+
+fn script_asset_key(input: &str) -> Result<AssetKey, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("script input is empty".to_string());
+    }
+    if trimmed.contains(':') {
+        let key = AssetKey::parse(trimmed).map_err(|err| err.to_string())?;
+        if key.namespace() != "engine" || key.kind() != "script" {
+            return Err(format!(
+                "expected engine:script asset id (got {})",
+                key.canonical()
+            ));
+        }
+        return Ok(key);
+    }
+    let normalized = trimmed.replace('\\', "/");
+    let path = normalized.trim_start_matches('/');
+    AssetKey::from_parts("engine", "script", path).map_err(|err| err.to_string())
+}
+
+fn resolve_config_base_dir(
+    path_policy: &PathPolicy,
+    key: &AssetKey,
+) -> Result<Option<PathBuf>, ExitError> {
+    let resolver = AssetResolver::new(path_policy, None);
+    let location = resolver
+        .resolve(key)
+        .map_err(|err| ExitError::new(EXIT_USAGE, err))?;
+    match location.path {
+        ResolvedPath::File(path) => Ok(path.parent().map(|dir| dir.to_path_buf())),
+        ResolvedPath::Vfs(_) | ResolvedPath::Bundle { .. } => Ok(None),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1591,15 +1705,21 @@ struct ScriptHostState {
     entities: Vec<ScriptEntity>,
     quake_vfs: Option<Arc<Vfs>>,
     audio: Option<Rc<AudioEngine>>,
+    asset_manager: AssetManager,
 }
 
 impl ScriptHostState {
-    fn new(quake_vfs: Option<Arc<Vfs>>, audio: Option<Rc<AudioEngine>>) -> Self {
+    fn new(
+        quake_vfs: Option<Arc<Vfs>>,
+        audio: Option<Rc<AudioEngine>>,
+        asset_manager: AssetManager,
+    ) -> Self {
         Self {
             next_id: 1,
             entities: Vec::new(),
             quake_vfs,
             audio,
+            asset_manager,
         }
     }
 
@@ -1630,11 +1750,11 @@ impl ScriptHostState {
             .audio
             .as_ref()
             .ok_or_else(|| "audio disabled".to_string())?;
-        let quake_vfs = self
-            .quake_vfs
-            .as_deref()
-            .ok_or_else(|| "quake mounts are required for play_sound".to_string())?;
-        let data = load_wav_sfx(quake_vfs, &asset).map_err(|err| err.message)?;
+        if self.quake_vfs.is_none() {
+            return Err("quake mounts are required for play_sound".to_string());
+        }
+        let data = load_wav_sfx(&self.asset_manager, &asset, AssetBudgetTag::Streaming)
+            .map_err(|err| err.message)?;
         audio
             .play_wav(data)
             .map_err(|err| format!("play_sound failed: {}", err))?;
@@ -2473,6 +2593,8 @@ fn main() {
             std::process::exit(err.code);
         }
     };
+    let asset_manager = AssetManager::new(path_policy.clone(), quake_vfs.clone(), None);
+    let quake_dir = args.quake_dir.clone();
 
     let ui_regression = args.ui_regression.clone();
     let mut settings = Settings::load();
@@ -2526,6 +2648,7 @@ fn main() {
         }
     };
     renderer.resize(renderer.window_inner_size());
+    let upload_queue = renderer.upload_queue();
     if let Some(regression) = ui_regression.as_ref() {
         let actual = renderer.size();
         if actual.width != regression.resolution[0] || actual.height != regression.resolution[1] {
@@ -2572,8 +2695,8 @@ fn main() {
         }
     };
     let mut sfx_data = None;
-    if let (Some(_), Some(vfs)) = (audio.as_ref(), quake_vfs.as_deref()) {
-        match load_wav_sfx(vfs, DEFAULT_SFX) {
+    if audio.is_some() && quake_vfs.is_some() {
+        match load_wav_sfx(&asset_manager, DEFAULT_SFX, AssetBudgetTag::Boot) {
             Ok(data) => sfx_data = Some(data),
             Err(err) => eprintln!("{}", err.message),
         }
@@ -2612,15 +2735,41 @@ fn main() {
         last_video_ms: 0,
     };
     let mut playlist_entries = if let Some(playlist_name) = args.playlist.as_deref() {
-        let resolved = match path_policy.resolve_config_file(ConfigKind::Playlist, playlist_name) {
-            Ok(resolved) => resolved,
+        let key = match config_asset_key("playlists", playlist_name) {
+            Ok(key) => key,
             Err(err) => {
-                eprintln!("{}", err);
+                eprintln!("playlist asset id invalid: {}", err);
                 std::process::exit(EXIT_USAGE);
             }
         };
-        println!("{}", resolved.describe());
-        match load_playlist(&resolved.path) {
+        let resolver = AssetResolver::new(&path_policy, None);
+        if let Ok(report) = resolver.explain(&key) {
+            for line in format_resolve_report(&report) {
+                println!("{}", line);
+            }
+        }
+        let handle = asset_manager.request::<ConfigAsset>(
+            key.clone(),
+            RequestOpts {
+                priority: AssetPriority::High,
+                budget_tag: AssetBudgetTag::Boot,
+            },
+        );
+        let asset = match asset_manager.await_ready(&handle, Duration::from_secs(2)) {
+            Ok(asset) => asset,
+            Err(err) => {
+                eprintln!("playlist load failed ({}): {}", key.canonical(), err);
+                std::process::exit(EXIT_USAGE);
+            }
+        };
+        let base_dir = match resolve_config_base_dir(&path_policy, &key) {
+            Ok(base_dir) => base_dir,
+            Err(err) => {
+                eprintln!("{}", err.message);
+                std::process::exit(err.code);
+            }
+        };
+        match parse_playlist_entries(&asset.text, base_dir.as_deref()) {
             Ok(list) => list,
             Err(err) => {
                 eprintln!("{}", err.message);
@@ -2668,17 +2817,23 @@ fn main() {
 
     let mut script: Option<ScriptRuntime> = None;
     if let Some(script_name) = args.script.as_deref() {
-        let resolved = match path_policy.resolve_config_file(ConfigKind::Script, script_name) {
-            Ok(resolved) => resolved,
+        let key = match script_asset_key(script_name) {
+            Ok(key) => key,
             Err(err) => {
-                eprintln!("{}", err);
+                eprintln!("script asset id invalid: {}", err);
                 std::process::exit(EXIT_USAGE);
             }
         };
-        println!("{}", resolved.describe());
+        let resolver = AssetResolver::new(&path_policy, None);
+        if let Ok(report) = resolver.explain(&key) {
+            for line in format_resolve_report(&report) {
+                println!("{}", line);
+            }
+        }
         let host_state = Rc::new(RefCell::new(ScriptHostState::new(
             quake_vfs.clone(),
             audio.clone(),
+            asset_manager.clone(),
         )));
         let spawn_state = Rc::clone(&host_state);
         let sound_state = Rc::clone(&host_state);
@@ -2696,7 +2851,21 @@ fn main() {
                 std::process::exit(EXIT_USAGE);
             }
         };
-        if let Err(err) = engine.load_file(&resolved.path) {
+        let handle = asset_manager.request::<ScriptAsset>(
+            key,
+            RequestOpts {
+                priority: AssetPriority::High,
+                budget_tag: AssetBudgetTag::Boot,
+            },
+        );
+        let asset = match asset_manager.await_ready(&handle, Duration::from_secs(2)) {
+            Ok(asset) => asset,
+            Err(err) => {
+                eprintln!("script load failed: {}", err);
+                std::process::exit(EXIT_USAGE);
+            }
+        };
+        if let Err(err) = engine.load_script(&asset.text) {
             eprintln!("script load failed: {}", err);
             std::process::exit(EXIT_USAGE);
         }
@@ -2708,6 +2877,10 @@ fn main() {
 
     let mut input = InputState::default();
     let mut console = ConsoleState::default();
+    let (console_async_tx, console_async_receiver) = mpsc::channel::<String>();
+    let console_async_sender = ConsoleAsyncSender {
+        sender: console_async_tx,
+    };
     let mut modifiers = ModifiersState::default();
     let mut last_cursor_pos = PhysicalPosition::new(0.0, 0.0);
     let mut input_router = InputRouter::new();
@@ -2758,6 +2931,9 @@ fn main() {
     if let Some(value) = cvar_bool(&cvars, core_cvars.dbg_perf_hud) {
         perf.show_overlay = value;
     }
+    if let Some(value) = cvar_int(&cvars, core_cvars.asset_decode_budget_ms) {
+        asset_manager.set_decode_budget_ms_per_tick(value.max(0) as u64);
+    }
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
     let mut fly_mode = false;
@@ -2770,28 +2946,79 @@ fn main() {
     let mut pending_map: Option<String> = None;
 
     if let Some(asset) = args.show_image.as_deref() {
-        let vfs = match quake_vfs.as_deref() {
-            Some(vfs) => vfs,
-            None => {
+        if asset.contains(':') {
+            let key = match AssetKey::parse(asset) {
+                Ok(key) => key,
+                Err(err) => {
+                    eprintln!("--show-image asset key invalid: {}", err);
+                    std::process::exit(EXIT_USAGE);
+                }
+            };
+            if key.namespace() != "engine" || key.kind() != "texture" {
+                eprintln!(
+                    "--show-image asset key must be engine:texture (got {})",
+                    key.canonical()
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+            let handle = asset_manager.request::<TextureAsset>(
+                key,
+                RequestOpts {
+                    priority: AssetPriority::High,
+                    budget_tag: AssetBudgetTag::Boot,
+                },
+            );
+            let texture = match asset_manager.await_ready(&handle, Duration::from_secs(2)) {
+                Ok(texture) => texture,
+                Err(err) => {
+                    eprintln!("asset load failed: {}", err);
+                    std::process::exit(EXIT_IMAGE);
+                }
+            };
+            let image = match ImageData::new(texture.width, texture.height, (*texture.rgba).clone())
+            {
+                Ok(image) => image,
+                Err(err) => {
+                    eprintln!("image decode failed: {}", err);
+                    std::process::exit(EXIT_IMAGE);
+                }
+            };
+            let upload_handle = renderer
+                .upload_queue()
+                .enqueue_image(image, UploadPriority::High);
+            let _ = renderer.drain_uploads();
+            let uploaded = match upload_handle.get() {
+                Some(uploaded) => uploaded,
+                None => {
+                    let message = upload_handle
+                        .error()
+                        .unwrap_or_else(|| "image upload pending".to_string());
+                    eprintln!("image upload failed: {}", message);
+                    std::process::exit(EXIT_IMAGE);
+                }
+            };
+            renderer.set_uploaded_image(&uploaded);
+        } else {
+            if quake_vfs.as_deref().is_none() {
                 eprintln!(
                     "--show-image requires mounts (use --quake-dir, --mount-*, or --mount-manifest)"
                 );
                 print_usage();
                 std::process::exit(EXIT_USAGE);
             }
-        };
 
-        let image = match load_lmp_image(vfs, asset) {
-            Ok(image) => image,
-            Err(err) => {
-                eprintln!("{}", err.message);
-                std::process::exit(err.code);
+            let image = match load_lmp_image(&asset_manager, asset) {
+                Ok(image) => image,
+                Err(err) => {
+                    eprintln!("{}", err.message);
+                    std::process::exit(err.code);
+                }
+            };
+
+            if let Err(err) = renderer.set_image(image) {
+                eprintln!("image upload failed: {}", err);
+                std::process::exit(EXIT_IMAGE);
             }
-        };
-
-        if let Err(err) = renderer.set_image(image) {
-            eprintln!("image upload failed: {}", err);
-            std::process::exit(EXIT_IMAGE);
         }
     }
 
@@ -3003,6 +3230,11 @@ fn main() {
                             &mut cvars,
                             &core_cvars,
                             &path_policy,
+                            &asset_manager,
+                            &upload_queue,
+                            quake_vfs.as_ref(),
+                            quake_dir.as_ref(),
+                            &console_async_sender,
                             &mut ui_state,
                             window,
                             &settings,
@@ -3220,6 +3452,9 @@ fn main() {
                 }
                 WindowEvent::RedrawRequested => {
                     let now = Instant::now();
+                    asset_manager.begin_tick();
+                    let _ = asset_manager.pump();
+                    drain_console_async(&console_async_receiver, &mut console);
                     if pending_video_prewarm {
                         renderer.prewarm_yuv_pipeline();
                         pending_video_prewarm = false;
@@ -3258,6 +3493,7 @@ fn main() {
                                             match enter_map_scene(
                                                 &mut renderer,
                                                 window,
+                                                &asset_manager,
                                                 quake_vfs.as_deref(),
                                                 &map,
                                                 audio.as_ref(),
@@ -3310,6 +3546,11 @@ fn main() {
                                         &mut cvars,
                                         &core_cvars,
                                         &path_policy,
+                                        &asset_manager,
+                                        &upload_queue,
+                                        quake_vfs.as_ref(),
+                                        quake_dir.as_ref(),
+                                        &console_async_sender,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3349,19 +3590,24 @@ fn main() {
                                     scripted.advance(now);
                                 }
                                 3 => {
-                                let _ = handle_non_video_key_input(
-                                    KeyCode::Escape,
-                                    true,
-                                    false,
-                                    &input_router,
-                                    &mut console,
-                                    &mut perf,
-                                    &mut cvars,
-                                    &core_cvars,
-                                    &path_policy,
-                                    &mut ui_state,
-                                    window,
-                                    &settings,
+                                    let _ = handle_non_video_key_input(
+                                        KeyCode::Escape,
+                                        true,
+                                        false,
+                                        &input_router,
+                                        &mut console,
+                                        &mut perf,
+                                        &mut cvars,
+                                        &core_cvars,
+                                        &path_policy,
+                                        &asset_manager,
+                                        &upload_queue,
+                                        quake_vfs.as_ref(),
+                                        quake_dir.as_ref(),
+                                        &console_async_sender,
+                                        &mut ui_state,
+                                        window,
+                                        &settings,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -3380,19 +3626,24 @@ fn main() {
                                     scripted.advance(now);
                                 }
                                 4 => {
-                                let _ = handle_non_video_key_input(
-                                    KeyCode::Backquote,
-                                    true,
-                                    false,
-                                    &input_router,
-                                    &mut console,
-                                    &mut perf,
-                                    &mut cvars,
-                                    &core_cvars,
-                                    &path_policy,
-                                    &mut ui_state,
-                                    window,
-                                    &settings,
+                                    let _ = handle_non_video_key_input(
+                                        KeyCode::Backquote,
+                                        true,
+                                        false,
+                                        &input_router,
+                                        &mut console,
+                                        &mut perf,
+                                        &mut cvars,
+                                        &core_cvars,
+                                        &path_policy,
+                                        &asset_manager,
+                                        &upload_queue,
+                                        quake_vfs.as_ref(),
+                                        quake_dir.as_ref(),
+                                        &console_async_sender,
+                                        &mut ui_state,
+                                        window,
+                                        &settings,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -3428,6 +3679,11 @@ fn main() {
                                         &mut cvars,
                                         &core_cvars,
                                         &path_policy,
+                                        &asset_manager,
+                                        &upload_queue,
+                                        quake_vfs.as_ref(),
+                                        quake_dir.as_ref(),
+                                        &console_async_sender,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3459,6 +3715,11 @@ fn main() {
                                         &mut cvars,
                                         &core_cvars,
                                         &path_policy,
+                                        &asset_manager,
+                                        &upload_queue,
+                                        quake_vfs.as_ref(),
+                                        quake_dir.as_ref(),
+                                        &console_async_sender,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3570,6 +3831,7 @@ fn main() {
                             let result = enter_map_scene(
                                 &mut renderer,
                                 window,
+                                &asset_manager,
                                 quake_vfs.as_deref(),
                                 &map,
                                 audio.as_ref(),
@@ -4990,6 +5252,7 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
 fn print_usage() {
     eprintln!("usage: pallet [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--mount-manifest <name-or-path>] [--content-root <path>] [--dev-root <path>] [--config-root <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <name>] [--script <name>] [--input-script] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
+    eprintln!("example: pallet --show-image engine:texture/ui/pallet_runner_gui_icon.png");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script demo.lua");
     eprintln!("example: pallet --play-movie intro.ogv");
@@ -5233,10 +5496,11 @@ fn write_png(path: &Path, width: u32, height: u32, data: &[u8]) -> Result<(), St
     Ok(())
 }
 
-fn load_playlist(path: &Path) -> Result<VecDeque<PlaylistEntry>, ExitError> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|err| ExitError::new(EXIT_USAGE, format!("playlist read failed: {}", err)))?;
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
+fn parse_playlist_entries(
+    contents: &str,
+    base_dir: Option<&Path>,
+) -> Result<VecDeque<PlaylistEntry>, ExitError> {
+    let base = base_dir.unwrap_or_else(|| Path::new("."));
     let mut entries = VecDeque::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -5369,17 +5633,48 @@ struct PalletCommandUser<'a> {
     perf: &'a mut PerfState,
     script: Option<&'a mut ScriptRuntime>,
     path_policy: &'a PathPolicy,
+    asset_manager: &'a AssetManager,
+    upload_queue: UploadQueue,
+    quake_vfs: Option<Arc<Vfs>>,
+    quake_dir: Option<PathBuf>,
+    console_async: ConsoleAsyncSender,
 }
 
 impl<'a> ExecPathResolver for PalletCommandUser<'a> {
     fn resolve_exec_path(&self, input: &str) -> Result<PathBuf, String> {
-        let resolved = self
-            .path_policy
-            .resolve_config_file(ConfigKind::Script, input)?;
-        Ok(resolved.path)
+        let key = config_asset_key("scripts", input)?;
+        let resolver = AssetResolver::new(self.path_policy, None);
+        let location = resolver.resolve(&key)?;
+        match location.path {
+            ResolvedPath::File(path) => Ok(path),
+            ResolvedPath::Vfs(_) | ResolvedPath::Bundle { .. } => Err(format!(
+                "exec assets must resolve to files (got {})",
+                key.canonical()
+            )),
+        }
+    }
+
+    fn resolve_exec_source(&self, input: &str) -> Result<ExecSource, String> {
+        let key = config_asset_key("scripts", input)?;
+        let handle = self.asset_manager.request::<ConfigAsset>(
+            key.clone(),
+            RequestOpts {
+                priority: AssetPriority::High,
+                budget_tag: AssetBudgetTag::Boot,
+            },
+        );
+        let asset = self
+            .asset_manager
+            .await_ready(&handle, Duration::from_secs(2))
+            .map_err(|err| format!("exec load failed ({}): {}", key.canonical(), err))?;
+        Ok(ExecSource {
+            label: key.canonical().to_string(),
+            source: asset.text.clone(),
+        })
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_console_line(
     line: &str,
     console: &mut ConsoleState,
@@ -5388,6 +5683,11 @@ fn dispatch_console_line(
     core_cvars: &CoreCvars,
     script: Option<&mut ScriptRuntime>,
     path_policy: &PathPolicy,
+    asset_manager: &AssetManager,
+    upload_queue: UploadQueue,
+    quake_vfs: Option<Arc<Vfs>>,
+    quake_dir: Option<PathBuf>,
+    console_async: ConsoleAsyncSender,
 ) {
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
@@ -5395,6 +5695,11 @@ fn dispatch_console_line(
                 perf,
                 script,
                 path_policy,
+                asset_manager,
+                upload_queue,
+                quake_vfs,
+                quake_dir,
+                console_async,
             };
             commands.dispatch_line(line, cvars, console, &mut user)
         }
@@ -5406,7 +5711,7 @@ fn dispatch_console_line(
     if let Err(err) = dispatch_result {
         console.push_line(format!("error: {}", err));
     }
-    apply_cvar_changes(cvars, perf, core_cvars);
+    apply_cvar_changes(cvars, perf, core_cvars, asset_manager);
 }
 
 fn build_command_registry<'a>(
@@ -5417,6 +5722,9 @@ fn build_command_registry<'a>(
     register_pallet_command_specs(&mut commands)?;
 
     let perf_hud_id = core_cvars.dbg_perf_hud;
+    let asset_decode_budget_id = core_cvars.asset_decode_budget_ms;
+    let asset_upload_budget_id = core_cvars.asset_upload_budget_ms;
+    let asset_io_budget_id = core_cvars.asset_io_budget_kb;
     commands.set_handler(
         "logfill",
         Box::new(|ctx, args| {
@@ -5517,6 +5825,302 @@ fn build_command_registry<'a>(
             Ok(())
         }),
     )?;
+    commands.set_handler(
+        "dev_asset_resolve",
+        Box::new(|ctx, args| {
+            let key = parse_asset_key_arg(args, "dev_asset_resolve <asset_id>")?;
+            let path_policy = ctx.user.path_policy.clone();
+            let vfs = ctx.user.quake_vfs.clone();
+            let sender = ctx.user.console_async.clone();
+            let jobs = ctx.user.asset_manager.jobs();
+            ctx.output
+                .push_line(format!("dev_asset_resolve: scheduled ({})", key));
+            schedule_console_job(jobs, sender, "dev_asset_resolve", JobQueue::Io, move || {
+                let resolver = AssetResolver::new(&path_policy, vfs.as_deref());
+                let location = resolver.resolve(&key)?;
+                Ok(format_resolved_location(&location))
+            })
+        }),
+    )?;
+    commands.set_handler(
+        "dev_asset_explain",
+        Box::new(|ctx, args| {
+            let key = parse_asset_key_arg(args, "dev_asset_explain <asset_id>")?;
+            let path_policy = ctx.user.path_policy.clone();
+            let vfs = ctx.user.quake_vfs.clone();
+            let sender = ctx.user.console_async.clone();
+            let jobs = ctx.user.asset_manager.jobs();
+            ctx.output
+                .push_line(format!("dev_asset_explain: scheduled ({})", key));
+            schedule_console_job(jobs, sender, "dev_asset_explain", JobQueue::Io, move || {
+                let resolver = AssetResolver::new(&path_policy, vfs.as_deref());
+                let report = resolver.explain(&key)?;
+                Ok(format_resolve_report(&report))
+            })
+        }),
+    )?;
+    commands.set_handler(
+        "dev_asset_stats",
+        Box::new(move |ctx, _args| {
+            let entries = ctx.user.asset_manager.list_assets();
+            let mut status_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+            let mut kind_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+            let mut decoded_bytes = 0usize;
+            for entry in &entries {
+                let status = entry.metrics.status.as_str();
+                *status_counts.entry(status).or_insert(0) += 1;
+                let kind = entry.kind.as_str();
+                *kind_counts.entry(kind).or_insert(0) += 1;
+                decoded_bytes = decoded_bytes.saturating_add(entry.metrics.decoded_bytes);
+            }
+            let total = entries.len();
+            let ready = status_counts.get("ready").copied().unwrap_or(0);
+            let loading = status_counts.get("loading").copied().unwrap_or(0);
+            let queued = status_counts.get("queued").copied().unwrap_or(0);
+            let failed = status_counts.get("failed").copied().unwrap_or(0);
+            let decode_budget = cvar_int(ctx.cvars, asset_decode_budget_id).unwrap_or(0);
+            let upload_budget = cvar_int(ctx.cvars, asset_upload_budget_id).unwrap_or(0);
+            let io_budget = cvar_int(ctx.cvars, asset_io_budget_id).unwrap_or(0);
+            let telemetry = ctx.user.asset_manager.budget_telemetry();
+            let upload_metrics = ctx.user.upload_queue.metrics();
+            let last_drain_ms = upload_metrics
+                .last_drain_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string());
+            ctx.output.push_line("asset stats:".to_string());
+            ctx.output.push_line(format!(
+                "budget: decode_ms={} upload_ms={} io_kb={}",
+                decode_budget, upload_budget, io_budget
+            ));
+            ctx.output.push_line(format!(
+                "spent ms: boot={} streaming={} background={}",
+                telemetry.spent_boot_ms, telemetry.spent_streaming_ms, telemetry.spent_background_ms
+            ));
+            ctx.output.push_line(format!(
+                "throttled: boot={} streaming={} background={}",
+                telemetry.throttled_boot,
+                telemetry.throttled_streaming,
+                telemetry.throttled_background
+            ));
+            ctx.output.push_line(format!(
+                "entries: total={} ready={} loading={} queued={} failed={}",
+                total, ready, loading, queued, failed
+            ));
+            ctx.output
+                .push_line(format!("decoded bytes: {}", decoded_bytes));
+            ctx.output
+                .push_line("by kind:".to_string());
+            for (kind, count) in kind_counts {
+                ctx.output.push_line(format!("  {} = {}", kind, count));
+            }
+            ctx.output.push_line(format!(
+                "upload queue: queued_jobs={} queued_bytes={} last_drain_ms={} last_drain_jobs={} last_drain_bytes={}",
+                upload_metrics.queued_jobs,
+                upload_metrics.queued_bytes,
+                last_drain_ms,
+                upload_metrics.last_drain_jobs,
+                upload_metrics.last_drain_bytes
+            ));
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "dev_asset_status",
+        Box::new(|ctx, args| {
+            let key = parse_asset_key_arg(args, "dev_asset_status <asset_id>")?;
+            match ctx.user.asset_manager.asset_snapshot(&key) {
+                Some(entry) => {
+                    for line in format_asset_status(&entry) {
+                        ctx.output.push_line(line);
+                    }
+                }
+                None => ctx
+                    .output
+                    .push_line(format!("asset not cached: {}", key.canonical())),
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "dev_asset_list",
+        Box::new(|ctx, args| {
+            let options = parse_asset_list_args(args)?;
+            let entries = ctx.user.asset_manager.list_assets();
+            let mut filtered: Vec<_> = entries
+                .into_iter()
+                .filter(|entry| match_asset_list_entry(entry, &options))
+                .collect();
+            filtered.sort_by(|a, b| a.key.canonical().cmp(b.key.canonical()));
+            let total = filtered.len();
+            let limit = options.limit.min(ASSET_LIST_MAX_LIMIT);
+            let shown = total.min(limit);
+            ctx.output
+                .push_line(format!("assets: total={} showing={}", total, shown));
+            for entry in filtered.into_iter().take(limit) {
+                ctx.output.push_line(format_asset_list_line(&entry));
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "quake_which",
+        Box::new(|ctx, args| {
+            let path = parse_string_arg(args, "quake_which <path>")?;
+            let path_policy = ctx.user.path_policy.clone();
+            let quake_dir = ctx.user.quake_dir.clone();
+            let sender = ctx.user.console_async.clone();
+            let jobs = ctx.user.asset_manager.jobs();
+            ctx.output
+                .push_line(format!("quake_which: scheduled ({})", path));
+            schedule_console_job(jobs, sender, "quake_which", JobQueue::Io, move || {
+                let index = load_quake_index_for_console(&path_policy, quake_dir.as_deref())?;
+                let report = index
+                    .which(&path)
+                    .ok_or_else(|| format!("quake path not found: {}", path))?;
+                let mut lines = Vec::new();
+                lines.push(format!("path: {}", report.path));
+                if let Some(derived) = report.winner.derived_asset_key() {
+                    lines.push(format!("derived_id: {}", derived));
+                }
+                lines.push(format!("winner: {}", format_quake_entry(&report.winner)));
+                lines.push("candidates:".to_string());
+                for entry in report.candidates {
+                    lines.push(format!("- {}", format_quake_entry(&entry)));
+                }
+                Ok(lines)
+            })
+        }),
+    )?;
+    commands.set_handler(
+        "quake_dupes",
+        Box::new(|ctx, args| {
+            let limit = parse_limit_flag(args, 20)?;
+            let path_policy = ctx.user.path_policy.clone();
+            let quake_dir = ctx.user.quake_dir.clone();
+            let sender = ctx.user.console_async.clone();
+            let jobs = ctx.user.asset_manager.jobs();
+            ctx.output.push_line("quake_dupes: scheduled".to_string());
+            schedule_console_job(jobs, sender, "quake_dupes", JobQueue::Io, move || {
+                let index = load_quake_index_for_console(&path_policy, quake_dir.as_deref())?;
+                let dupes = index.duplicates();
+                if dupes.is_empty() {
+                    return Ok(vec!["no duplicates found".to_string()]);
+                }
+                let mut lines = Vec::new();
+                lines.push(format!("duplicates: {}", dupes.len()));
+                for dupe in dupes.into_iter().take(limit) {
+                    lines.push(format!("path: {}", dupe.path));
+                    lines.push(format!("winner: {}", format_quake_entry(&dupe.winner)));
+                    for entry in dupe.others {
+                        lines.push(format!("- {}", format_quake_entry(&entry)));
+                    }
+                }
+                Ok(lines)
+            })
+        }),
+    )?;
+    commands.set_handler(
+        "dev_asset_reload",
+        Box::new(|ctx, args| {
+            let key = parse_asset_key_arg(args, "dev_asset_reload <asset_id>")?;
+            let sender = ctx.user.console_async.clone();
+            let jobs = ctx.user.asset_manager.jobs();
+            let asset_manager = ctx.user.asset_manager.clone();
+            let path_policy = ctx.user.path_policy.clone();
+            let quake_vfs = ctx.user.quake_vfs.clone();
+            ctx.output
+                .push_line(format!("dev_asset_reload: scheduled ({})", key));
+            schedule_console_job(jobs, sender, "dev_asset_reload", JobQueue::Io, move || {
+                let mut lines = Vec::new();
+                let before_version = asset_manager
+                    .asset_snapshot(&key)
+                    .map(|snapshot| snapshot.metrics.version)
+                    .unwrap_or(0);
+                let resolver = AssetResolver::new(&path_policy, quake_vfs.as_deref());
+                match resolver.resolve(&key) {
+                    Ok(location) => lines.extend(format_resolved_location(&location)),
+                    Err(err) => lines.push(format!("resolve error: {}", err)),
+                }
+                request_asset_reload(&asset_manager, key.clone())?;
+                lines.push(format!("reload requested: {}", key.canonical()));
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if let Some(snapshot) = asset_manager.asset_snapshot(&key) {
+                        let metrics = snapshot.metrics;
+                        if metrics.version > before_version {
+                            let mut line =
+                                format!("reloaded: {} v={}", key.canonical(), metrics.version);
+                            if let Some(hash) = metrics.content_hash {
+                                line.push_str(&format!(" hash={:016x}", hash));
+                            }
+                            lines.push(line);
+                            break;
+                        }
+                        if metrics.status == AssetStatus::Failed {
+                            lines.push(format!(
+                                "reload failed: {}",
+                                metrics.error.unwrap_or_else(|| "unknown".to_string())
+                            ));
+                            break;
+                        }
+                        if metrics.version == before_version
+                            && metrics.status == AssetStatus::Ready
+                            && metrics.error.is_some()
+                        {
+                            lines.push(format!(
+                                "reload failed: {}",
+                                metrics.error.unwrap_or_else(|| "unknown".to_string())
+                            ));
+                            break;
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        lines.push("reload pending".to_string());
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(lines)
+            })
+        }),
+    )?;
+    commands.set_handler(
+        "dev_asset_purge",
+        Box::new(|ctx, args| {
+            let key = parse_asset_key_arg(args, "dev_asset_purge <asset_id>")?;
+            let sender = ctx.user.console_async.clone();
+            let jobs = ctx.user.asset_manager.jobs();
+            let asset_manager = ctx.user.asset_manager.clone();
+            ctx.output
+                .push_line(format!("dev_asset_purge: scheduled ({})", key));
+            schedule_console_job(jobs, sender, "dev_asset_purge", JobQueue::Io, move || {
+                let line = if asset_manager.purge(&key) {
+                    format!("purged: {}", key.canonical())
+                } else {
+                    format!("asset not cached: {}", key.canonical())
+                };
+                Ok(vec![line])
+            })
+        }),
+    )?;
+    commands.set_handler(
+        "dev_content_validate",
+        Box::new(|ctx, _args| {
+            let path_policy = ctx.user.path_policy.clone();
+            let quake_dir = ctx.user.quake_dir.clone();
+            let sender = ctx.user.console_async.clone();
+            let jobs = ctx.user.asset_manager.jobs();
+            ctx.output
+                .push_line("dev_content_validate: scheduled".to_string());
+            schedule_console_job(
+                jobs,
+                sender,
+                "dev_content_validate",
+                JobQueue::Io,
+                move || run_content_validate(path_policy, quake_dir),
+            )
+        }),
+    )?;
     commands.set_fallback(Box::new(|ctx, name, args| {
         if let Some(script) = ctx.user.script.as_deref_mut() {
             match script.engine.run_command(name, args.raw_tokens()) {
@@ -5531,12 +6135,505 @@ fn build_command_registry<'a>(
     Ok(commands)
 }
 
-fn apply_cvar_changes(cvars: &mut CvarRegistry, perf: &mut PerfState, core: &CoreCvars) {
+fn schedule_console_job<F>(
+    jobs: Arc<Jobs>,
+    sender: ConsoleAsyncSender,
+    label: &str,
+    queue: JobQueue,
+    job: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<Vec<String>, String> + Send + 'static,
+{
+    let label = label.to_string();
+    let error_label = label.clone();
+    jobs.submit(queue, job, move |result| match result {
+        Ok(lines) => sender.send_lines(lines),
+        Err(err) => sender.send_line(format!("{} error: {}", label, err)),
+    })
+    .map_err(|err| format!("{} queue error: {}", error_label, err))?;
+    Ok(())
+}
+
+fn parse_asset_key_arg(args: &CommandArgs, usage: &str) -> Result<AssetKey, String> {
+    let value = args
+        .positional(0)
+        .ok_or_else(|| format!("usage: {}", usage))?;
+    AssetKey::parse(value).map_err(|err| format!("invalid asset id: {}", err))
+}
+
+fn parse_string_arg(args: &CommandArgs, usage: &str) -> Result<String, String> {
+    let value = args
+        .positional(0)
+        .ok_or_else(|| format!("usage: {}", usage))?;
+    Ok(value.to_string())
+}
+
+fn parse_limit_flag(args: &CommandArgs, default_limit: usize) -> Result<usize, String> {
+    let mut limit: Option<usize> = None;
+    let mut iter = args.raw_tokens().iter().peekable();
+    while let Some(token) = iter.next() {
+        if let Some(flag) = token.strip_prefix("--") {
+            match flag {
+                "limit" => {
+                    if limit.is_some() {
+                        return Err("duplicate --limit".to_string());
+                    }
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| "missing value for --limit".to_string())?;
+                    limit = Some(parse_limit_value(value)?);
+                }
+                _ => return Err(format!("unknown flag: --{}", flag)),
+            }
+        } else if limit.is_none() {
+            limit = Some(parse_limit_value(token)?);
+        } else {
+            return Err(format!("unexpected arg: {}", token));
+        }
+    }
+    let limit = limit.unwrap_or(default_limit);
+    Ok(limit.clamp(1, ASSET_LIST_MAX_LIMIT))
+}
+
+fn parse_limit_value(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid limit: {}", value))
+}
+
+struct AssetListOptions {
+    ns: Option<String>,
+    kind: Option<String>,
+    limit: usize,
+}
+
+fn parse_asset_list_args(args: &CommandArgs) -> Result<AssetListOptions, String> {
+    let mut ns = None;
+    let mut kind = None;
+    let mut limit: Option<usize> = None;
+    let mut iter = args.raw_tokens().iter().peekable();
+    while let Some(token) = iter.next() {
+        let Some(flag) = token.strip_prefix("--") else {
+            return Err(format!("unexpected arg: {}", token));
+        };
+        match flag {
+            "ns" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "missing value for --ns".to_string())?;
+                ns = Some(value.to_ascii_lowercase());
+            }
+            "kind" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "missing value for --kind".to_string())?;
+                kind = Some(value.to_ascii_lowercase());
+            }
+            "limit" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "missing value for --limit".to_string())?;
+                limit = Some(parse_limit_value(value)?);
+            }
+            _ => return Err(format!("unknown flag: --{}", flag)),
+        }
+    }
+    let limit = match limit {
+        Some(0) => ASSET_LIST_MAX_LIMIT,
+        Some(value) => value,
+        None => ASSET_LIST_DEFAULT_LIMIT,
+    };
+    Ok(AssetListOptions {
+        ns,
+        kind,
+        limit: limit.clamp(1, ASSET_LIST_MAX_LIMIT),
+    })
+}
+
+fn match_asset_list_entry(entry: &AssetEntrySnapshot, options: &AssetListOptions) -> bool {
+    if let Some(ns) = options.ns.as_deref() {
+        if entry.key.namespace() != ns {
+            return false;
+        }
+    }
+    if let Some(kind) = options.kind.as_deref() {
+        if !match_asset_kind(entry, kind) {
+            return false;
+        }
+    }
+    true
+}
+
+fn match_asset_kind(entry: &AssetEntrySnapshot, kind: &str) -> bool {
+    if kind.contains(':') {
+        entry.kind.as_str() == kind
+    } else {
+        entry.key.kind() == kind
+    }
+}
+
+fn format_asset_status(entry: &AssetEntrySnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("asset: {}", entry.key.canonical()));
+    lines.push(format!("kind: {}", entry.kind.as_str()));
+    lines.push(format!("status: {}", entry.metrics.status.as_str()));
+    lines.push(format!("version: {}", entry.metrics.version));
+    lines.push(format!("decoded_bytes: {}", entry.metrics.decoded_bytes));
+    if let Some(ms) = entry.metrics.decode_ms {
+        lines.push(format!("decode_ms: {}", ms));
+    }
+    if let Some(ms) = entry.metrics.load_ms {
+        lines.push(format!("load_ms: {}", ms));
+    }
+    if let Some(hash) = entry.metrics.content_hash {
+        lines.push(format!("hash: {:016x}", hash));
+    }
+    if let Some(err) = &entry.metrics.error {
+        lines.push(format!("error: {}", err));
+    }
+    lines
+}
+
+fn format_asset_list_line(entry: &AssetEntrySnapshot) -> String {
+    let mut line = format!(
+        "- {} kind={} status={}",
+        entry.key.canonical(),
+        entry.kind.as_str(),
+        entry.metrics.status.as_str()
+    );
+    line.push_str(&format!(" v={}", entry.metrics.version));
+    if entry.metrics.decoded_bytes > 0 {
+        line.push_str(&format!(" bytes={}", entry.metrics.decoded_bytes));
+    }
+    if let Some(ms) = entry.metrics.decode_ms {
+        line.push_str(&format!(" decode_ms={}", ms));
+    }
+    if let Some(ms) = entry.metrics.load_ms {
+        line.push_str(&format!(" load_ms={}", ms));
+    }
+    if let Some(hash) = entry.metrics.content_hash {
+        line.push_str(&format!(" hash={:016x}", hash));
+    }
+    line
+}
+
+fn format_resolved_location(location: &ResolvedLocation) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("resolved: {}", location.key.canonical()));
+    lines.push(format!(
+        "mount: {} (order={})",
+        location.mount_name, location.mount_order
+    ));
+    lines.push(format!("layer: {}", layer_label(location.layer)));
+    match &location.path {
+        ResolvedPath::File(path) => {
+            lines.push(format!("path: {}", path.display()));
+        }
+        ResolvedPath::Vfs(path) => {
+            lines.push(format!("vpath: {}", path));
+        }
+        ResolvedPath::Bundle {
+            bundle_id,
+            entry_id,
+            offset,
+        } => {
+            lines.push(format!("bundle: {}", bundle_id));
+            lines.push(format!("entry: {}", entry_id));
+            if let Some(offset) = offset {
+                lines.push(format!("offset: {}", offset));
+            }
+        }
+    }
+    lines.push(format!("source: {}", format_source_line(&location.source)));
+    lines
+}
+
+fn format_resolve_report(report: &ResolveReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("explain: {}", report.key.canonical()));
+    for candidate in &report.candidates {
+        let layer = layer_label(candidate.layer);
+        let hit = if candidate.exists { " [hit]" } else { "" };
+        let mut line = format!(
+            "- order={} layer={} mount={}",
+            candidate.mount_order, layer, candidate.mount_name
+        );
+        match &candidate.path {
+            ResolvedPath::File(path) => {
+                line.push_str(&format!(" path={}{}", path.display(), hit));
+            }
+            ResolvedPath::Vfs(path) => {
+                line.push_str(&format!(" vpath={}{}", path, hit));
+            }
+            ResolvedPath::Bundle {
+                bundle_id,
+                entry_id,
+                offset,
+            } => {
+                if let Some(offset) = offset {
+                    line.push_str(&format!(
+                        " bundle={} entry={} offset={}{}",
+                        bundle_id, entry_id, offset, hit
+                    ));
+                } else {
+                    line.push_str(&format!(" bundle={} entry={}{}", bundle_id, entry_id, hit));
+                }
+            }
+        }
+        lines.push(line);
+    }
+    if let Some(location) = &report.winner {
+        lines.push("winner:".to_string());
+        lines.extend(format_resolved_location(location));
+    }
+    lines
+}
+
+fn layer_label(layer: AssetLayer) -> &'static str {
+    match layer {
+        AssetLayer::Shipped => "shipped",
+        AssetLayer::Dev => "dev",
+        AssetLayer::User => "user",
+    }
+}
+
+fn format_source_line(source: &AssetSource) -> String {
+    match source {
+        AssetSource::EngineContent { root } => format!("engine_content ({})", root.display()),
+        AssetSource::EngineBundle { bundle_id, source } => {
+            format!("engine_bundle {} ({})", bundle_id, source.display())
+        }
+        AssetSource::Quake1 { mount_kind, source } => {
+            format!("quake1 {} {}", mount_kind, source.display())
+        }
+        AssetSource::QuakeLive { mount_kind, source } => {
+            format!("quakelive {} {}", mount_kind, source.display())
+        }
+    }
+}
+
+fn format_quake_entry(entry: &QuakeEntry) -> String {
+    let source_path = match &entry.source {
+        engine_core::quake_index::QuakeSource::LooseFile { root } => {
+            root.join(&entry.path).display().to_string()
+        }
+        _ => entry.source.source_path().display().to_string(),
+    };
+    let mut extra = String::new();
+    match &entry.source {
+        engine_core::quake_index::QuakeSource::Pak {
+            file_index, offset, ..
+        } => {
+            extra = format!(" index={} offset={}", file_index, offset);
+        }
+        engine_core::quake_index::QuakeSource::Pk3 { file_index, .. } => {
+            extra = format!(" index={}", file_index);
+        }
+        _ => {}
+    }
+    format!(
+        "{} order={} kind={} size={} hash={:016x} source={} {}{}",
+        entry.mount_kind,
+        entry.mount_order,
+        entry.kind.as_str(),
+        entry.size,
+        entry.hash,
+        entry.source.kind_label(),
+        source_path,
+        extra
+    )
+}
+
+fn load_quake_index_for_console(
+    path_policy: &PathPolicy,
+    quake_dir: Option<&Path>,
+) -> Result<QuakeIndex, String> {
+    if let Some(quake_dir) = quake_dir {
+        if !quake_dir.is_dir() {
+            return Err(format!("quake dir not found: {}", quake_dir.display()));
+        }
+        return QuakeIndex::load_or_build(path_policy.content_root(), quake_dir);
+    }
+    let path = QuakeIndex::default_index_path(path_policy.content_root());
+    if !path.is_file() {
+        return Err(format!(
+            "quake index not found: {} (run `tools quake index --quake-dir <path>`)",
+            path.display()
+        ));
+    }
+    QuakeIndex::read_from(&path)
+}
+
+fn request_asset_reload(asset_manager: &AssetManager, key: AssetKey) -> Result<(), String> {
+    let opts = RequestOpts {
+        priority: AssetPriority::High,
+        budget_tag: AssetBudgetTag::Boot,
+    };
+    let canonical = key.canonical().to_string();
+    match (key.namespace(), key.kind()) {
+        ("engine", "config") => {
+            let _ = asset_manager.reload::<ConfigAsset>(key, opts)?;
+            Ok(())
+        }
+        ("engine", "script") => {
+            let _ = asset_manager.reload::<ScriptAsset>(key, opts)?;
+            Ok(())
+        }
+        ("engine", "text") => {
+            let _ = asset_manager.reload::<TextAsset>(key, opts)?;
+            Ok(())
+        }
+        ("engine", "blob") => {
+            let _ = asset_manager.reload::<BlobAsset>(key, opts)?;
+            Ok(())
+        }
+        ("engine", "texture") => {
+            let _ = asset_manager.reload::<TextureAsset>(key, opts)?;
+            Ok(())
+        }
+        ("quake1", "raw") => {
+            let _ = asset_manager.reload::<QuakeRawAsset>(key, opts)?;
+            Ok(())
+        }
+        _ => Err(format!("unsupported asset kind: {}", canonical)),
+    }
+}
+
+fn run_content_validate(
+    path_policy: PathPolicy,
+    quake_dir: Option<PathBuf>,
+) -> Result<Vec<String>, String> {
+    let resolver = AssetResolver::new(&path_policy, None);
+    let quake_index = match quake_dir.as_ref() {
+        Some(dir) => {
+            if !dir.is_dir() {
+                return Err(format!("quake dir not found: {}", dir.display()));
+            }
+            Some(QuakeIndex::load_or_build(path_policy.content_root(), dir)?)
+        }
+        None => None,
+    };
+    let manifests = discover_level_manifests(&path_policy).map_err(|err| err.to_string())?;
+    if manifests.is_empty() {
+        return Ok(vec!["no level manifests found".to_string()]);
+    }
+    let mut lines = Vec::new();
+    let mut errors = 0usize;
+    for entry in manifests {
+        match load_level_manifest(&entry.path) {
+            Ok(manifest) => {
+                errors += validate_level_manifest_lines(
+                    &path_policy,
+                    &entry,
+                    &manifest,
+                    &resolver,
+                    quake_index.as_ref(),
+                    &mut lines,
+                );
+            }
+            Err(err) => {
+                lines.push(err.to_string());
+                errors += 1;
+            }
+        }
+    }
+    lines.push(format!("content validate: {} errors", errors));
+    Ok(lines)
+}
+
+fn validate_level_manifest_lines(
+    path_policy: &PathPolicy,
+    entry: &LevelManifestPath,
+    manifest: &LevelManifest,
+    resolver: &AssetResolver,
+    quake_index: Option<&QuakeIndex>,
+    lines: &mut Vec<String>,
+) -> usize {
+    let mut errors = 0usize;
+    let manifest_path = &entry.path;
+
+    if let Some(geometry) = &manifest.geometry {
+        if let Some(index) = quake_index {
+            let path = quake_bsp_path(geometry);
+            if index.which(&path).is_none() {
+                lines.push(format!(
+                    "{}{} [geometry]: missing quake asset {}",
+                    manifest_path.display(),
+                    format_line(manifest.lines.geometry),
+                    geometry.canonical()
+                ));
+                errors += 1;
+            }
+        } else {
+            lines.push(format!(
+                "{}{} [geometry]: quake dir required to validate {}",
+                manifest_path.display(),
+                format_line(manifest.lines.geometry),
+                geometry.canonical()
+            ));
+            errors += 1;
+        }
+    }
+
+    for (field, items, line) in [
+        ("assets", &manifest.assets, manifest.lines.assets),
+        ("requires", &manifest.requires, manifest.lines.requires),
+    ] {
+        for key in items {
+            if key.namespace() == "engine" && key.kind() == "level" {
+                if resolve_level_manifest_path(path_policy, key).is_err() {
+                    lines.push(format!(
+                        "{}{} [{}]: missing level manifest {}",
+                        manifest_path.display(),
+                        format_line(line),
+                        field,
+                        key.canonical()
+                    ));
+                    errors += 1;
+                }
+                continue;
+            }
+            if resolver.resolve(key).is_err() {
+                lines.push(format!(
+                    "{}{} [{}]: missing asset {}",
+                    manifest_path.display(),
+                    format_line(line),
+                    field,
+                    key.canonical()
+                ));
+                errors += 1;
+            }
+        }
+    }
+
+    errors
+}
+
+fn format_line(line: Option<usize>) -> String {
+    line.map(|value| format!(":{}", value)).unwrap_or_default()
+}
+
+fn quake_bsp_path(key: &AssetKey) -> String {
+    format!("maps/{}.bsp", key.path())
+}
+
+fn apply_cvar_changes(
+    cvars: &mut CvarRegistry,
+    perf: &mut PerfState,
+    core: &CoreCvars,
+    asset_manager: &AssetManager,
+) {
     for id in cvars.take_dirty() {
         if id == core.dbg_perf_hud {
             if let Some(value) = cvar_bool(cvars, id) {
                 perf.show_overlay = value;
                 perf.hud_dirty = true;
+            }
+        }
+        if id == core.asset_decode_budget_ms {
+            if let Some(value) = cvar_int(cvars, id) {
+                asset_manager.set_decode_budget_ms_per_tick(value.max(0) as u64);
             }
         }
     }
@@ -5545,6 +6642,13 @@ fn apply_cvar_changes(cvars: &mut CvarRegistry, perf: &mut PerfState, core: &Cor
 fn cvar_bool(cvars: &CvarRegistry, id: CvarId) -> Option<bool> {
     match cvars.get(id)?.value {
         engine_core::control_plane::CvarValue::Bool(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn cvar_int(cvars: &CvarRegistry, id: CvarId) -> Option<i32> {
+    match cvars.get(id)?.value {
+        engine_core::control_plane::CvarValue::Int(value) => Some(value),
         _ => None,
     }
 }
@@ -5560,31 +6664,67 @@ fn parse_toggle_arg(args: &CommandArgs) -> Result<Option<bool>, String> {
     }
 }
 
-fn load_wav_sfx(vfs: &Vfs, asset: &str) -> Result<Vec<u8>, ExitError> {
-    let asset_name = normalize_asset_name(asset);
-    let vpath = quake_vpath(&asset_name);
-    let (wav_bytes, provenance) = vfs.read_with_provenance(&vpath).map_err(|err| {
-        ExitError::new(EXIT_PAK, format!("asset read failed ({}): {}", vpath, err))
+fn load_quake_raw_asset(
+    asset_manager: &AssetManager,
+    asset_path: &str,
+    budget_tag: AssetBudgetTag,
+) -> Result<Arc<Vec<u8>>, ExitError> {
+    let key = AssetKey::from_parts("quake1", "raw", asset_path).map_err(|err| {
+        ExitError::new(
+            EXIT_USAGE,
+            format!("quake asset key invalid ({}): {}", asset_path, err),
+        )
     })?;
-    println!(
-        "loaded {} from {} ({})",
-        asset_name,
-        provenance.source.display(),
-        provenance.kind
+    let handle = asset_manager.request::<QuakeRawAsset>(
+        key.clone(),
+        RequestOpts {
+            priority: AssetPriority::High,
+            budget_tag,
+        },
     );
-    Ok(wav_bytes)
+    let asset = asset_manager
+        .await_ready(&handle, Duration::from_secs(2))
+        .map_err(|err| {
+            ExitError::new(
+                EXIT_PAK,
+                format!("quake asset load failed ({}): {}", key.canonical(), err),
+            )
+        })?;
+    Ok(Arc::clone(&asset.bytes))
 }
 
-fn load_music_track(vfs: &Vfs) -> Result<Option<MusicTrack>, ExitError> {
+fn quake_asset_path_from_vpath(path: &str) -> &str {
+    path.strip_prefix("raw/quake/").unwrap_or(path)
+}
+
+fn load_wav_sfx(
+    asset_manager: &AssetManager,
+    asset: &str,
+    budget_tag: AssetBudgetTag,
+) -> Result<Vec<u8>, ExitError> {
+    let asset_name = normalize_asset_name(asset);
+    let bytes = load_quake_raw_asset(asset_manager, &asset_name, budget_tag)?;
+    println!("loaded {} via asset manager", asset_name);
+    Ok((*bytes).clone())
+}
+
+fn load_music_track(
+    asset_manager: &AssetManager,
+    vfs: &Vfs,
+) -> Result<Option<MusicTrack>, ExitError> {
     for dir in [quake_vpath("music")] {
-        if let Some(track) = find_music_in_dir(vfs, &dir)? {
+        if let Some(track) = find_music_in_dir(asset_manager, vfs, &dir)? {
             return Ok(Some(track));
         }
     }
     Ok(None)
 }
 
-fn find_music_in_dir(vfs: &Vfs, dir: &str) -> Result<Option<MusicTrack>, ExitError> {
+fn find_music_in_dir(
+    asset_manager: &AssetManager,
+    vfs: &Vfs,
+    dir: &str,
+) -> Result<Option<MusicTrack>, ExitError> {
     let entries = match vfs.list_dir(dir) {
         Ok(entries) => entries,
         Err(VfsError::NotFound(_)) => return Ok(None),
@@ -5604,41 +6744,27 @@ fn find_music_in_dir(vfs: &Vfs, dir: &str) -> Result<Option<MusicTrack>, ExitErr
     candidates.sort();
 
     if let Some(name) = candidates.into_iter().next() {
-        let path = format!("{}/{}", dir, name);
-        let (data, provenance) = vfs
-            .read_with_provenance(&path)
-            .map_err(|err| ExitError::new(EXIT_PAK, format!("music read failed: {}", err)))?;
-        println!(
-            "loaded music {} from {} ({})",
-            path,
-            provenance.source.display(),
-            provenance.kind
-        );
-        return Ok(Some(MusicTrack { name: path, data }));
+        let vpath = format!("{}/{}", dir, name);
+        let asset_path = quake_asset_path_from_vpath(&vpath);
+        let data = load_quake_raw_asset(asset_manager, asset_path, AssetBudgetTag::Streaming)?;
+        println!("loaded music {} via asset manager", asset_path);
+        return Ok(Some(MusicTrack {
+            name: vpath,
+            data: (*data).clone(),
+        }));
     }
 
     Ok(None)
 }
 
-fn load_lmp_image(vfs: &Vfs, asset: &str) -> Result<ImageData, ExitError> {
-    let palette_path = quake_vpath("gfx/palette.lmp");
-    let palette_bytes = vfs.read(&palette_path).map_err(|err| {
-        ExitError::new(
-            EXIT_PAK,
-            format!("palette lookup failed ({}): {}", palette_path, err),
-        )
-    })?;
+fn load_lmp_image(asset_manager: &AssetManager, asset: &str) -> Result<ImageData, ExitError> {
+    let palette_bytes =
+        load_quake_raw_asset(asset_manager, "gfx/palette.lmp", AssetBudgetTag::Boot)?;
     let palette = lmp::parse_palette(&palette_bytes)
         .map_err(|err| ExitError::new(EXIT_IMAGE, format!("palette parse failed: {}", err)))?;
 
     let asset_name = normalize_asset_name(asset);
-    let image_path = quake_vpath(&asset_name);
-    let (image_bytes, provenance) = vfs.read_with_provenance(&image_path).map_err(|err| {
-        ExitError::new(
-            EXIT_PAK,
-            format!("asset lookup failed ({}): {}", image_path, err),
-        )
-    })?;
+    let image_bytes = load_quake_raw_asset(asset_manager, &asset_name, AssetBudgetTag::Boot)?;
     let image = lmp::parse_lmp_image(&image_bytes)
         .map_err(|err| ExitError::new(EXIT_IMAGE, format!("image parse failed: {}", err)))?;
     let rgba = image.to_rgba8(&palette);
@@ -5646,35 +6772,25 @@ fn load_lmp_image(vfs: &Vfs, asset: &str) -> Result<ImageData, ExitError> {
         .map_err(|err| ExitError::new(EXIT_IMAGE, format!("image data failed: {}", err)))?;
 
     println!(
-        "loaded {} from {} ({}x{})",
-        asset_name,
-        provenance.source.display(),
-        image.width,
-        image.height
+        "loaded {} via asset manager ({}x{})",
+        asset_name, image.width, image.height
     );
 
     Ok(image)
 }
 
 fn load_bsp_scene(
-    vfs: &Vfs,
+    asset_manager: &AssetManager,
     map: &str,
 ) -> Result<(MeshData, Bounds, SceneCollision, Option<SpawnPoint>), ExitError> {
     let map_name = normalize_map_asset(map);
-    let map_path = quake_vpath(&map_name);
-    let (bsp_bytes, provenance) = vfs.read_with_provenance(&map_path).map_err(|err| {
-        ExitError::new(
-            EXIT_PAK,
-            format!("map lookup failed ({}): {}", map_path, err),
-        )
-    })?;
+    let bsp_bytes = load_quake_raw_asset(asset_manager, &map_name, AssetBudgetTag::Boot)?;
     let bsp = bsp::parse_bsp(&bsp_bytes)
         .map_err(|err| ExitError::new(EXIT_BSP, format!("bsp parse failed: {}", err)))?;
 
     println!(
-        "loaded {} from {} ({} vertices, {} faces)",
+        "loaded {} via asset manager ({} vertices, {} faces)",
         map_name,
-        provenance.source.display(),
         bsp.vertices.len(),
         bsp.faces.len()
     );
@@ -5989,14 +7105,14 @@ fn open_console(
     input: &mut InputState,
     mouse_look: &mut bool,
     mouse_grabbed: &mut bool,
-    path_policy: &PathPolicy,
+    asset_manager: &AssetManager,
 ) {
     let now = Instant::now();
     console.caret_epoch = now;
     console.open(now);
     console.resume_mouse_look = *mouse_look;
     console.buffer.clear();
-    push_console_welcome(console, path_policy);
+    push_console_welcome(console, asset_manager);
     ui_state.console_open = console.is_blocking();
     *input = InputState::default();
     *mouse_look = false;
@@ -6047,6 +7163,11 @@ fn handle_non_video_key_input(
     cvars: &mut CvarRegistry,
     core_cvars: &CoreCvars,
     path_policy: &PathPolicy,
+    asset_manager: &AssetManager,
+    upload_queue: &UploadQueue,
+    quake_vfs: Option<&Arc<Vfs>>,
+    quake_dir: Option<&PathBuf>,
+    console_async: &ConsoleAsyncSender,
     ui_state: &mut UiState,
     window: &Window,
     settings: &Settings,
@@ -6090,7 +7211,7 @@ fn handle_non_video_key_input(
                     input,
                     mouse_look,
                     mouse_grabbed,
-                    path_policy,
+                    asset_manager,
                 );
             }
         }
@@ -6147,6 +7268,11 @@ fn handle_non_video_key_input(
                                 core_cvars,
                                 script.as_mut(),
                                 path_policy,
+                                asset_manager,
+                                upload_queue.clone(),
+                                quake_vfs.cloned(),
+                                quake_dir.cloned(),
+                                console_async.clone(),
                             );
                         }
                     }

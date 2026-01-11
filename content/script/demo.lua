@@ -31,3 +31,5 @@ register_command("sound", function(args)
   local asset = args[1] or "sound/misc/menu1.wav"
   play_sound(asset)
 end)
+-- hot reload test
+-- hot reload test

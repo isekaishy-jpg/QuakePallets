@@ -10,3 +10,4 @@ path = "src/lib.rs"
 [dependencies]
 compat_quake = { path = "../compat_quake", version = "0.1.0" }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+png = "0.17"

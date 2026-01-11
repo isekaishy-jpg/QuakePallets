@@ -1,0 +1,8 @@
+version = 1
+geometry = "quake1:bsp/e1m1"
+
+assets = [
+  "engine:texture/ui/pallet_runner_gui_icon.png"
+]
+
+requires = []

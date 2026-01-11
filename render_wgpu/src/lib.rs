@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
+use std::any::Any;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
@@ -137,6 +141,342 @@ impl std::error::Error for RenderCaptureError {
             RenderCaptureError::Capture(err) => Some(err),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadStatus {
+    Queued,
+    Uploading,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadPriority {
+    High,
+    Normal,
+    Low,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UploadLimits {
+    pub jobs_per_frame: usize,
+    pub bytes_per_frame: u64,
+}
+
+impl Default for UploadLimits {
+    fn default() -> Self {
+        Self {
+            jobs_per_frame: 8,
+            bytes_per_frame: 8 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadQueueMetrics {
+    pub queued_jobs: usize,
+    pub queued_bytes: u64,
+    pub last_drain_ms: Option<u64>,
+    pub last_drain_jobs: usize,
+    pub last_drain_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadDrainStats {
+    pub drained_jobs: usize,
+    pub drained_bytes: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone)]
+pub struct UploadQueue {
+    inner: Arc<UploadQueueInner>,
+}
+
+struct UploadQueueInner {
+    state: Mutex<UploadQueueState>,
+}
+
+struct UploadQueueState {
+    pending_high: VecDeque<UploadJob>,
+    pending_normal: VecDeque<UploadJob>,
+    pending_low: VecDeque<UploadJob>,
+    queued_bytes: u64,
+    last_drain_ms: Option<u64>,
+    last_drain_jobs: usize,
+    last_drain_bytes: u64,
+    limits: UploadLimits,
+}
+
+impl UploadQueueState {
+    fn new() -> Self {
+        Self {
+            pending_high: VecDeque::new(),
+            pending_normal: VecDeque::new(),
+            pending_low: VecDeque::new(),
+            queued_bytes: 0,
+            last_drain_ms: None,
+            last_drain_jobs: 0,
+            last_drain_bytes: 0,
+            limits: UploadLimits::default(),
+        }
+    }
+
+    fn queued_jobs(&self) -> usize {
+        self.pending_high.len() + self.pending_normal.len() + self.pending_low.len()
+    }
+
+    fn pop_next(&mut self) -> Option<UploadJob> {
+        if let Some(job) = self.pending_high.pop_front() {
+            return Some(job);
+        }
+        if let Some(job) = self.pending_normal.pop_front() {
+            return Some(job);
+        }
+        self.pending_low.pop_front()
+    }
+
+    fn push_job(&mut self, job: UploadJob) {
+        match job.priority {
+            UploadPriority::High => self.pending_high.push_back(job),
+            UploadPriority::Normal => self.pending_normal.push_back(job),
+            UploadPriority::Low => self.pending_low.push_back(job),
+        }
+    }
+}
+
+impl UploadQueue {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(UploadQueueInner {
+                state: Mutex::new(UploadQueueState::new()),
+            }),
+        }
+    }
+
+    pub fn set_limits(&self, limits: UploadLimits) {
+        let mut state = self.inner.state.lock().expect("upload queue lock poisoned");
+        state.limits = limits;
+    }
+
+    pub fn metrics(&self) -> UploadQueueMetrics {
+        let state = self.inner.state.lock().expect("upload queue lock poisoned");
+        UploadQueueMetrics {
+            queued_jobs: state.queued_jobs(),
+            queued_bytes: state.queued_bytes,
+            last_drain_ms: state.last_drain_ms,
+            last_drain_jobs: state.last_drain_jobs,
+            last_drain_bytes: state.last_drain_bytes,
+        }
+    }
+
+    pub fn enqueue_image(
+        &self,
+        image: ImageData,
+        priority: UploadPriority,
+    ) -> UploadHandle<UploadedImage> {
+        let bytes = image.rgba.len() as u64;
+        let slot = Arc::new(UploadSlot::new());
+        let job = UploadJob {
+            slot: Arc::clone(&slot),
+            priority,
+            bytes,
+            payload: UploadPayload::Image { image },
+        };
+
+        let mut state = self.inner.state.lock().expect("upload queue lock poisoned");
+        state.push_job(job);
+        state.queued_bytes = state.queued_bytes.saturating_add(bytes);
+
+        UploadHandle {
+            slot,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn drain(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> UploadDrainStats {
+        let start = Instant::now();
+        let mut drained_jobs = 0usize;
+        let mut drained_bytes = 0u64;
+
+        loop {
+            let job = {
+                let mut state = self.inner.state.lock().expect("upload queue lock poisoned");
+                let Some(job) = state.pop_next() else {
+                    break;
+                };
+                let limits = state.limits;
+                if limits.jobs_per_frame == 0 {
+                    state.push_job(job);
+                    break;
+                }
+                if drained_jobs >= limits.jobs_per_frame {
+                    state.push_job(job);
+                    break;
+                }
+                if limits.bytes_per_frame == 0 {
+                    state.push_job(job);
+                    break;
+                }
+                if drained_jobs > 0
+                    && drained_bytes.saturating_add(job.bytes) > limits.bytes_per_frame
+                {
+                    state.push_job(job);
+                    break;
+                }
+                state.queued_bytes = state.queued_bytes.saturating_sub(job.bytes);
+                job
+            };
+
+            job.slot.mark_uploading();
+            let upload_start = Instant::now();
+            let result = match job.payload {
+                UploadPayload::Image { image } => UploadedImage::new(device, queue, config, &image)
+                    .map(Arc::new)
+                    .map_err(|err| err.to_string()),
+            };
+
+            let upload_ms = upload_start.elapsed().as_millis() as u64;
+            match result {
+                Ok(uploaded) => job.slot.finish(uploaded, upload_ms),
+                Err(err) => job.slot.fail(&err),
+            }
+
+            drained_jobs = drained_jobs.saturating_add(1);
+            drained_bytes = drained_bytes.saturating_add(job.bytes);
+        }
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let mut state = self.inner.state.lock().expect("upload queue lock poisoned");
+        state.last_drain_ms = Some(elapsed_ms);
+        state.last_drain_jobs = drained_jobs;
+        state.last_drain_bytes = drained_bytes;
+
+        UploadDrainStats {
+            drained_jobs,
+            drained_bytes,
+            elapsed_ms,
+        }
+    }
+}
+
+impl Default for UploadQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct UploadHandle<T> {
+    slot: Arc<UploadSlot>,
+    marker: PhantomData<T>,
+}
+
+impl<T> UploadHandle<T> {
+    pub fn status(&self) -> UploadStatus {
+        let guard = self.slot.state.lock().expect("upload slot lock poisoned");
+        guard.status
+    }
+
+    pub fn get(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let guard = self.slot.state.lock().expect("upload slot lock poisoned");
+        let value = guard.value.as_ref()?;
+        let value = Arc::clone(value);
+        Arc::downcast::<T>(value).ok()
+    }
+
+    pub fn error(&self) -> Option<String> {
+        let guard = self.slot.state.lock().expect("upload slot lock poisoned");
+        guard.error.clone()
+    }
+}
+
+pub struct UploadedImage {
+    quad: Arc<TexturedQuad>,
+    width: u32,
+    height: u32,
+}
+
+impl UploadedImage {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &wgpu::SurfaceConfiguration,
+        image: &ImageData,
+    ) -> Result<Self, ImageError> {
+        let quad = Arc::new(TexturedQuad::new(device, queue, config, image)?);
+        Ok(Self {
+            quad,
+            width: image.width,
+            height: image.height,
+        })
+    }
+
+    pub fn size(&self) -> [u32; 2] {
+        [self.width, self.height]
+    }
+}
+
+struct UploadSlot {
+    state: Mutex<UploadSlotState>,
+}
+
+struct UploadSlotState {
+    status: UploadStatus,
+    value: Option<Arc<dyn Any + Send + Sync>>,
+    error: Option<String>,
+    upload_ms: Option<u64>,
+}
+
+impl UploadSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(UploadSlotState {
+                status: UploadStatus::Queued,
+                value: None,
+                error: None,
+                upload_ms: None,
+            }),
+        }
+    }
+
+    fn mark_uploading(&self) {
+        let mut guard = self.state.lock().expect("upload slot lock poisoned");
+        guard.status = UploadStatus::Uploading;
+    }
+
+    fn finish(&self, value: Arc<dyn Any + Send + Sync>, upload_ms: u64) {
+        let mut guard = self.state.lock().expect("upload slot lock poisoned");
+        guard.status = UploadStatus::Ready;
+        guard.value = Some(value);
+        guard.upload_ms = Some(upload_ms);
+    }
+
+    fn fail(&self, message: &str) {
+        let mut guard = self.state.lock().expect("upload slot lock poisoned");
+        guard.status = UploadStatus::Failed;
+        guard.error = Some(message.to_string());
+        guard.upload_ms = Some(0);
+    }
+}
+
+struct UploadJob {
+    slot: Arc<UploadSlot>,
+    priority: UploadPriority,
+    bytes: u64,
+    payload: UploadPayload,
+}
+
+enum UploadPayload {
+    Image { image: ImageData },
 }
 
 pub struct FrameCapture {
@@ -470,6 +810,7 @@ pub struct Renderer<'window> {
     textured_quad: Option<Quad>,
     yuv_pipeline: Option<Arc<YuvPipeline>>,
     scene: Option<SceneRenderer>,
+    upload_queue: UploadQueue,
 }
 
 impl<'window> Renderer<'window> {
@@ -532,6 +873,9 @@ impl<'window> Renderer<'window> {
             wgpu::TextureFormat,
         ),
     {
+        let _ = self
+            .upload_queue
+            .drain(&self.device, &self.queue, &self.config);
         let frame = self.surface.get_current_texture()?;
         let view = frame
             .texture
@@ -629,6 +973,9 @@ impl<'window> Renderer<'window> {
             wgpu::TextureFormat,
         ),
     {
+        let _ = self
+            .upload_queue
+            .drain(&self.device, &self.queue, &self.config);
         let frame = self
             .surface
             .get_current_texture()
@@ -726,12 +1073,30 @@ impl<'window> Renderer<'window> {
         &self.queue
     }
 
+    pub fn upload_queue(&self) -> UploadQueue {
+        self.upload_queue.clone()
+    }
+
+    pub fn drain_uploads(&mut self) -> UploadDrainStats {
+        self.upload_queue
+            .drain(&self.device, &self.queue, &self.config)
+    }
+
+    pub fn set_uploaded_image(&mut self, uploaded: &UploadedImage) {
+        self.textured_quad = Some(Quad::Rgba(Arc::clone(&uploaded.quad)));
+    }
+
     pub fn surface_format(&self) -> wgpu::TextureFormat {
         self.config.format
     }
 
     pub fn set_image(&mut self, image: ImageData) -> Result<(), ImageError> {
-        let quad = TexturedQuad::new(&self.device, &self.queue, &self.config, &image)?;
+        let quad = Arc::new(TexturedQuad::new(
+            &self.device,
+            &self.queue,
+            &self.config,
+            &image,
+        )?);
         self.textured_quad = Some(Quad::Rgba(quad));
         Ok(())
     }
@@ -741,7 +1106,12 @@ impl<'window> Renderer<'window> {
             quad.update(&self.queue, image)?;
             return Ok(());
         }
-        let quad = TexturedQuad::new(&self.device, &self.queue, &self.config, image)?;
+        let quad = Arc::new(TexturedQuad::new(
+            &self.device,
+            &self.queue,
+            &self.config,
+            image,
+        )?);
         self.textured_quad = Some(Quad::Rgba(quad));
         Ok(())
     }
@@ -759,7 +1129,7 @@ impl<'window> Renderer<'window> {
             image,
             &mut self.yuv_pipeline,
         )?;
-        self.textured_quad = Some(Quad::Yuv(quad));
+        self.textured_quad = Some(Quad::Yuv(Box::new(quad)));
         Ok(())
     }
 
@@ -780,7 +1150,7 @@ impl<'window> Renderer<'window> {
             image,
             &mut self.yuv_pipeline,
         )?;
-        self.textured_quad = Some(Quad::Yuv(quad));
+        self.textured_quad = Some(Quad::Yuv(Box::new(quad)));
         Ok(())
     }
 
@@ -871,6 +1241,7 @@ impl<'window> Renderer<'window> {
             textured_quad: None,
             yuv_pipeline: None,
             scene: None,
+            upload_queue: UploadQueue::new(),
         })
     }
 
@@ -887,8 +1258,8 @@ impl<'window> Renderer<'window> {
 }
 
 enum Quad {
-    Rgba(TexturedQuad),
-    Yuv(YuvQuad),
+    Rgba(Arc<TexturedQuad>),
+    Yuv(Box<YuvQuad>),
 }
 
 impl Quad {

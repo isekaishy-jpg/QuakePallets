@@ -81,6 +81,15 @@ pub struct MountSummary {
     pub source: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VfsMountCandidate {
+    pub order: usize,
+    pub mount_point: String,
+    pub kind: MountKind,
+    pub source: PathBuf,
+    pub exists: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct Vfs {
     mounts: Vec<VfsMount>,
@@ -210,6 +219,38 @@ impl Vfs {
                 source: mount.source.clone(),
             })
             .collect()
+    }
+
+    pub fn explain_mounts(&self, virtual_path: &str) -> Result<Vec<VfsMountCandidate>, VfsError> {
+        let vpath = VirtualPath::parse(virtual_path)?;
+        if vpath.components.is_empty() {
+            return Err(VfsError::UnsafePath(virtual_path.to_string()));
+        }
+        let mut candidates = Vec::new();
+        for (order, mount) in self.mounts.iter().enumerate() {
+            let Some(rel) = mount.root.match_relative(&vpath) else {
+                continue;
+            };
+            let exists = mount.exists(&rel);
+            candidates.push(VfsMountCandidate {
+                order,
+                mount_point: mount.root.display.clone(),
+                kind: mount.kind,
+                source: mount.source.clone(),
+                exists,
+            });
+        }
+        Ok(candidates)
+    }
+
+    pub fn resolve_mount(&self, virtual_path: &str) -> Result<VfsMountCandidate, VfsError> {
+        let candidates = self.explain_mounts(virtual_path)?;
+        for candidate in &candidates {
+            if candidate.exists {
+                return Ok(candidate.clone());
+            }
+        }
+        Err(VfsError::NotFound(virtual_path.to_string()))
     }
 
     pub fn read(&self, virtual_path: &str) -> Result<Vec<u8>, VfsError> {

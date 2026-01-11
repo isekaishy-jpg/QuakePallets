@@ -4,6 +4,7 @@
 mod config;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fs;
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -76,6 +77,46 @@ impl StatusLine {
     }
 }
 
+#[derive(Clone, Debug)]
+struct BuildManifestUi {
+    version: Option<String>,
+    tool_version: Option<String>,
+    profile: Option<String>,
+    build_id: Option<String>,
+    platform: Option<String>,
+    timestamp: Option<String>,
+    mount_count: Option<usize>,
+    input_count: Option<usize>,
+    output_count: Option<usize>,
+    mounts: Vec<ManifestMountUi>,
+    stages: Vec<ManifestStageUi>,
+    quake_index: Option<ManifestQuakeIndexUi>,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestMountUi {
+    namespace: String,
+    order: String,
+    layer: String,
+    kind: String,
+    name: String,
+    source: String,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestStageUi {
+    name: String,
+    status: String,
+    duration_ms: String,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestQuakeIndexUi {
+    version: String,
+    fingerprint: String,
+    entry_count: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppTab {
     Pallet,
@@ -110,6 +151,11 @@ struct RunnerApp {
     server_process: ProcessLane,
     client_process: ProcessLane,
     checks_process: ProcessLane,
+    content_manifest: Option<BuildManifestUi>,
+    content_manifest_error: Option<String>,
+    tools_last_running: bool,
+    asset_stats_lines: Vec<String>,
+    asset_stats_log_len: usize,
     pending_window_action: Option<WindowAction>,
     repo_root_input: String,
     repo_root: Option<PathBuf>,
@@ -142,6 +188,11 @@ impl RunnerApp {
             server_process: ProcessLane::new(LOG_MAX_LINES),
             client_process: ProcessLane::new(LOG_MAX_LINES),
             checks_process: ProcessLane::new(LOG_MAX_LINES),
+            content_manifest: None,
+            content_manifest_error: None,
+            tools_last_running: false,
+            asset_stats_lines: Vec::new(),
+            asset_stats_log_len: 0,
             pending_window_action: None,
             repo_root_input,
             repo_root: None,
@@ -166,6 +217,8 @@ impl RunnerApp {
         self.repo_root = None;
         self.metadata_status = None;
         self.metadata_details = None;
+        self.content_manifest = None;
+        self.content_manifest_error = None;
         let trimmed = self.repo_root_input.trim();
         self.config.repo_root = if trimmed.is_empty() {
             None
@@ -379,6 +432,98 @@ impl RunnerApp {
         Ok(command)
     }
 
+    fn append_content_common_args(&self, command: &mut Command) {
+        let quake_dir = self.config.quake_dir.trim();
+        if !quake_dir.is_empty() {
+            command.arg("--quake-dir").arg(quake_dir);
+        }
+        if let Some(manifest) = self.config.mount_manifest.as_ref() {
+            let manifest = manifest.trim();
+            if !manifest.is_empty() {
+                command.arg("--mount-manifest").arg(manifest);
+            }
+        }
+    }
+
+    fn build_tools_content_lint_command(&self) -> Result<Command, String> {
+        let mut command = self
+            .command_in_repo_root("cargo")
+            .ok_or_else(|| "Repo root is required to run tools.".to_string())?;
+        let files = self.collect_content_lint_files()?;
+        command.arg("run").arg("-p").arg("tools").arg("--");
+        command.arg("content");
+        self.append_content_common_args(&mut command);
+        command.arg("lint-ids");
+        for file in files {
+            command.arg("--file").arg(file);
+        }
+        Ok(command)
+    }
+
+    fn build_tools_content_validate_command(&self) -> Result<Command, String> {
+        let mut command = self
+            .command_in_repo_root("cargo")
+            .ok_or_else(|| "Repo root is required to run tools.".to_string())?;
+        command.arg("run").arg("-p").arg("tools").arg("--");
+        command.arg("content");
+        self.append_content_common_args(&mut command);
+        command.arg("validate");
+        Ok(command)
+    }
+
+    fn build_tools_content_build_command(&self) -> Result<Command, String> {
+        let mut command = self
+            .command_in_repo_root("cargo")
+            .ok_or_else(|| "Repo root is required to run tools.".to_string())?;
+        command.arg("run").arg("-p").arg("tools").arg("--");
+        command.arg("content");
+        self.append_content_common_args(&mut command);
+        command.arg("build");
+        Ok(command)
+    }
+
+    fn build_tools_content_clean_command(&self) -> Result<Command, String> {
+        let mut command = self
+            .command_in_repo_root("cargo")
+            .ok_or_else(|| "Repo root is required to run tools.".to_string())?;
+        command.arg("run").arg("-p").arg("tools").arg("--");
+        command.arg("content");
+        self.append_content_common_args(&mut command);
+        command.arg("clean");
+        Ok(command)
+    }
+
+    fn build_tools_content_doctor_command(&self) -> Result<Command, String> {
+        let mut command = self
+            .command_in_repo_root("cargo")
+            .ok_or_else(|| "Repo root is required to run tools.".to_string())?;
+        command.arg("run").arg("-p").arg("tools").arg("--");
+        command.arg("content");
+        self.append_content_common_args(&mut command);
+        command.arg("doctor");
+        Ok(command)
+    }
+
+    fn build_tools_quake_index_command(&self) -> Result<Command, String> {
+        let mut command = self
+            .command_in_repo_root("cargo")
+            .ok_or_else(|| "Repo root is required to run tools.".to_string())?;
+        let quake_dir = self.config.quake_dir.trim();
+        if quake_dir.is_empty() {
+            return Err("--quake-dir is required for quake index.".to_string());
+        }
+        command
+            .arg("run")
+            .arg("-p")
+            .arg("tools")
+            .arg("--")
+            .arg("quake")
+            .arg("index")
+            .arg("--quake-dir")
+            .arg(quake_dir);
+        Ok(command)
+    }
+
     fn run_tools_smoke(&mut self) {
         match self.build_tools_smoke_command() {
             Ok(command) => {
@@ -429,6 +574,140 @@ impl RunnerApp {
                 self.tools_process.push_system(err);
             }
         }
+    }
+
+    fn run_tools_content_lint(&mut self) {
+        match self.build_tools_content_lint_command() {
+            Ok(command) => {
+                if let Err(err) = self.tools_process.start(command) {
+                    self.tools_process.push_system(err);
+                }
+            }
+            Err(err) => {
+                self.tools_process.push_system(err);
+            }
+        }
+    }
+
+    fn run_tools_content_validate(&mut self) {
+        match self.build_tools_content_validate_command() {
+            Ok(command) => {
+                if let Err(err) = self.tools_process.start(command) {
+                    self.tools_process.push_system(err);
+                }
+            }
+            Err(err) => {
+                self.tools_process.push_system(err);
+            }
+        }
+    }
+
+    fn run_tools_content_build(&mut self) {
+        match self.build_tools_content_build_command() {
+            Ok(command) => {
+                if let Err(err) = self.tools_process.start(command) {
+                    self.tools_process.push_system(err);
+                }
+            }
+            Err(err) => {
+                self.tools_process.push_system(err);
+            }
+        }
+    }
+
+    fn run_tools_content_clean(&mut self) {
+        match self.build_tools_content_clean_command() {
+            Ok(command) => {
+                if let Err(err) = self.tools_process.start(command) {
+                    self.tools_process.push_system(err);
+                }
+            }
+            Err(err) => {
+                self.tools_process.push_system(err);
+            }
+        }
+    }
+
+    fn run_tools_content_doctor(&mut self) {
+        match self.build_tools_content_doctor_command() {
+            Ok(command) => {
+                if let Err(err) = self.tools_process.start(command) {
+                    self.tools_process.push_system(err);
+                }
+            }
+            Err(err) => {
+                self.tools_process.push_system(err);
+            }
+        }
+    }
+
+    fn run_tools_quake_index(&mut self) {
+        match self.build_tools_quake_index_command() {
+            Ok(command) => {
+                if let Err(err) = self.tools_process.start(command) {
+                    self.tools_process.push_system(err);
+                }
+            }
+            Err(err) => {
+                self.tools_process.push_system(err);
+            }
+        }
+    }
+
+    fn collect_content_lint_files(&self) -> Result<Vec<PathBuf>, String> {
+        let repo_root = self
+            .repo_root
+            .as_ref()
+            .ok_or_else(|| "Repo root is required to run tools.".to_string())?;
+        let content_root = repo_root.join("content");
+        if !content_root.is_dir() {
+            return Err("content root directory not found.".to_string());
+        }
+        let mut files = Vec::new();
+        collect_level_manifest_paths(&content_root, &mut files).map_err(|err| err.to_string())?;
+        if files.is_empty() {
+            return Err("No level manifests found under content.".to_string());
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    fn build_manifest_path(&self) -> Option<PathBuf> {
+        self.repo_root.as_ref().map(|root| {
+            root.join("content")
+                .join("build")
+                .join("build_manifest.txt")
+        })
+    }
+
+    fn refresh_build_manifest_cache(&mut self) {
+        let path = match self.build_manifest_path() {
+            Some(path) => path,
+            None => {
+                self.content_manifest = None;
+                self.content_manifest_error = Some("Repo root is required.".to_string());
+                return;
+            }
+        };
+        match read_build_manifest_ui(&path) {
+            Ok(summary) => {
+                self.content_manifest = Some(summary);
+                self.content_manifest_error = None;
+            }
+            Err(err) => {
+                self.content_manifest = None;
+                self.content_manifest_error = Some(err);
+            }
+        }
+    }
+
+    fn update_asset_stats_cache(&mut self) {
+        let log_len = self.pallet_process.logs.len();
+        if log_len == self.asset_stats_log_len {
+            return;
+        }
+        self.asset_stats_log_len = log_len;
+        self.asset_stats_lines = extract_dev_asset_stats(&self.pallet_process.logs);
     }
 
     fn build_server_command(&self) -> Result<Command, String> {
@@ -810,7 +1089,13 @@ impl RunnerApp {
 
     fn ui(&mut self, ctx: &Context, window: &Window) {
         self.pallet_process.poll();
+        self.update_asset_stats_cache();
         self.tools_process.poll();
+        let tools_running = self.tools_process.is_running();
+        if self.tools_last_running && !tools_running {
+            self.refresh_build_manifest_cache();
+        }
+        self.tools_last_running = tools_running;
         self.server_process.poll();
         self.client_process.poll();
         self.checks_process.poll();
@@ -1137,6 +1422,7 @@ impl RunnerApp {
         for warning in self.pallet_warnings() {
             ui.colored_label(STATUS_WARN, warning);
         }
+        self.ui_asset_stats_summary(ui);
         ui.label(self.pallet_process.status_line());
         ui.separator();
         log_header(ui, "Pallet log", &mut self.pallet_process);
@@ -1149,9 +1435,67 @@ impl RunnerApp {
             });
     }
 
+    fn ui_asset_stats_summary(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.label("Asset stats (last dev_asset_stats)");
+        if self.asset_stats_lines.is_empty() {
+            ui.small("Run dev_asset_stats in the console to populate this panel.");
+            return;
+        }
+        for line in &self.asset_stats_lines {
+            ui.small(line);
+        }
+    }
+
     fn ui_tools(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
         ui.add_space(6.0);
+        ui.label("Content toolchain");
+        let can_run_tools = self.repo_root.is_some() && !self.tools_process.is_running();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_run_tools, egui::Button::new("Lint IDs"))
+                .clicked()
+            {
+                self.run_tools_content_lint();
+            }
+            if ui
+                .add_enabled(can_run_tools, egui::Button::new("Validate"))
+                .clicked()
+            {
+                self.run_tools_content_validate();
+            }
+            if ui
+                .add_enabled(can_run_tools, egui::Button::new("Build"))
+                .clicked()
+            {
+                self.run_tools_content_build();
+            }
+            if ui
+                .add_enabled(can_run_tools, egui::Button::new("Clean"))
+                .clicked()
+            {
+                self.run_tools_content_clean();
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_run_tools, egui::Button::new("Doctor"))
+                .clicked()
+            {
+                self.run_tools_content_doctor();
+            }
+            if ui
+                .add_enabled(can_run_tools, egui::Button::new("Quake Index"))
+                .clicked()
+            {
+                self.run_tools_quake_index();
+            }
+        });
+        ui.add_space(6.0);
+        self.ui_content_manifest_summary(ui);
+        ui.add_space(6.0);
+        ui.separator();
         ui.label("Smoke");
         let mut smoke_mode = self.config.smoke_mode.clone();
         egui::ComboBox::from_label("Mode")
@@ -1319,6 +1663,132 @@ impl RunnerApp {
             .show(ui, |ui| {
                 render_log_lines(ui, &self.tools_process.logs);
             });
+    }
+
+    fn ui_content_manifest_summary(&mut self, ui: &mut egui::Ui) {
+        if self.content_manifest.is_none() && self.content_manifest_error.is_none() {
+            self.refresh_build_manifest_cache();
+        }
+        ui.label("Build manifest");
+        ui.horizontal(|ui| {
+            if ui.button("Refresh").clicked() {
+                self.refresh_build_manifest_cache();
+            }
+            if let Some(path) = self.build_manifest_path() {
+                ui.small(path.display().to_string());
+            }
+        });
+        if let Some(error) = self.content_manifest_error.as_ref() {
+            ui.colored_label(STATUS_ERR, error);
+        }
+        let Some(summary) = self.content_manifest.as_ref() else {
+            ui.small("No build manifest loaded yet.");
+            return;
+        };
+        egui::Grid::new("build_manifest_summary")
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Build ID");
+                ui.label(summary.build_id.as_deref().unwrap_or("n/a"));
+                ui.end_row();
+                ui.label("Version");
+                ui.label(summary.version.as_deref().unwrap_or("n/a"));
+                ui.end_row();
+                ui.label("Tool version");
+                ui.label(summary.tool_version.as_deref().unwrap_or("n/a"));
+                ui.end_row();
+                ui.label("Profile");
+                ui.label(summary.profile.as_deref().unwrap_or("n/a"));
+                ui.end_row();
+                ui.label("Platform");
+                ui.label(summary.platform.as_deref().unwrap_or("n/a"));
+                ui.end_row();
+                ui.label("Timestamp");
+                ui.label(summary.timestamp.as_deref().unwrap_or("n/a"));
+                ui.end_row();
+                ui.label("Mounts");
+                ui.label(
+                    summary
+                        .mount_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| summary.mounts.len().to_string()),
+                );
+                ui.end_row();
+                ui.label("Inputs");
+                ui.label(
+                    summary
+                        .input_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                );
+                ui.end_row();
+                ui.label("Outputs");
+                ui.label(
+                    summary
+                        .output_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                );
+                ui.end_row();
+            });
+        if !summary.stages.is_empty() {
+            ui.add_space(4.0);
+            ui.label("Stages");
+            egui::Grid::new("build_manifest_stages")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Name");
+                    ui.label("Status");
+                    ui.label("Duration");
+                    ui.end_row();
+                    for stage in &summary.stages {
+                        ui.label(&stage.name);
+                        ui.label(&stage.status);
+                        ui.label(&stage.duration_ms);
+                        ui.end_row();
+                    }
+                });
+        }
+        if let Some(quake) = summary.quake_index.as_ref() {
+            ui.add_space(4.0);
+            ui.label(format!(
+                "Quake index: v{} entries={} fingerprint={}",
+                quake.version, quake.entry_count, quake.fingerprint
+            ));
+        }
+        if !summary.mounts.is_empty() {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new("Mount table summary")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_source("build_manifest_mounts")
+                        .max_height(160.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new("build_manifest_mounts_grid")
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.label("NS");
+                                    ui.label("Order");
+                                    ui.label("Layer");
+                                    ui.label("Kind");
+                                    ui.label("Name");
+                                    ui.label("Source");
+                                    ui.end_row();
+                                    for mount in &summary.mounts {
+                                        ui.label(&mount.namespace);
+                                        ui.label(&mount.order);
+                                        ui.label(&mount.layer);
+                                        ui.label(&mount.kind);
+                                        ui.label(&mount.name);
+                                        ui.label(&mount.source);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+        }
     }
 
     fn ui_net(&mut self, ui: &mut egui::Ui) {
@@ -2385,4 +2855,187 @@ fn truncate_text(value: &str, max: usize) -> String {
     let mut text = value.chars().take(max).collect::<String>();
     text.push_str("...");
     text
+}
+
+fn collect_level_manifest_paths(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_level_manifest_paths(&path, out)?;
+        } else if path
+            .file_name()
+            .map(|name| name == "level.toml")
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn read_build_manifest_ui(path: &Path) -> Result<BuildManifestUi, String> {
+    let text =
+        fs::read_to_string(path).map_err(|err| format!("build manifest read failed: {}", err))?;
+    let mut summary = BuildManifestUi {
+        version: None,
+        tool_version: None,
+        profile: None,
+        build_id: None,
+        platform: None,
+        timestamp: None,
+        mount_count: None,
+        input_count: None,
+        output_count: None,
+        mounts: Vec::new(),
+        stages: Vec::new(),
+        quake_index: None,
+    };
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("version=") {
+            summary.version = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("tool_version=") {
+            summary.tool_version = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("profile=") {
+            summary.profile = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("build_id=") {
+            summary.build_id = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("platform=") {
+            summary.platform = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("timestamp=") {
+            summary.timestamp = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("mount_count=") {
+            summary.mount_count = value.parse::<usize>().ok();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("input_count=") {
+            summary.input_count = value.parse::<usize>().ok();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("output_count=") {
+            summary.output_count = value.parse::<usize>().ok();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("mount|") {
+            let parts: Vec<_> = rest.split('|').collect();
+            if parts.len() >= 6 {
+                summary.mounts.push(ManifestMountUi {
+                    namespace: unescape_manifest_field(parts[0]),
+                    order: parts[1].to_string(),
+                    layer: unescape_manifest_field(parts[2]),
+                    kind: unescape_manifest_field(parts[3]),
+                    name: unescape_manifest_field(parts[4]),
+                    source: unescape_manifest_field(parts[5]),
+                });
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("stage|") {
+            let parts: Vec<_> = rest.split('|').collect();
+            if parts.len() >= 4 {
+                summary.stages.push(ManifestStageUi {
+                    name: unescape_manifest_field(parts[0]),
+                    status: parts[2].to_string(),
+                    duration_ms: format!("{} ms", parts[3]),
+                });
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("quake_index|") {
+            let parts: Vec<_> = rest.split('|').collect();
+            if parts.len() >= 3 {
+                summary.quake_index = Some(ManifestQuakeIndexUi {
+                    version: parts[0].to_string(),
+                    fingerprint: unescape_manifest_field(parts[1]),
+                    entry_count: parts[2].to_string(),
+                });
+            }
+            continue;
+        }
+    }
+    Ok(summary)
+}
+
+fn unescape_manifest_field(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let mut code = String::new();
+            if let Some(a) = chars.next() {
+                code.push(a);
+            }
+            if let Some(b) = chars.next() {
+                code.push(b);
+            }
+            match code.as_str() {
+                "25" => out.push('%'),
+                "7C" => out.push('|'),
+                "3B" => out.push(';'),
+                "0A" => out.push('\n'),
+                "0D" => out.push('\r'),
+                _ => {
+                    out.push('%');
+                    out.push_str(&code);
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn extract_dev_asset_stats(logs: &VecDeque<String>) -> Vec<String> {
+    let mut start_idx = None;
+    for (idx, line) in logs.iter().enumerate().rev() {
+        let line = strip_log_prefix(line);
+        if line.starts_with("asset stats:") {
+            start_idx = Some(idx);
+            break;
+        }
+    }
+    let Some(start_idx) = start_idx else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for line in logs.iter().skip(start_idx) {
+        let line = strip_log_prefix(line);
+        if !is_asset_stats_line(line) {
+            break;
+        }
+        lines.push(line.to_string());
+    }
+    lines
+}
+
+fn strip_log_prefix(line: &str) -> &str {
+    line.strip_prefix("[stdout] ")
+        .or_else(|| line.strip_prefix("[stderr] "))
+        .unwrap_or(line)
+}
+
+fn is_asset_stats_line(line: &str) -> bool {
+    let line = line.trim_end();
+    line.starts_with("asset stats:")
+        || line.starts_with("budget:")
+        || line.starts_with("spent ms:")
+        || line.starts_with("throttled:")
+        || line.starts_with("entries:")
+        || line.starts_with("decoded bytes:")
+        || line.starts_with("by kind:")
+        || line.starts_with("upload queue:")
+        || line.starts_with("  ")
 }

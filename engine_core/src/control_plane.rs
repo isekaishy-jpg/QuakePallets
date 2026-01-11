@@ -307,12 +307,27 @@ pub trait CommandOutput {
 
 pub trait ExecPathResolver {
     fn resolve_exec_path(&self, input: &str) -> Result<PathBuf, String>;
+
+    fn resolve_exec_source(&self, input: &str) -> Result<ExecSource, String> {
+        let path = self.resolve_exec_path(input)?;
+        let source = std::fs::read_to_string(&path)
+            .map_err(|err| format!("exec failed to read {}: {}", path.display(), err))?;
+        Ok(ExecSource {
+            label: path.display().to_string(),
+            source,
+        })
+    }
 }
 
 impl ExecPathResolver for () {
     fn resolve_exec_path(&self, input: &str) -> Result<PathBuf, String> {
         Ok(PathBuf::from(input))
     }
+}
+
+pub struct ExecSource {
+    pub label: String,
+    pub source: String,
 }
 
 pub type CommandResult = Result<(), String>;
@@ -481,11 +496,9 @@ impl<'a, U> CommandRegistry<'a, U> {
         let path = args
             .positional(0)
             .ok_or_else(|| "usage: exec <file>".to_string())?;
-        let resolved = user.resolve_exec_path(path)?;
-        let source = std::fs::read_to_string(&resolved)
-            .map_err(|err| format!("exec failed to read {}: {}", resolved.display(), err))?;
+        let exec_source = user.resolve_exec_source(path)?;
         let mut errors = 0usize;
-        for (index, line) in source.lines().enumerate() {
+        for (index, line) in exec_source.source.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -498,7 +511,12 @@ impl<'a, U> CommandRegistry<'a, U> {
                     if let Err(err) = self.dispatch(&parsed.name, &parsed.args, cvars, output, user)
                     {
                         errors += 1;
-                        output.push_line(format!("error: line {}: {}", index + 1, err));
+                        output.push_line(format!(
+                            "error: {} line {}: {}",
+                            exec_source.label,
+                            index + 1,
+                            err
+                        ));
                         if !continue_on_error {
                             break;
                         }
@@ -507,7 +525,12 @@ impl<'a, U> CommandRegistry<'a, U> {
                 Ok(None) => {}
                 Err(err) => {
                     errors += 1;
-                    output.push_line(format!("error: line {}: {}", index + 1, err));
+                    output.push_line(format!(
+                        "error: {} line {}: {}",
+                        exec_source.label,
+                        index + 1,
+                        err
+                    ));
                     if !continue_on_error {
                         break;
                     }
@@ -592,6 +615,9 @@ fn tokenize_command_line(line: &str) -> Result<Vec<String>, String> {
 
 pub struct CoreCvars {
     pub dbg_perf_hud: CvarId,
+    pub asset_decode_budget_ms: CvarId,
+    pub asset_upload_budget_ms: CvarId,
+    pub asset_io_budget_kb: CvarId,
 }
 
 pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, String> {
@@ -603,7 +629,48 @@ pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, Str
         )
         .with_flags(CvarFlags::DEV_ONLY),
     )?;
-    Ok(CoreCvars { dbg_perf_hud })
+    let asset_decode_budget_ms = registry.register(
+        CvarDef::new(
+            "asset_decode_budget_ms",
+            CvarValue::Int(8),
+            "Asset decode budget per tick (ms).",
+        )
+        .with_bounds(CvarBounds::Int {
+            min: Some(0),
+            max: None,
+        })
+        .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let asset_upload_budget_ms = registry.register(
+        CvarDef::new(
+            "asset_upload_budget_ms",
+            CvarValue::Int(0),
+            "Asset upload budget per tick (ms, telemetry only).",
+        )
+        .with_bounds(CvarBounds::Int {
+            min: Some(0),
+            max: None,
+        })
+        .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let asset_io_budget_kb = registry.register(
+        CvarDef::new(
+            "asset_io_budget_kb",
+            CvarValue::Int(0),
+            "Asset IO budget per tick (kb, telemetry only).",
+        )
+        .with_bounds(CvarBounds::Int {
+            min: Some(0),
+            max: None,
+        })
+        .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    Ok(CoreCvars {
+        dbg_perf_hud,
+        asset_decode_budget_ms,
+        asset_upload_budget_ms,
+        asset_io_budget_kb,
+    })
 }
 
 pub fn register_core_commands<U>(registry: &mut CommandRegistry<'_, U>) -> Result<(), String> {
@@ -746,6 +813,76 @@ pub fn register_pallet_command_specs<U>(
         "Print the sticky error (if any).",
         "sticky_error",
     ))?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_asset_resolve",
+            "Resolve an asset id.",
+            "dev_asset_resolve <asset_id>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_asset_explain",
+            "Explain asset resolution.",
+            "dev_asset_explain <asset_id>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new("dev_asset_stats", "Asset cache stats.", "dev_asset_stats")
+            .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_asset_status",
+            "Inspect a cached asset.",
+            "dev_asset_status <asset_id>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_asset_list",
+            "List cached assets.",
+            "dev_asset_list [--ns <namespace>] [--kind <kind>] [--limit N]",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(CommandSpec::new(
+        "quake_which",
+        "Show quake asset resolution.",
+        "quake_which <path>",
+    ))?;
+    registry.register_spec(CommandSpec::new(
+        "quake_dupes",
+        "List duplicate quake assets.",
+        "quake_dupes [--limit N]",
+    ))?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_asset_reload",
+            "Reload an asset (async).",
+            "dev_asset_reload <asset_id>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_asset_purge",
+            "Purge a cached asset (async).",
+            "dev_asset_purge <asset_id>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_content_validate",
+            "Validate level manifests (async).",
+            "dev_content_validate",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
     Ok(())
 }
 

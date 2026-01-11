@@ -1,0 +1,9 @@
+version = 1
+
+assets = [
+  "engine:config/console/console_welcome.txt",
+  "engine:text/fixtures/golden.cfg",
+  "engine:texture/fixtures/golden.png"
+]
+
+requires = []

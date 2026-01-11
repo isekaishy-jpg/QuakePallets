@@ -103,6 +103,7 @@ impl ScriptEngine {
         })
     }
 
+    // Legacy: runtime should provide script sources via AssetManager instead of direct disk reads.
     pub fn load_file(&mut self, path: impl AsRef<Path>) -> Result<(), ScriptError> {
         let source = fs::read_to_string(path)?;
         self.load_script(&source)

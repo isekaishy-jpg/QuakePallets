@@ -1,0 +1,4 @@
+^8Welcome to the Pallet console.
+^8Colors: ^0black ^1red ^2orange ^3yellow ^4green ^5blue ^6indigo ^7violet ^8white
+^8Use caret (^) + a digit 0-8 before text to change color.
+^8Example: ^1ye^8s ^2or^3an^4ge
