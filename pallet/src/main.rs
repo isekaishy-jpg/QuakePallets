@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audio::AudioEngine;
@@ -28,6 +28,7 @@ use engine_core::level_manifest::{
     discover_level_manifests, load_level_manifest, resolve_level_manifest_path, LevelManifest,
     LevelManifestPath,
 };
+use engine_core::logging::{self, LogLevel};
 use engine_core::mount_manifest::{load_mount_manifest, MountManifestEntry};
 use engine_core::observability;
 use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
@@ -100,6 +101,7 @@ const CONSOLE_PADDING: f32 = 6.0;
 const CONSOLE_INPUT_PADDING: f32 = 0.5;
 const CONSOLE_INPUT_BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 const CONSOLE_SLIDE_MS: u64 = 500;
+const CONSOLE_HISTORY_LIMIT: usize = 128;
 const CONSOLE_SELECTION_LINE_LIMIT: usize = 128;
 const ASSET_LIST_DEFAULT_LIMIT: usize = 200;
 const ASSET_LIST_MAX_LIMIT: usize = 1000;
@@ -505,6 +507,9 @@ struct ConsoleState {
     max_lines: usize,
     log_revision: u64,
     welcome_shown: bool,
+    history: VecDeque<String>,
+    history_cursor: Option<usize>,
+    history_draft: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -610,6 +615,9 @@ impl Default for ConsoleState {
             max_lines: 256,
             log_revision: 0,
             welcome_shown: false,
+            history: VecDeque::new(),
+            history_cursor: None,
+            history_draft: None,
         }
     }
 }
@@ -727,6 +735,58 @@ impl ConsoleState {
         self.selection = None;
         self.selecting = false;
         self.close_menu();
+    }
+
+    fn clear_history_nav(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
+    }
+
+    fn push_history(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.history.back().is_some_and(|entry| entry == trimmed) {
+            return;
+        }
+        self.history.push_back(trimmed.to_string());
+        while self.history.len() > CONSOLE_HISTORY_LIMIT {
+            self.history.pop_front();
+        }
+    }
+
+    fn history_previous(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next_index = match self.history_cursor {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft = Some(self.buffer.clone());
+                self.history.len().saturating_sub(1)
+            }
+        };
+        self.history_cursor = Some(next_index);
+        if let Some(entry) = self.history.get(next_index) {
+            self.buffer = entry.clone();
+        }
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_cursor else {
+            return;
+        };
+        let next_index = index.saturating_add(1);
+        if next_index >= self.history.len() {
+            self.history_cursor = None;
+            self.buffer = self.history_draft.take().unwrap_or_default();
+        } else {
+            self.history_cursor = Some(next_index);
+            if let Some(entry) = self.history.get(next_index) {
+                self.buffer = entry.clone();
+            }
+        }
     }
 
     fn is_selecting(&self) -> bool {
@@ -1147,6 +1207,174 @@ fn finalize_console_spans(spans: Vec<ConsoleSpan>) -> Vec<TextSpan> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CompletionSource {
+    Command,
+    Cvar,
+    CommandOrCvar,
+}
+
+struct ConsoleToken {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn tokenize_console_input(buffer: &str) -> (Vec<ConsoleToken>, bool) {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut token_start: Option<usize> = None;
+    for (index, ch) in buffer.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                tokens.push(ConsoleToken {
+                    text: std::mem::take(&mut current),
+                    start,
+                    end: index,
+                });
+            }
+        } else {
+            if token_start.is_none() {
+                token_start = Some(index);
+            }
+            current.push(ch);
+        }
+    }
+    if let Some(start) = token_start {
+        tokens.push(ConsoleToken {
+            text: current,
+            start,
+            end: buffer.len(),
+        });
+    }
+    let trailing_space = buffer.chars().last().is_some_and(|ch| ch.is_whitespace());
+    (tokens, trailing_space)
+}
+
+fn completion_source_for_input(
+    tokens: &[ConsoleToken],
+    trailing_space: bool,
+) -> Option<CompletionSource> {
+    let first = tokens
+        .first()
+        .map(|token| token.text.as_str())
+        .unwrap_or("");
+    let token_index = if trailing_space {
+        tokens.len()
+    } else {
+        tokens.len().saturating_sub(1)
+    };
+    if token_index == 0 {
+        return Some(CompletionSource::Command);
+    }
+    match first {
+        "cvar_get" | "cvar_set" | "cvar_list" | "cvar_toggle" => Some(CompletionSource::Cvar),
+        "help" => Some(CompletionSource::CommandOrCvar),
+        "cmd_list" => Some(CompletionSource::Command),
+        _ => None,
+    }
+}
+
+fn collect_command_names() -> Result<Vec<String>, String> {
+    let mut registry: CommandRegistry<()> = CommandRegistry::new();
+    register_core_commands(&mut registry)?;
+    register_pallet_command_specs(&mut registry)?;
+    let mut names: Vec<String> = registry
+        .list_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn collect_cvar_names(cvars: &CvarRegistry) -> Vec<String> {
+    let mut names: Vec<String> = cvars
+        .list()
+        .into_iter()
+        .map(|entry| entry.def.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn common_prefix(values: &[String]) -> Option<String> {
+    let mut iter = values.iter();
+    let mut prefix = iter.next()?.to_string();
+    for value in iter {
+        let max = prefix.len().min(value.len());
+        let mut len = 0usize;
+        for (left, right) in prefix.chars().zip(value.chars()).take(max) {
+            if left != right {
+                break;
+            }
+            len += left.len_utf8();
+        }
+        prefix.truncate(len);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    Some(prefix)
+}
+
+fn apply_console_completion(console: &mut ConsoleState, cvars: &CvarRegistry) {
+    let (tokens, trailing_space) = tokenize_console_input(&console.buffer);
+    let Some(source) = completion_source_for_input(&tokens, trailing_space) else {
+        return;
+    };
+    let (replace_start, replace_end, prefix) = if trailing_space || tokens.is_empty() {
+        (console.buffer.len(), console.buffer.len(), String::new())
+    } else {
+        let token = &tokens[tokens.len().saturating_sub(1)];
+        (token.start, token.end, token.text.clone())
+    };
+
+    let mut candidates = match source {
+        CompletionSource::Command => collect_command_names().unwrap_or_default(),
+        CompletionSource::Cvar => collect_cvar_names(cvars),
+        CompletionSource::CommandOrCvar => {
+            let mut names = collect_command_names().unwrap_or_default();
+            names.extend(collect_cvar_names(cvars));
+            names.sort();
+            names.dedup();
+            names
+        }
+    };
+    if !prefix.is_empty() {
+        candidates.retain(|name| name.starts_with(&prefix));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    if candidates.len() == 1 {
+        let replacement = &candidates[0];
+        console.buffer = format!(
+            "{}{}{}",
+            &console.buffer[..replace_start],
+            replacement,
+            &console.buffer[replace_end..]
+        );
+        return;
+    }
+    if let Some(shared) = common_prefix(&candidates) {
+        if shared.len() > prefix.len() {
+            console.buffer = format!(
+                "{}{}{}",
+                &console.buffer[..replace_start],
+                shared,
+                &console.buffer[replace_end..]
+            );
+        }
+    }
+    console.push_line(format!("matches: {}", candidates.len()));
+    for name in candidates {
+        console.push_line(format!("  {}", name));
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct ConsoleQuadVertex {
@@ -1544,6 +1772,58 @@ struct PerfHudSnapshot {
     stress_glyphs: usize,
     stress_cols: usize,
     stress_rows: usize,
+}
+
+struct DebugOverlayState {
+    text: Arc<str>,
+    line_count: usize,
+    last_update: Instant,
+    enabled_last: bool,
+}
+
+impl DebugOverlayState {
+    fn new(now: Instant) -> Self {
+        Self {
+            text: Arc::from(""),
+            line_count: 0,
+            last_update: now - Duration::from_millis(HUD_STATS_UPDATE_MS),
+            enabled_last: false,
+        }
+    }
+
+    fn update(
+        &mut self,
+        now: Instant,
+        enabled: bool,
+        build_lines: impl FnOnce() -> Vec<String>,
+    ) -> Option<(Arc<str>, usize)> {
+        if !enabled {
+            self.enabled_last = false;
+            self.line_count = 0;
+            return None;
+        }
+        let mut refresh = false;
+        if !self.enabled_last {
+            self.enabled_last = true;
+            refresh = true;
+        }
+        if now.saturating_duration_since(self.last_update)
+            >= Duration::from_millis(HUD_STATS_UPDATE_MS)
+        {
+            refresh = true;
+        }
+        if refresh {
+            self.last_update = now;
+            let lines = build_lines();
+            self.line_count = lines.len();
+            self.text = Arc::from(lines.join("\n"));
+        }
+        if self.line_count == 0 {
+            None
+        } else {
+            Some((Arc::clone(&self.text), self.line_count))
+        }
+    }
 }
 
 impl PerfState {
@@ -2881,6 +3161,7 @@ fn main() {
     let console_async_sender = ConsoleAsyncSender {
         sender: console_async_tx,
     };
+    let log_filter_state = Arc::new(Mutex::new(LogFilterState::default()));
     let mut modifiers = ModifiersState::default();
     let mut last_cursor_pos = PhysicalPosition::new(0.0, 0.0);
     let mut input_router = InputRouter::new();
@@ -2920,6 +3201,7 @@ fn main() {
     let mut ui_regression_done = false;
     let mut hud = HudState::new(Instant::now());
     let mut perf = PerfState::new();
+    let mut debug_overlay = DebugOverlayState::new(Instant::now());
     let mut cvars = CvarRegistry::new();
     let core_cvars = match register_core_cvars(&mut cvars) {
         Ok(core_cvars) => core_cvars,
@@ -2928,8 +3210,20 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
-    if let Some(value) = cvar_bool(&cvars, core_cvars.dbg_perf_hud) {
-        perf.show_overlay = value;
+    update_perf_overlay(&mut perf, &cvars, &core_cvars);
+    update_log_filter_state(&cvars, &core_cvars, &log_filter_state);
+    {
+        let log_sender = console_async_sender.clone();
+        let log_filter_state = Arc::clone(&log_filter_state);
+        logging::set_logger(move |level, message| {
+            if let Ok(state) = log_filter_state.lock() {
+                if !state.allows(level, message) {
+                    return;
+                }
+            }
+            log_sender.send_line(format!("log {}: {}", level, message));
+            eprintln!("[{}] {}", level, message);
+        });
     }
     if let Some(value) = cvar_int(&cvars, core_cvars.asset_decode_budget_ms) {
         asset_manager.set_decode_budget_ms_per_tick(value.max(0) as u64);
@@ -3235,6 +3529,7 @@ fn main() {
                             quake_vfs.as_ref(),
                             quake_dir.as_ref(),
                             &console_async_sender,
+                            &log_filter_state,
                             &mut ui_state,
                             window,
                             &settings,
@@ -3284,6 +3579,7 @@ fn main() {
                                         | KeyCode::Escape
                                         | KeyCode::Enter
                                         | KeyCode::NumpadEnter
+                                        | KeyCode::Tab
                                 ) {
                                     for ch in text.chars() {
                                         if !ch.is_control() {
@@ -3551,6 +3847,7 @@ fn main() {
                                         quake_vfs.as_ref(),
                                         quake_dir.as_ref(),
                                         &console_async_sender,
+                                        &log_filter_state,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3605,6 +3902,7 @@ fn main() {
                                         quake_vfs.as_ref(),
                                         quake_dir.as_ref(),
                                         &console_async_sender,
+                                        &log_filter_state,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3641,6 +3939,7 @@ fn main() {
                                         quake_vfs.as_ref(),
                                         quake_dir.as_ref(),
                                         &console_async_sender,
+                                        &log_filter_state,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3684,6 +3983,7 @@ fn main() {
                                         quake_vfs.as_ref(),
                                         quake_dir.as_ref(),
                                         &console_async_sender,
+                                        &log_filter_state,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3720,6 +4020,7 @@ fn main() {
                                         quake_vfs.as_ref(),
                                         quake_dir.as_ref(),
                                         &console_async_sender,
+                                        &log_filter_state,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -4279,6 +4580,65 @@ fn main() {
                                     height: perf_height,
                                 },
                                 perf_text,
+                            );
+                        }
+                        let dbg_overlay_enabled =
+                            cvar_bool(&cvars, core_cvars.dbg_overlay).unwrap_or(false);
+                        if let Some((dbg_text, dbg_lines)) = debug_overlay.update(
+                            now,
+                            dbg_overlay_enabled,
+                            || {
+                                let show_fps =
+                                    cvar_bool(&cvars, core_cvars.dbg_fps).unwrap_or(true);
+                                let show_frame =
+                                    cvar_bool(&cvars, core_cvars.dbg_frame_time).unwrap_or(true);
+                                let show_net =
+                                    cvar_bool(&cvars, core_cvars.dbg_net).unwrap_or(false);
+                                let mut lines = Vec::new();
+                                if show_fps || show_frame {
+                                    let fps_display = fps.round();
+                                    let frame_ms = (dt * 1000.0).max(0.0);
+                                    let frame_display = (frame_ms * 10.0).round() / 10.0;
+                                    let line = match (show_fps, show_frame) {
+                                        (true, true) => format!(
+                                            "fps: {:>3} frame_ms: {:.1}",
+                                            fps_display, frame_display
+                                        ),
+                                        (true, false) => format!("fps: {:>3}", fps_display),
+                                        (false, true) => format!("frame_ms: {:.1}", frame_display),
+                                        (false, false) => String::new(),
+                                    };
+                                    if !line.is_empty() {
+                                        lines.push(line);
+                                    }
+                                }
+                                if show_net {
+                                    lines.push(format!(
+                                        "net: {}",
+                                        if loopback.is_some() { "loopback" } else { "offline" }
+                                    ));
+                                }
+                                let last_error = observability::sticky_error()
+                                    .unwrap_or_else(|| "<none>".to_string());
+                                lines.push(format!("last_error: {}", last_error));
+                                lines
+                            },
+                        ) {
+                            let dbg_line_height =
+                                (hud_small_px * LINE_HEIGHT_SCALE).round().max(1.0);
+                            let dbg_height = dbg_line_height * dbg_lines as f32;
+                            hud_overlay.queue(
+                                TextLayer::Hud,
+                                hud_small_style,
+                                TextPosition {
+                                    x: hud_margin,
+                                    y: hud_margin,
+                                },
+                                TextBounds {
+                                    width: resolution.physical_px[0] as f32,
+                                    height: dbg_height,
+                                },
+                                dbg_text,
                             );
                         }
                         if let Some(checks) = ui_regression_checks.as_mut() {
@@ -5688,6 +6048,7 @@ fn dispatch_console_line(
     quake_vfs: Option<Arc<Vfs>>,
     quake_dir: Option<PathBuf>,
     console_async: ConsoleAsyncSender,
+    log_filter_state: &Arc<Mutex<LogFilterState>>,
 ) {
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
@@ -5704,14 +6065,18 @@ fn dispatch_console_line(
             commands.dispatch_line(line, cvars, console, &mut user)
         }
         Err(err) => {
-            console.push_line(format!("error: {}", err));
+            let message = format!("error: {}", err);
+            console.push_line(message.clone());
+            observability::set_sticky_error(message);
             return;
         }
     };
     if let Err(err) = dispatch_result {
-        console.push_line(format!("error: {}", err));
+        let message = format!("error: {}", err);
+        console.push_line(message.clone());
+        observability::set_sticky_error(message);
     }
-    apply_cvar_changes(cvars, perf, core_cvars, asset_manager);
+    apply_cvar_changes(cvars, perf, core_cvars, asset_manager, log_filter_state);
 }
 
 fn build_command_registry<'a>(
@@ -6618,18 +6983,96 @@ fn quake_bsp_path(key: &AssetKey) -> String {
     format!("maps/{}.bsp", key.path())
 }
 
+#[derive(Clone, Debug)]
+struct LogFilterState {
+    min_level: LogLevel,
+    filter: Option<String>,
+}
+
+impl Default for LogFilterState {
+    fn default() -> Self {
+        Self {
+            min_level: LogLevel::Info,
+            filter: None,
+        }
+    }
+}
+
+impl LogFilterState {
+    fn allows(&self, level: LogLevel, message: &str) -> bool {
+        if log_level_rank(level) > log_level_rank(self.min_level) {
+            return false;
+        }
+        if let Some(filter) = self.filter.as_ref() {
+            let needle = filter.as_str();
+            if !message.to_ascii_lowercase().contains(needle) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn log_level_rank(level: LogLevel) -> u8 {
+    match level {
+        LogLevel::Error => 0,
+        LogLevel::Warn => 1,
+        LogLevel::Info => 2,
+        LogLevel::Debug => 3,
+    }
+}
+
+fn parse_log_level(value: &str) -> Option<LogLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "error" | "err" => Some(LogLevel::Error),
+        "warn" | "warning" => Some(LogLevel::Warn),
+        "info" => Some(LogLevel::Info),
+        "debug" => Some(LogLevel::Debug),
+        _ => None,
+    }
+}
+
+fn update_log_filter_state(
+    cvars: &CvarRegistry,
+    core: &CoreCvars,
+    log_filter_state: &Arc<Mutex<LogFilterState>>,
+) {
+    let level_value = cvar_string(cvars, core.log_level)
+        .and_then(|value| parse_log_level(&value))
+        .unwrap_or(LogLevel::Info);
+    let filter_value = cvar_string(cvars, core.log_filter)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+    if let Ok(mut state) = log_filter_state.lock() {
+        state.min_level = level_value;
+        state.filter = filter_value;
+    }
+}
+
+fn update_perf_overlay(perf: &mut PerfState, cvars: &CvarRegistry, core: &CoreCvars) {
+    let master = cvar_bool(cvars, core.dbg_overlay).unwrap_or(false);
+    let perf_enabled = cvar_bool(cvars, core.dbg_perf_hud).unwrap_or(false);
+    let next = master && perf_enabled;
+    if perf.show_overlay != next {
+        perf.show_overlay = next;
+        perf.hud_dirty = true;
+    }
+}
+
 fn apply_cvar_changes(
     cvars: &mut CvarRegistry,
     perf: &mut PerfState,
     core: &CoreCvars,
     asset_manager: &AssetManager,
+    log_filter_state: &Arc<Mutex<LogFilterState>>,
 ) {
     for id in cvars.take_dirty() {
-        if id == core.dbg_perf_hud {
-            if let Some(value) = cvar_bool(cvars, id) {
-                perf.show_overlay = value;
-                perf.hud_dirty = true;
-            }
+        if id == core.dbg_perf_hud || id == core.dbg_overlay {
+            update_perf_overlay(perf, cvars, core);
+        }
+        if id == core.log_level || id == core.log_filter {
+            update_log_filter_state(cvars, core, log_filter_state);
         }
         if id == core.asset_decode_budget_ms {
             if let Some(value) = cvar_int(cvars, id) {
@@ -6649,6 +7092,13 @@ fn cvar_bool(cvars: &CvarRegistry, id: CvarId) -> Option<bool> {
 fn cvar_int(cvars: &CvarRegistry, id: CvarId) -> Option<i32> {
     match cvars.get(id)?.value {
         engine_core::control_plane::CvarValue::Int(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn cvar_string(cvars: &CvarRegistry, id: CvarId) -> Option<String> {
+    match cvars.get(id)?.value {
+        engine_core::control_plane::CvarValue::String(ref value) => Some(value.clone()),
         _ => None,
     }
 }
@@ -7168,6 +7618,7 @@ fn handle_non_video_key_input(
     quake_vfs: Option<&Arc<Vfs>>,
     quake_dir: Option<&PathBuf>,
     console_async: &ConsoleAsyncSender,
+    log_filter_state: &Arc<Mutex<LogFilterState>>,
     ui_state: &mut UiState,
     window: &Window,
     settings: &Settings,
@@ -7257,7 +7708,9 @@ fn handle_non_video_key_input(
                     KeyCode::Enter | KeyCode::NumpadEnter => {
                         let line = console.buffer.trim().to_string();
                         console.buffer.clear();
+                        console.clear_history_nav();
                         if !line.is_empty() {
+                            console.push_history(&line);
                             println!("> {}", line);
                             console.push_line(format!("> {}", line));
                             dispatch_console_line(
@@ -7273,11 +7726,18 @@ fn handle_non_video_key_input(
                                 quake_vfs.cloned(),
                                 quake_dir.cloned(),
                                 console_async.clone(),
+                                log_filter_state,
                             );
                         }
                     }
                     KeyCode::Backspace => {
                         console.buffer.pop();
+                    }
+                    KeyCode::ArrowUp => {
+                        console.history_previous();
+                    }
+                    KeyCode::ArrowDown => {
+                        console.history_next();
                     }
                     KeyCode::PageUp => {
                         let page =
@@ -7294,6 +7754,9 @@ fn handle_non_video_key_input(
                     }
                     KeyCode::End => {
                         console.scroll_offset = 0.0;
+                    }
+                    KeyCode::Tab => {
+                        apply_console_completion(console, cvars);
                     }
                     _ => {}
                 }

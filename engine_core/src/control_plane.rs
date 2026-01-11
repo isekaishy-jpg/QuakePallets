@@ -614,18 +614,79 @@ fn tokenize_command_line(line: &str) -> Result<Vec<String>, String> {
 }
 
 pub struct CoreCvars {
+    pub dbg_overlay: CvarId,
     pub dbg_perf_hud: CvarId,
+    pub dbg_fps: CvarId,
+    pub dbg_frame_time: CvarId,
+    pub dbg_net: CvarId,
+    pub dbg_jobs: CvarId,
+    pub dbg_assets: CvarId,
+    pub dbg_mounts: CvarId,
+    pub log_level: CvarId,
+    pub log_filter: CvarId,
     pub asset_decode_budget_ms: CvarId,
     pub asset_upload_budget_ms: CvarId,
     pub asset_io_budget_kb: CvarId,
 }
 
 pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, String> {
+    let dbg_overlay = registry.register(
+        CvarDef::new(
+            "dbg_overlay",
+            CvarValue::Bool(false),
+            "Master debug overlay toggle.",
+        )
+        .with_flags(CvarFlags::DEV_ONLY),
+    )?;
     let dbg_perf_hud = registry.register(
         CvarDef::new(
             "dbg_perf_hud",
             CvarValue::Bool(false),
             "Show perf HUD overlay.",
+        )
+        .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let dbg_fps = registry.register(
+        CvarDef::new("dbg_fps", CvarValue::Bool(true), "Show FPS overlay.")
+            .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let dbg_frame_time = registry.register(
+        CvarDef::new(
+            "dbg_frame_time",
+            CvarValue::Bool(true),
+            "Show frame time overlay.",
+        )
+        .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let dbg_net = registry.register(
+        CvarDef::new("dbg_net", CvarValue::Bool(false), "Show network overlay.")
+            .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let dbg_jobs = registry.register(
+        CvarDef::new("dbg_jobs", CvarValue::Bool(false), "Show jobs overlay.")
+            .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let dbg_assets = registry.register(
+        CvarDef::new("dbg_assets", CvarValue::Bool(false), "Show asset overlay.")
+            .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let dbg_mounts = registry.register(
+        CvarDef::new("dbg_mounts", CvarValue::Bool(false), "Show mount overlay.")
+            .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let log_level = registry.register(
+        CvarDef::new(
+            "log_level",
+            CvarValue::String("info".to_string()),
+            "Log level threshold (error|warn|info|debug).",
+        )
+        .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let log_filter = registry.register(
+        CvarDef::new(
+            "log_filter",
+            CvarValue::String(String::new()),
+            "Substring filter for console logs.",
         )
         .with_flags(CvarFlags::DEV_ONLY),
     )?;
@@ -666,7 +727,16 @@ pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, Str
         .with_flags(CvarFlags::DEV_ONLY),
     )?;
     Ok(CoreCvars {
+        dbg_overlay,
         dbg_perf_hud,
+        dbg_fps,
+        dbg_frame_time,
+        dbg_net,
+        dbg_jobs,
+        dbg_assets,
+        dbg_mounts,
+        log_level,
+        log_filter,
         asset_decode_budget_ms,
         asset_upload_budget_ms,
         asset_io_budget_kb,
