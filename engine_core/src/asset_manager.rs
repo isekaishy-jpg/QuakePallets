@@ -12,6 +12,7 @@ use crate::jobs::{JobError, JobHandle, JobQueue, Jobs, JobsConfig};
 use crate::logging;
 use crate::path_policy::PathPolicy;
 use crate::vfs::Vfs;
+use test_map::{ResolvedSolid, TestMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssetStatus {
@@ -74,6 +75,7 @@ pub enum AssetKind {
     EngineScript,
     EngineText,
     EngineBlob,
+    EngineTestMap,
     Quake1Raw,
     EngineTexture,
 }
@@ -85,6 +87,7 @@ impl AssetKind {
             AssetKind::EngineScript => "engine:script",
             AssetKind::EngineText => "engine:text",
             AssetKind::EngineBlob => "engine:blob",
+            AssetKind::EngineTestMap => "engine:test_map",
             AssetKind::Quake1Raw => "quake1:raw",
             AssetKind::EngineTexture => "engine:texture",
         }
@@ -129,6 +132,12 @@ pub struct ConfigAsset {
 
 pub struct ScriptAsset {
     pub text: String,
+}
+
+pub struct TestMapAsset {
+    pub map: TestMap,
+    pub solids: Vec<ResolvedSolid>,
+    source_len: usize,
 }
 
 pub struct BlobAsset {
@@ -200,6 +209,29 @@ impl AssetPayload for ScriptAsset {
 
     fn decoded_size(&self) -> usize {
         self.text.len()
+    }
+}
+
+impl AssetPayload for TestMapAsset {
+    const KIND: AssetKind = AssetKind::EngineTestMap;
+
+    fn accepts(key: &AssetKey) -> bool {
+        key.namespace() == "engine" && key.kind() == "test_map"
+    }
+
+    fn decode(_key: &AssetKey, bytes: Vec<u8>) -> Result<Self, String> {
+        let text = String::from_utf8(bytes).map_err(|err| err.to_string())?;
+        let map = TestMap::parse_toml(&text)?;
+        let solids = map.expanded_solids()?;
+        Ok(Self {
+            map,
+            solids,
+            source_len: text.len(),
+        })
+    }
+
+    fn decoded_size(&self) -> usize {
+        self.source_len
     }
 }
 
@@ -1024,6 +1056,15 @@ fn decode_for_kind(
         }
         AssetKind::EngineBlob => {
             let asset = BlobAsset::decode(key, bytes)?;
+            let bytes = asset.decoded_size();
+            Ok(DecodedPayload {
+                value: Arc::new(asset),
+                decoded_bytes: bytes,
+                content_hash,
+            })
+        }
+        AssetKind::EngineTestMap => {
+            let asset = TestMapAsset::decode(key, bytes)?;
             let bytes = asset.decoded_size();
             Ok(DecodedPayload {
                 value: Arc::new(asset),

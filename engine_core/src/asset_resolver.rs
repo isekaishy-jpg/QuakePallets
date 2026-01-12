@@ -376,7 +376,11 @@ fn engine_config_roots(path_policy: &PathPolicy) -> (Option<PathBuf>, PathBuf) {
 }
 
 fn engine_relative_path(key: &AssetKey) -> PathBuf {
-    Path::new(key.kind()).join(key.path())
+    if key.kind() == "test_map" {
+        Path::new("test_maps").join(key.path())
+    } else {
+        Path::new(key.kind()).join(key.path())
+    }
 }
 
 fn quake_vpath(root: &str, kind: &str, path: &str) -> String {

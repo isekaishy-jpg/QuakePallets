@@ -1,0 +1,68 @@
+version = 1
+name = "soft_bhop_course"
+map_to_world_scale = 1.0
+space_origin = [0.0, 0.0, 0.0]
+notes = "Repeated landing pads to validate soft-bhop retention."
+
+[[solids]]
+id = "floor"
+kind = "box"
+pos = [0.0, -0.5, 0.0]
+size = [80.0, 1.0, 16.0]
+tags = ["ground"]
+
+[[solids]]
+id = "pad_01"
+kind = "box"
+pos = [-20.0, 0.2, 0.0]
+size = [2.5, 0.4, 8.0]
+tags = ["pad"]
+
+[[solids]]
+id = "pad_02"
+kind = "box"
+pos = [-15.0, 0.2, 0.0]
+size = [2.5, 0.4, 8.0]
+tags = ["pad"]
+
+[[solids]]
+id = "pad_03"
+kind = "box"
+pos = [-10.0, 0.2, 0.0]
+size = [2.5, 0.4, 8.0]
+tags = ["pad"]
+
+[[solids]]
+id = "pad_04"
+kind = "box"
+pos = [-5.0, 0.2, 0.0]
+size = [2.5, 0.4, 8.0]
+tags = ["pad"]
+
+[[solids]]
+id = "pad_05"
+kind = "box"
+pos = [0.0, 0.2, 0.0]
+size = [2.5, 0.4, 8.0]
+tags = ["pad"]
+
+[[solids]]
+id = "pad_06"
+kind = "box"
+pos = [5.0, 0.2, 0.0]
+size = [2.5, 0.4, 8.0]
+tags = ["pad"]
+
+[[solids]]
+id = "pad_07"
+kind = "box"
+pos = [10.0, 0.2, 0.0]
+size = [2.5, 0.4, 8.0]
+tags = ["pad"]
+
+[[solids]]
+id = "pad_08"
+kind = "box"
+pos = [15.0, 0.2, 0.0]
+size = [2.5, 0.4, 8.0]
+tags = ["pad"]

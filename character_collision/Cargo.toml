@@ -1,0 +1,12 @@
+[package]
+name = "character_collision"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+physics_rapier = { path = "../physics_rapier" }
+rapier3d = { version = "0.22.0" }

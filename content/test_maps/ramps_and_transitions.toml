@@ -1,0 +1,24 @@
+version = 1
+name = "ramps_and_transitions"
+map_to_world_scale = 1.0
+space_origin = [0.0, 0.0, 0.0]
+notes = "Ramp angles for slope limits."
+
+[[solids]]
+id = "floor"
+kind = "box"
+pos = [0.0, -0.5, 0.0]
+size = [60.0, 1.0, 40.0]
+tags = ["ground"]
+
+[[generators]]
+id = "ramp_pack"
+kind = "ramps"
+pos = [-15.0, 0.0, -8.0]
+yaw_deg = 0.0
+width = 4.0
+length = 8.0
+angles_deg = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+align_base = true
+gap = 4.0
+tags = ["ramp"]

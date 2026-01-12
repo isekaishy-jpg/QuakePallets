@@ -622,6 +622,7 @@ pub struct CoreCvars {
     pub dbg_jobs: CvarId,
     pub dbg_assets: CvarId,
     pub dbg_mounts: CvarId,
+    pub dbg_movement: CvarId,
     pub log_level: CvarId,
     pub log_filter: CvarId,
     pub capture_include_overlays: CvarId,
@@ -674,6 +675,14 @@ pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, Str
     let dbg_mounts = registry.register(
         CvarDef::new("dbg_mounts", CvarValue::Bool(false), "Show mount overlay.")
             .with_flags(CvarFlags::DEV_ONLY),
+    )?;
+    let dbg_movement = registry.register(
+        CvarDef::new(
+            "dbg_movement",
+            CvarValue::Bool(false),
+            "Show movement debug overlay.",
+        )
+        .with_flags(CvarFlags::DEV_ONLY),
     )?;
     let log_level = registry.register(
         CvarDef::new(
@@ -744,6 +753,7 @@ pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, Str
         dbg_jobs,
         dbg_assets,
         dbg_mounts,
+        dbg_movement,
         log_level,
         log_filter,
         capture_include_overlays,
@@ -751,6 +761,27 @@ pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, Str
         asset_upload_budget_ms,
         asset_io_budget_kb,
     })
+}
+
+fn register_cvar_alias<U>(
+    registry: &mut CommandRegistry<'_, U>,
+    name: &'static str,
+    help: &'static str,
+) -> Result<(), String> {
+    let usage = format!("{name} <value>");
+    registry.register(
+        CommandSpec::new(name, help, usage).with_flags(CommandFlags::DEV_ONLY),
+        Box::new(move |ctx, args| {
+            let value = args
+                .positional(0)
+                .ok_or_else(|| format!("usage: {name} <value>"))?;
+            let parsed = ctx.cvars.set_from_str(name, value)?;
+            ctx.output
+                .push_line(format!("{name} = {}", parsed.display()));
+            Ok(())
+        }),
+    )?;
+    Ok(())
 }
 
 pub fn register_core_commands<U>(registry: &mut CommandRegistry<'_, U>) -> Result<(), String> {
@@ -828,6 +859,17 @@ pub fn register_core_commands<U>(registry: &mut CommandRegistry<'_, U>) -> Resul
                 .push_line(format!("{name} = {}", parsed.display()));
             Ok(())
         }),
+    )?;
+
+    register_cvar_alias(
+        registry,
+        "dbg_overlay",
+        "Alias for cvar_set dbg_overlay (0/1).",
+    )?;
+    register_cvar_alias(
+        registry,
+        "dbg_movement",
+        "Alias for cvar_set dbg_movement (0/1).",
     )?;
 
     registry.register(
@@ -944,6 +986,14 @@ pub fn register_pallet_command_specs<U>(
             "dev_asset_reload",
             "Reload an asset (async).",
             "dev_asset_reload <asset_id>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_test_map_reload",
+            "Reload the active test map (or a specified one).",
+            "dev_test_map_reload [engine:test_map/...]",
         )
         .with_flags(CommandFlags::DEV_ONLY),
     )?;

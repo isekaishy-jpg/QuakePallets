@@ -148,6 +148,7 @@ pub struct EngineTextureId(AssetKey);
 pub struct EngineConfigId(AssetKey);
 pub struct EngineScriptId(AssetKey);
 pub struct EngineLevelId(AssetKey);
+pub struct EngineTestMapId(AssetKey);
 pub struct Quake1RawId(AssetKey);
 
 impl EngineTextureId {
@@ -190,6 +191,16 @@ impl EngineLevelId {
     }
 }
 
+impl EngineTestMapId {
+    pub fn new(path: &str) -> Result<Self, AssetKeyError> {
+        AssetKey::from_parts("engine", "test_map", path).map(Self)
+    }
+
+    pub fn key(&self) -> &AssetKey {
+        &self.0
+    }
+}
+
 impl Quake1RawId {
     pub fn new(path: &str) -> Result<Self, AssetKeyError> {
         AssetKey::from_parts("quake1", "raw", path).map(Self)
@@ -200,7 +211,9 @@ impl Quake1RawId {
     }
 }
 
-const ENGINE_KINDS: [&str; 6] = ["blob", "config", "level", "script", "text", "texture"];
+const ENGINE_KINDS: [&str; 7] = [
+    "blob", "config", "level", "script", "test_map", "text", "texture",
+];
 const QUAKE1_KINDS: [&str; 8] = [
     "bsp",
     "cfg",

@@ -1,0 +1,14 @@
+[package]
+name = "player_controller"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+character_collision = { path = "../character_collision" }
+physics_rapier = { path = "../physics_rapier" }
+player_camera = { path = "../player_camera" }
+rapier3d = { version = "0.22.0" }

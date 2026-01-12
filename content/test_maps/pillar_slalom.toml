@@ -1,0 +1,52 @@
+version = 1
+name = "pillar_slalom"
+map_to_world_scale = 1.0
+space_origin = [0.0, 0.0, 0.0]
+notes = "Cylinder obstacles for navigation and strafing."
+
+[[solids]]
+id = "floor"
+kind = "box"
+pos = [0.0, -0.5, 0.0]
+size = [60.0, 1.0, 40.0]
+tags = ["ground"]
+
+[[solids]]
+id = "pillar_01"
+kind = "cylinder"
+pos = [-12.0, 1.5, -6.0]
+radius = 0.6
+height = 3.0
+tags = ["pillar"]
+
+[[solids]]
+id = "pillar_02"
+kind = "cylinder"
+pos = [-6.0, 1.5, 6.0]
+radius = 0.6
+height = 3.0
+tags = ["pillar"]
+
+[[solids]]
+id = "pillar_03"
+kind = "cylinder"
+pos = [0.0, 1.5, -4.0]
+radius = 0.6
+height = 3.0
+tags = ["pillar"]
+
+[[solids]]
+id = "pillar_04"
+kind = "cylinder"
+pos = [6.0, 1.5, 4.0]
+radius = 0.6
+height = 3.0
+tags = ["pillar"]
+
+[[solids]]
+id = "pillar_05"
+kind = "cylinder"
+pos = [12.0, 1.5, -2.0]
+radius = 0.6
+height = 3.0
+tags = ["pillar"]

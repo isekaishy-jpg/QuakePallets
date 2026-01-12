@@ -1,5 +1,5 @@
 [package]
-name = "engine_core"
+name = "map_cook"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -8,7 +8,5 @@ license = "MIT OR Apache-2.0"
 path = "src/lib.rs"
 
 [dependencies]
-compat_quake = { path = "../compat_quake", version = "0.1.0" }
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
-png = "0.17"
+rapier3d = { version = "0.22.0" }
 test_map = { path = "../test_map", version = "0.1.0" }

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
+use std::f32::consts::TAU;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -8,21 +9,30 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audio::AudioEngine;
+use character_collision::{CharacterCollision, CollisionProfile};
+use character_motor_arena::{
+    build_move_intent, golden_angle_metrics, ArenaMotor, ArenaMotorConfig, ArenaMotorInput,
+    ArenaMotorState, FrictionlessJumpMode,
+};
+use character_motor_rpg::{
+    build_move_intent as build_move_intent_rpg, RpgMotor, RpgMotorConfig, RpgMotorInput,
+    RpgMotorState,
+};
 use client::{Client, ClientInput};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
 use engine_core::asset_id::AssetKey;
 use engine_core::asset_manager::{
     AssetBudgetTag, AssetEntrySnapshot, AssetManager, AssetPriority, AssetStatus, BlobAsset,
-    ConfigAsset, QuakeRawAsset, RequestOpts, ScriptAsset, TextAsset, TextureAsset,
+    ConfigAsset, QuakeRawAsset, RequestOpts, ScriptAsset, TestMapAsset, TextAsset, TextureAsset,
 };
 use engine_core::asset_resolver::{
     AssetLayer, AssetResolver, AssetSource, ResolveReport, ResolvedLocation, ResolvedPath,
 };
 use engine_core::control_plane::{
     parse_command_line, register_core_commands, register_core_cvars, register_pallet_command_specs,
-    CommandArgs, CommandOutput, CommandRegistry, CoreCvars, CvarId, CvarRegistry, ExecPathResolver,
-    ExecSource, ParsedCommand,
+    CommandArgs, CommandOutput, CommandRegistry, CommandSpec, CoreCvars, CvarBounds, CvarDef,
+    CvarFlags, CvarId, CvarRegistry, CvarValue, ExecPathResolver, ExecSource, ParsedCommand,
 };
 use engine_core::jobs::{JobQueue, Jobs};
 use engine_core::level_manifest::{
@@ -35,12 +45,16 @@ use engine_core::observability;
 use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
 use engine_core::quake_index::{QuakeEntry, QuakeIndex};
 use engine_core::vfs::{MountKind, Vfs, VfsError};
+use map_cook::build_test_map_colliders;
 use net_transport::{LoopbackTransport, Transport, TransportConfig};
+use physics_rapier::PhysicsWorld;
 use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Fullscreen, Ime,
     KeyCode, ModifiersState, MouseButton, MouseScrollDelta, PhysicalKey, PhysicalPosition,
     PhysicalSize, Window, WindowEvent,
 };
+use rapier3d::math::{Isometry, Vector};
+use rapier3d::prelude::Real;
 use render_wgpu::{
     FrameCapture, ImageData, MeshData, MeshVertex, RenderCaptureError, RenderError, TextBounds,
     TextFontSystem, TextLayer, TextOverlay, TextOverlayTimings, TextPosition, TextSpan, TextStyle,
@@ -48,6 +62,7 @@ use render_wgpu::{
 };
 use script_lua::{HostCallbacks, ScriptConfig, ScriptEngine, SpawnRequest};
 use server::Server;
+use test_map::{ResolvedSolid, SolidKind, TestMap};
 use video::{
     advance_playlist, start_video_playback, PlaylistEntry, VideoDebugSnapshot, VideoDebugStats,
     VideoPlayback, VIDEO_AUDIO_PREBUFFER_MS, VIDEO_HOLD_LAST_FRAME_MS, VIDEO_INTERMISSION_MS,
@@ -110,6 +125,30 @@ const CONSOLE_HISTORY_LIMIT: usize = 128;
 const CONSOLE_SELECTION_LINE_LIMIT: usize = 128;
 const ASSET_LIST_DEFAULT_LIMIT: usize = 200;
 const ASSET_LIST_MAX_LIMIT: usize = 1000;
+const TEST_MAP_CYLINDER_SEGMENTS: usize = 16;
+const TEST_MAP_MOVE_SPEED: f32 = 4.5;
+const TEST_MAP_ACCEL: f32 = 30.0;
+const TEST_MAP_AIR_ACCEL: f32 = 18.0;
+const TEST_MAP_FRICTION: f32 = 18.0;
+const TEST_MAP_STOP_SPEED: f32 = 4.0;
+const TEST_MAP_GRAVITY: f32 = 9.81;
+const TEST_MAP_JUMP_SPEED: f32 = 4.5;
+const TEST_MAP_MAX_AIR_SPEED: f32 = 6.0;
+const TEST_MAP_AIR_RESISTANCE: f32 = 1.0;
+const TEST_MAP_GOLDEN_ANGLE_TARGET: f32 = 45.0 * std::f32::consts::PI / 180.0;
+const TEST_MAP_GOLDEN_ANGLE_GAIN_MIN: f32 = 1.0;
+const TEST_MAP_GOLDEN_ANGLE_GAIN_PEAK: f32 = 1.25;
+const TEST_MAP_GOLDEN_ANGLE_BLEND_START: f32 = TEST_MAP_MOVE_SPEED;
+const TEST_MAP_GOLDEN_ANGLE_BLEND_END: f32 = TEST_MAP_MOVE_SPEED * 1.4;
+const TEST_MAP_CORRIDOR_SHAPING_STRENGTH_DEG: f32 = 80.0;
+const TEST_MAP_CORRIDOR_SHAPING_MIN_SPEED: f32 = 10.0;
+const TEST_MAP_CORRIDOR_SHAPING_MAX_ANGLE_DEG: f32 = 6.0;
+const TEST_MAP_CORRIDOR_SHAPING_MIN_ALIGNMENT: f32 = 0.2;
+const TEST_MAP_JUMP_BUFFER_WINDOW: f32 = 0.1;
+const TEST_MAP_BHOP_GRACE: f32 = 0.1;
+const TEST_MAP_BHOP_FRICTION_SCALE: f32 = 0.25;
+const TEST_MAP_BHOP_FRICTION_SCALE_BEST_ANGLE: f32 = 0.0;
+const TEST_MAP_EYE_HEIGHT: f32 = 1.6;
 const UI_REGRESSION_MIN_FONT_PX: f32 = 9.0;
 const UI_REGRESSION_LOG_LINE_COUNT: usize = 24;
 const UI_REGRESSION_FPS: f32 = 144.0;
@@ -384,6 +423,7 @@ struct CliArgs {
     smoke_timeout_ms: Option<u64>,
     ui_regression: Option<UiRegressionArgs>,
     debug_resolution: bool,
+    dev_motor: Option<i32>,
 }
 
 enum ArgParseError {
@@ -411,6 +451,63 @@ impl ExitError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneKind {
+    Bsp,
+    TestMap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MotorKind {
+    Arena,
+    Rpg,
+}
+
+impl MotorKind {
+    fn from_cvar(value: i32) -> Self {
+        if value == 2 {
+            MotorKind::Rpg
+        } else {
+            MotorKind::Arena
+        }
+    }
+}
+
+struct LoadedScene {
+    mesh: MeshData,
+    bounds: Bounds,
+    collision: Option<SceneCollision>,
+    spawn: Option<SpawnPoint>,
+    kind: SceneKind,
+    test_map: Option<TestMapSceneData>,
+}
+
+struct TestMapSceneData {
+    key: AssetKey,
+    map: TestMap,
+}
+
+struct TestMapRuntime {
+    key: AssetKey,
+    world: PhysicsWorld,
+    collision: CharacterCollision,
+    position: Isometry<Real>,
+    prev_position: Isometry<Real>,
+    velocity: Vec3,
+    prev_velocity: Vec3,
+    grounded: bool,
+    ground_normal: Option<Vector<Real>>,
+    capsule_offset: f32,
+    motor_kind: MotorKind,
+    motor_arena: ArenaMotor,
+    motor_rpg: RpgMotor,
+}
+
+enum MapRequest {
+    Bsp(String),
+    TestMap(AssetKey),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enter_map_scene(
     renderer: &mut render_wgpu::Renderer,
@@ -421,24 +518,23 @@ fn enter_map_scene(
     audio: Option<&Rc<AudioEngine>>,
     camera: &mut CameraState,
     collision: &mut Option<SceneCollision>,
+    test_map_runtime: &mut Option<TestMapRuntime>,
     scene_active: &mut bool,
     mouse_look: &mut bool,
     mouse_grabbed: &mut bool,
+    fly_mode: &mut bool,
     loopback: &mut Option<LoopbackNet>,
 ) -> Result<(), ExitError> {
-    let vfs = quake_vfs.ok_or_else(|| {
-        ExitError::new(EXIT_QUAKE_DIR, "quake mounts not configured for map load")
-    })?;
-    let (mesh, bounds, scene_collision, spawn) = load_bsp_scene(asset_manager, map)?;
+    let scene = load_scene(asset_manager, quake_vfs, map)?;
 
     renderer.clear_textured_quad();
     renderer
-        .set_scene(mesh)
+        .set_scene(scene.mesh)
         .map_err(|err| ExitError::new(EXIT_SCENE, format!("scene upload failed: {}", err)))?;
 
-    *collision = Some(scene_collision);
-    *camera = CameraState::from_bounds(&bounds, collision.as_ref());
-    if let Some(spawn) = spawn {
+    *collision = scene.collision;
+    *camera = CameraState::from_bounds(&scene.bounds, collision.as_ref());
+    if let Some(spawn) = scene.spawn {
         let base = quake_to_render(spawn.origin);
         camera.position = camera.camera_from_origin(base);
         if let Some(angle) = spawn.angle {
@@ -449,6 +545,31 @@ fn enter_map_scene(
         if let Some(scene) = collision.as_ref() {
             camera.snap_to_floor(scene);
         }
+    }
+    *test_map_runtime = scene
+        .test_map
+        .map(|data| build_test_map_runtime(&data, &scene.bounds))
+        .transpose()?;
+    if let Some(runtime) = test_map_runtime.as_mut() {
+        let tuning = match runtime.motor_kind {
+            MotorKind::Arena => camera_tuning_from_arena(runtime.motor_arena.config()),
+            MotorKind::Rpg => camera_tuning_from_rpg(runtime.motor_rpg.config()),
+        };
+        configure_test_map_camera(camera, &scene.bounds, tuning);
+        snap_test_map_runtime_to_ground(runtime, &scene.bounds);
+        let origin_y = runtime.position.translation.y - runtime.capsule_offset;
+        camera.position = Vec3::new(
+            runtime.position.translation.x,
+            origin_y + camera.eye_height,
+            runtime.position.translation.z,
+        );
+        camera.velocity = Vec3::zero();
+        camera.vertical_velocity = 0.0;
+        camera.on_ground = runtime.grounded;
+        runtime.velocity = Vec3::zero();
+        runtime.motor_arena.reset_state();
+        runtime.motor_rpg.reset_state();
+        *fly_mode = false;
     }
     *scene_active = true;
     *mouse_look = false;
@@ -464,17 +585,22 @@ fn enter_map_scene(
         }
     };
 
-    if let Some(audio) = audio {
-        match load_music_track(asset_manager, vfs) {
-            Ok(Some(track)) => {
-                if let Err(err) = audio.play_music(track.data) {
-                    eprintln!("{}", err);
-                } else {
-                    println!("streaming {}", track.name);
+    if scene.kind == SceneKind::Bsp {
+        if let Some(audio) = audio {
+            let vfs = quake_vfs.ok_or_else(|| {
+                ExitError::new(EXIT_QUAKE_DIR, "quake mounts not configured for map load")
+            })?;
+            match load_music_track(asset_manager, vfs) {
+                Ok(Some(track)) => {
+                    if let Err(err) = audio.play_music(track.data) {
+                        eprintln!("{}", err);
+                    } else {
+                        println!("streaming {}", track.name);
+                    }
                 }
+                Ok(None) => {}
+                Err(err) => eprintln!("{}", err.message),
             }
-            Ok(None) => {}
-            Err(err) => eprintln!("{}", err.message),
         }
     }
 
@@ -492,8 +618,36 @@ struct InputState {
     back: bool,
     left: bool,
     right: bool,
-    jump: bool,
+    jump_keyboard: bool,
+    jump_mouse: bool,
     down: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MovementCvars {
+    air_max_speed: CvarId,
+    air_accel: CvarId,
+    air_resistance: CvarId,
+    air_resistance_speed_scale: CvarId,
+    golden_target_deg: CvarId,
+    golden_gain_min: CvarId,
+    golden_gain_peak: CvarId,
+    golden_bonus_scale: CvarId,
+    golden_blend_start: CvarId,
+    golden_blend_end: CvarId,
+    corridor_shaping_strength: CvarId,
+    corridor_shaping_min_speed: CvarId,
+    corridor_shaping_max_angle: CvarId,
+    corridor_shaping_min_alignment: CvarId,
+    dev_motor: CvarId,
+    dev_fixed_dt: CvarId,
+    dev_substeps: CvarId,
+}
+
+impl InputState {
+    fn jump_active(&self) -> bool {
+        self.jump_keyboard || self.jump_mouse
+    }
 }
 
 struct ConsoleState {
@@ -2520,7 +2674,7 @@ impl LoopbackNet {
     fn tick(&mut self, input: &InputState, camera: &CameraState) -> Result<(), String> {
         let move_x = bool_to_axis(input.forward, input.back);
         let move_y = bool_to_axis(input.right, input.left);
-        let buttons = if input.jump { 1 } else { 0 };
+        let buttons = if input.jump_active() { 1 } else { 0 };
         self.client
             .send_input(ClientInput {
                 move_x,
@@ -2648,7 +2802,7 @@ impl CameraState {
             }
         }
 
-        if self.on_ground && input.jump {
+        if self.on_ground && input.jump_active() {
             self.vertical_velocity = self.jump_speed;
             self.on_ground = false;
         }
@@ -2704,7 +2858,7 @@ impl CameraState {
         if input.left {
             direction = direction.sub(right);
         }
-        if input.jump {
+        if input.jump_active() {
             direction = direction.add(CAMERA_UP);
         }
         if input.down {
@@ -3656,6 +3810,19 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
+    let movement_cvars = match register_movement_cvars(&mut cvars) {
+        Ok(cvars) => cvars,
+        Err(err) => {
+            eprintln!("movement cvar init failed: {}", err);
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+    if let Some(value) = args.dev_motor {
+        if let Err(err) = cvars.set(movement_cvars.dev_motor, CvarValue::Int(value)) {
+            eprintln!("--dev-motor {}", err);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
     update_perf_overlay(&mut perf, &cvars, &core_cvars);
     update_log_filter_state(&cvars, &core_cvars, &log_filter_state);
     {
@@ -3676,6 +3843,7 @@ fn main() {
     }
     let mut camera = CameraState::default();
     let mut collision: Option<SceneCollision> = None;
+    let mut test_map_runtime: Option<TestMapRuntime> = None;
     let mut fly_mode = false;
     let mut scene_active = false;
     let mut loopback: Option<LoopbackNet> = None;
@@ -3684,6 +3852,8 @@ fn main() {
     let mut ignore_cursor_move = false;
     let mut was_mouse_look = false;
     let mut pending_map: Option<String> = None;
+    let mut test_map_reload_requests: VecDeque<AssetKey> = VecDeque::new();
+    let mut fixed_dt_accum = 0.0_f32;
 
     if let Some(asset) = args.show_image.as_deref() {
         if asset.contains(':') {
@@ -3763,10 +3933,22 @@ fn main() {
     }
 
     if let Some(map) = args.map.as_deref() {
-        if quake_vfs.is_none() {
-            eprintln!("--map requires mounts (use --quake-dir, --mount-*, or --mount-manifest)");
-            print_usage();
-            std::process::exit(EXIT_USAGE);
+        match parse_map_request(map) {
+            Ok(MapRequest::Bsp(_)) => {
+                if quake_vfs.is_none() {
+                    eprintln!(
+                        "--map requires mounts (use --quake-dir, --mount-*, or --mount-manifest)"
+                    );
+                    print_usage();
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+            Ok(MapRequest::TestMap(_)) => {}
+            Err(err) => {
+                eprintln!("--map {}", err);
+                print_usage();
+                std::process::exit(EXIT_USAGE);
+            }
         }
         pending_map = Some(map.to_string());
     }
@@ -4008,6 +4190,8 @@ fn main() {
                             window,
                             &mut settings,
                             &mut settings_flags,
+                            &mut test_map_reload_requests,
+                            test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
                             &mut console_fullscreen_override,
                             &mut input,
                             &mut mouse_look,
@@ -4123,6 +4307,11 @@ fn main() {
                         } else {
                             console.close_menu();
                         }
+                    } else if input_router.active_layer(console.is_blocking(), ui_state.menu_open)
+                        == InputLayer::Game
+                        && button == MouseButton::Right
+                    {
+                        input.jump_mouse = state == ElementState::Pressed;
                     }
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
@@ -4270,9 +4459,11 @@ fn main() {
                                                 audio.as_ref(),
                                                 &mut camera,
                                                 &mut collision,
+                                                &mut test_map_runtime,
                                                 &mut scene_active,
                                                 &mut mouse_look,
                                                 &mut mouse_grabbed,
+                                                &mut fly_mode,
                                                 &mut loopback,
                                             ) {
                                                 Ok(()) => {
@@ -4329,6 +4520,8 @@ fn main() {
                                         window,
                                         &mut settings,
                                         &mut settings_flags,
+                                        &mut test_map_reload_requests,
+                                        test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4386,6 +4579,8 @@ fn main() {
                                         window,
                                         &mut settings,
                                         &mut settings_flags,
+                                        &mut test_map_reload_requests,
+                                        test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4425,6 +4620,8 @@ fn main() {
                                         window,
                                         &mut settings,
                                         &mut settings_flags,
+                                        &mut test_map_reload_requests,
+                                        test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4471,6 +4668,8 @@ fn main() {
                                         window,
                                         &mut settings,
                                         &mut settings_flags,
+                                        &mut test_map_reload_requests,
+                                        test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4510,6 +4709,8 @@ fn main() {
                                         window,
                                         &mut settings,
                                         &mut settings_flags,
+                                        &mut test_map_reload_requests,
+                                        test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4709,9 +4910,11 @@ fn main() {
                                 audio.as_ref(),
                                 &mut camera,
                                 &mut collision,
+                                &mut test_map_runtime,
                                 &mut scene_active,
                                 &mut mouse_look,
                                 &mut mouse_grabbed,
+                                &mut fly_mode,
                                 &mut loopback,
                             );
                             match result {
@@ -5050,8 +5253,88 @@ fn main() {
                         }
                     }
 
+                    if let Some(key) = test_map_reload_requests.pop_front() {
+                        let map_id = key.canonical().to_string();
+                        match enter_map_scene(
+                            &mut renderer,
+                            window,
+                            &asset_manager,
+                            quake_vfs.as_deref(),
+                            &map_id,
+                            audio.as_ref(),
+                            &mut camera,
+                            &mut collision,
+                            &mut test_map_runtime,
+                            &mut scene_active,
+                            &mut mouse_look,
+                            &mut mouse_grabbed,
+                            &mut fly_mode,
+                            &mut loopback,
+                        ) {
+                            Ok(()) => {
+                                current_map = Some(map_id);
+                                console.push_line(format!(
+                                    "test map reload complete: {}",
+                                    key.canonical()
+                                ));
+                            }
+                            Err(err) => {
+                                console.push_line(format!(
+                                    "test map reload failed: {}",
+                                    err.message
+                                ));
+                            }
+                        }
+                    }
+
                     if scene_active {
-                        camera.update(&input, dt, collision.as_ref(), fly_mode);
+                if let Some(runtime) = test_map_runtime.as_mut() {
+                    apply_movement_cvars(&cvars, &movement_cvars, runtime, &mut camera);
+                    let fixed_dt = cvar_float(&cvars, movement_cvars.dev_fixed_dt)
+                        .unwrap_or(0.0)
+                        .max(0.0);
+                    let substeps = cvar_int(&cvars, movement_cvars.dev_substeps)
+                        .unwrap_or(1)
+                        .clamp(1, 16) as u32;
+                    if fixed_dt > 0.0 {
+                        fixed_dt_accum = (fixed_dt_accum + dt).min(0.5);
+                        let step_dt = fixed_dt.max(1.0e-4);
+                        let mut steps = 0u32;
+                        let max_steps = 8u32;
+                        while fixed_dt_accum >= step_dt && steps < max_steps {
+                            let sub_dt = step_dt / substeps as f32;
+                            for _ in 0..substeps {
+                                if fly_mode {
+                                    camera.update(&input, sub_dt, None, true);
+                                    sync_test_map_runtime_to_camera(runtime, &camera);
+                                } else {
+                                    update_test_map_runtime(runtime, &mut camera, &input, sub_dt);
+                                }
+                            }
+                            fixed_dt_accum -= step_dt;
+                            steps += 1;
+                        }
+                        if fly_mode {
+                            if steps == 0 {
+                                camera.update(&input, dt, None, true);
+                                sync_test_map_runtime_to_camera(runtime, &camera);
+                            }
+                        } else if steps > 0 {
+                            let alpha = (fixed_dt_accum / step_dt).clamp(0.0, 1.0);
+                            apply_test_map_interpolation(runtime, &mut camera, alpha);
+                        }
+                    } else {
+                        fixed_dt_accum = 0.0;
+                        if fly_mode {
+                            camera.update(&input, dt, None, true);
+                            sync_test_map_runtime_to_camera(runtime, &camera);
+                        } else {
+                            update_test_map_runtime(runtime, &mut camera, &input, dt);
+                        }
+                    }
+                } else {
+                            camera.update(&input, dt, collision.as_ref(), fly_mode);
+                        }
                         let aspect = aspect_ratio(renderer.size());
                         renderer.update_camera(camera.view_proj(aspect));
                         if let Some(loopback_net) = loopback.as_mut() {
@@ -5156,6 +5439,8 @@ fn main() {
                         }
                         let dbg_overlay_enabled =
                             cvar_bool(&cvars, core_cvars.dbg_overlay).unwrap_or(false);
+                        let show_movement = dbg_overlay_enabled
+                            && cvar_bool(&cvars, core_cvars.dbg_movement).unwrap_or(false);
                         if let Some((dbg_text, dbg_lines)) = debug_overlay.update(
                             now,
                             dbg_overlay_enabled,
@@ -5190,6 +5475,90 @@ fn main() {
                                         if loopback.is_some() { "loopback" } else { "offline" }
                                     ));
                                 }
+                                if show_movement {
+                                    if let Some(runtime) = test_map_runtime.as_ref() {
+                                        let move_axis = [
+                                            bool_to_axis(input.right, input.left),
+                                            bool_to_axis(input.forward, input.back),
+                                        ];
+                                        let (intent_mag, max_speed, golden_config) =
+                                            match runtime.motor_kind {
+                                                MotorKind::Arena => {
+                                                    let config = runtime.motor_arena.config();
+                                                    let intent = build_move_intent(
+                                                        camera.yaw,
+                                                        move_axis,
+                                                        runtime.grounded,
+                                                        runtime.ground_normal,
+                                                    );
+                                                    let max_speed = if runtime.grounded {
+                                                        config.max_speed_ground
+                                                    } else {
+                                                        config.max_speed_air
+                                                    };
+                                                    (intent.mag, max_speed, Some(config))
+                                                }
+                                                MotorKind::Rpg => {
+                                                    let config = runtime.motor_rpg.config();
+                                                    let intent = build_move_intent_rpg(
+                                                        camera.yaw,
+                                                        move_axis,
+                                                        runtime.grounded,
+                                                        runtime.ground_normal,
+                                                    );
+                                                    let max_speed = if runtime.grounded {
+                                                        config.max_speed_ground
+                                                    } else {
+                                                        config.max_speed_air
+                                                    };
+                                                    (intent.mag, max_speed, None)
+                                                }
+                                            };
+                                        let intent_speed = intent_mag * max_speed;
+                                        let planar_velocity = Vector::new(
+                                            runtime.velocity.x,
+                                            0.0,
+                                            runtime.velocity.z,
+                                        );
+                                        let planar_speed = planar_velocity.norm();
+                                        let total_speed = Vector::new(
+                                            runtime.velocity.x,
+                                            runtime.velocity.y,
+                                            runtime.velocity.z,
+                                        )
+                                        .norm();
+                                        lines.push(format!(
+                                            "move: grounded={} speed={:.2} total={:.2}",
+                                            runtime.grounded, planar_speed, total_speed
+                                        ));
+                                        lines.push(format!(
+                                            "intent: mag={:.2} speed={:.2}",
+                                            intent_mag, intent_speed
+                                        ));
+                                        let view_forward =
+                                            Vector::new(camera.yaw.sin(), 0.0, -camera.yaw.cos());
+                                        if let Some(config) = golden_config {
+                                            if let Some(metrics) = golden_angle_metrics(
+                                                &config,
+                                                planar_velocity,
+                                                view_forward,
+                                            ) {
+                                                lines.push(format!(
+                                                    "golden: theta={:.1}deg gain={:.2} quality={:.0}%",
+                                                    metrics.theta.to_degrees(),
+                                                    metrics.gain,
+                                                    metrics.quality * 100.0
+                                                ));
+                                            } else {
+                                                lines.push("golden: theta=-- gain=--".to_string());
+                                            }
+                                        } else {
+                                            lines.push("golden: -- (rpg motor)".to_string());
+                                        }
+                                    } else {
+                                        lines.push("move: no test map runtime".to_string());
+                                    }
+                                }
                                 let last_error = observability::sticky_error()
                                     .unwrap_or_else(|| "<none>".to_string());
                                 lines.push(format!("last_error: {}", last_error));
@@ -5211,6 +5580,37 @@ fn main() {
                                     height: dbg_height,
                                 },
                                 dbg_text,
+                            );
+                        }
+                        if show_movement {
+                            let cross_size = (6.0 * font_scale).round().max(2.0);
+                            let cross_thickness = (1.0 * font_scale).round().max(1.0);
+                            let center_x = resolution.physical_px[0] as f32 * 0.5;
+                            let center_y = resolution.physical_px[1] as f32 * 0.5;
+                            let cross_color = [0.95, 0.95, 0.95, 0.9];
+                            hud_overlay.queue_rect(
+                                TextLayer::Hud,
+                                TextPosition {
+                                    x: (center_x - cross_size).round(),
+                                    y: (center_y - cross_thickness * 0.5).round(),
+                                },
+                                TextBounds {
+                                    width: (cross_size * 2.0).round(),
+                                    height: cross_thickness,
+                                },
+                                cross_color,
+                            );
+                            hud_overlay.queue_rect(
+                                TextLayer::Hud,
+                                TextPosition {
+                                    x: (center_x - cross_thickness * 0.5).round(),
+                                    y: (center_y - cross_size).round(),
+                                },
+                                TextBounds {
+                                    width: cross_thickness,
+                                    height: (cross_size * 2.0).round(),
+                                },
+                                cross_color,
                             );
                         }
                         if let Some(checks) = ui_regression_checks.as_mut() {
@@ -6073,6 +6473,7 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
     let mut ui_regression_ui_scale = None;
     let mut ui_regression_screen = None;
     let mut debug_resolution = false;
+    let mut dev_motor = None;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -6241,6 +6642,18 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
             "--debug-resolution" => {
                 debug_resolution = true;
             }
+            "--dev-motor" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--dev-motor expects 1 or 2".into()))?;
+                let parsed = value
+                    .parse::<i32>()
+                    .map_err(|_| ArgParseError::Message("--dev-motor expects 1 or 2".into()))?;
+                if !(parsed == 1 || parsed == 2) {
+                    return Err(ArgParseError::Message("--dev-motor expects 1 or 2".into()));
+                }
+                dev_motor = Some(parsed);
+            }
             "-h" | "--help" => return Err(ArgParseError::Help),
             _ => {
                 return Err(ArgParseError::Message(format!(
@@ -6349,15 +6762,17 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
         smoke_timeout_ms,
         ui_regression,
         debug_resolution,
+        dev_motor,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: pallet [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--mount-manifest <name-or-path>] [--content-root <path>] [--dev-root <path>] [--config-root <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <name>] [--script <name>] [--input-script] [--smoke <script> [--gtimeout-ms <ms>]] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
+    eprintln!("usage: pallet [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--mount-manifest <name-or-path>] [--content-root <path>] [--dev-root <path>] [--config-root <path>] [--show-image <asset>] [--map <name|engine:test_map/...>] [--play-movie <file>] [--playlist <name>] [--script <name>] [--input-script] [--smoke <script> [--gtimeout-ms <ms>]] [--debug-resolution] [--dev-motor <1|2>] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --show-image engine:texture/ui/pallet_runner_gui_icon.png");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --script demo.lua");
+    eprintln!("example: pallet --map engine:test_map/stairs_and_steps.toml");
     eprintln!("example: pallet --play-movie intro.ogv");
     eprintln!("example: pallet --playlist movies_playlist.txt");
     eprintln!("example: pallet --mount-pk3 raw/q3 \"C:\\\\Quake3\\\\baseq3\\\\pak0.pk3\" --show-image raw/q3/gfx/2d/console.tga");
@@ -6890,6 +7305,8 @@ struct PalletCommandUser<'a> {
     capture_requests: &'a mut VecDeque<CaptureRequest>,
     settings: &'a mut Settings,
     settings_flags: &'a mut SettingsChangeFlags,
+    test_map_reload_requests: &'a mut VecDeque<AssetKey>,
+    active_test_map: Option<AssetKey>,
 }
 
 impl<'a> ExecPathResolver for PalletCommandUser<'a> {
@@ -6944,6 +7361,8 @@ fn dispatch_console_line(
     capture_requests: &mut VecDeque<CaptureRequest>,
     settings: &mut Settings,
     settings_flags: &mut SettingsChangeFlags,
+    test_map_reload_requests: &mut VecDeque<AssetKey>,
+    active_test_map: Option<AssetKey>,
 ) {
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
@@ -6959,6 +7378,8 @@ fn dispatch_console_line(
                 capture_requests,
                 settings,
                 settings_flags,
+                test_map_reload_requests,
+                active_test_map,
             };
             commands.dispatch_line(line, cvars, console, &mut user)
         }
@@ -6996,6 +7417,7 @@ fn dispatch_smoke_command(
     settings: &mut Settings,
     settings_flags: &mut SettingsChangeFlags,
 ) -> Result<(), String> {
+    let mut test_map_reload_requests = VecDeque::new();
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
             let mut user = PalletCommandUser {
@@ -7010,6 +7432,8 @@ fn dispatch_smoke_command(
                 capture_requests,
                 settings,
                 settings_flags,
+                test_map_reload_requests: &mut test_map_reload_requests,
+                active_test_map: None,
             };
             commands.dispatch(&parsed.name, &parsed.args, cvars, console, &mut user)
         }
@@ -7062,12 +7486,118 @@ fn record_capture_failure(
     *capture_last_error = Some(message);
 }
 
+fn register_cvar_alias_command<'a>(
+    commands: &mut CommandRegistry<'a, PalletCommandUser<'a>>,
+    alias: &'static str,
+    cvar_name: &'static str,
+    help: &'static str,
+) -> Result<(), String> {
+    let usage = format!("{alias} <value>");
+    commands.register(
+        CommandSpec::new(alias, help, usage),
+        Box::new(move |ctx, args| {
+            let value = args
+                .positional(0)
+                .ok_or_else(|| format!("usage: {alias} <value>"))?;
+            let parsed = ctx.cvars.set_from_str(cvar_name, value)?;
+            ctx.output
+                .push_line(format!("{cvar_name} = {}", parsed.display()));
+            Ok(())
+        }),
+    )?;
+    Ok(())
+}
+
 fn build_command_registry<'a>(
     core_cvars: &'a CoreCvars,
 ) -> Result<CommandRegistry<'a, PalletCommandUser<'a>>, String> {
     let mut commands: CommandRegistry<'a, PalletCommandUser<'a>> = CommandRegistry::new();
     register_core_commands(&mut commands)?;
     register_pallet_command_specs(&mut commands)?;
+    register_cvar_alias_command(
+        &mut commands,
+        "arena_cs_strength_deg",
+        "arena_cs_strength_deg",
+        "Alias for cvar_set arena_cs_strength_deg.",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "arena_cs_min_speed",
+        "arena_cs_min_speed",
+        "Alias for cvar_set arena_cs_min_speed.",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "arena_cs_max_angle_deg",
+        "arena_cs_max_angle_deg",
+        "Alias for cvar_set arena_cs_max_angle_deg.",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "arena_cs_min_alignment",
+        "arena_cs_min_alignment",
+        "Alias for cvar_set arena_cs_min_alignment.",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "cs_strength",
+        "arena_cs_strength_deg",
+        "Alias for cvar_set arena_cs_strength_deg.",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "cs_min_speed",
+        "arena_cs_min_speed",
+        "Alias for cvar_set arena_cs_min_speed.",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "cs_max_angle",
+        "arena_cs_max_angle_deg",
+        "Alias for cvar_set arena_cs_max_angle_deg.",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "cs_min_align",
+        "arena_cs_min_alignment",
+        "Alias for cvar_set arena_cs_min_alignment.",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "dev_motor",
+        "dev_motor",
+        "Alias for cvar_set dev_motor (1=arena, 2=rpg).",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "motor",
+        "dev_motor",
+        "Alias for cvar_set dev_motor (1=arena, 2=rpg).",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "dev_fixed_dt",
+        "dev_fixed_dt",
+        "Alias for cvar_set dev_fixed_dt (seconds).",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "fixed_dt",
+        "dev_fixed_dt",
+        "Alias for cvar_set dev_fixed_dt (seconds).",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "dev_substeps",
+        "dev_substeps",
+        "Alias for cvar_set dev_substeps (1..16).",
+    )?;
+    register_cvar_alias_command(
+        &mut commands,
+        "substeps",
+        "dev_substeps",
+        "Alias for cvar_set dev_substeps (1..16).",
+    )?;
 
     let perf_hud_id = core_cvars.dbg_perf_hud;
     let asset_decode_budget_id = core_cvars.asset_decode_budget_ms;
@@ -7431,6 +7961,26 @@ fn build_command_registry<'a>(
                 }
                 Ok(lines)
             })
+        }),
+    )?;
+    commands.set_handler(
+        "dev_test_map_reload",
+        Box::new(|ctx, args| {
+            if args.positionals().len() > 1 {
+                return Err("usage: dev_test_map_reload [engine:test_map/...]".to_string());
+            }
+            let key = match args.positional(0) {
+                Some(value) => parse_test_map_key_arg(value)?,
+                None => ctx
+                    .user
+                    .active_test_map
+                    .clone()
+                    .ok_or_else(|| "no active test map loaded".to_string())?,
+            };
+            ctx.user.test_map_reload_requests.push_back(key.clone());
+            ctx.output
+                .push_line(format!("test map reload queued: {}", key.canonical()));
+            Ok(())
         }),
     )?;
     commands.set_handler(
@@ -8122,6 +8672,10 @@ fn request_asset_reload(asset_manager: &AssetManager, key: AssetKey) -> Result<(
             let _ = asset_manager.reload::<TextAsset>(key, opts)?;
             Ok(())
         }
+        ("engine", "test_map") => {
+            let _ = asset_manager.reload::<TestMapAsset>(key, opts)?;
+            Ok(())
+        }
         ("engine", "blob") => {
             let _ = asset_manager.reload::<BlobAsset>(key, opts)?;
             Ok(())
@@ -8425,6 +8979,272 @@ fn apply_cvar_changes(
     }
 }
 
+fn register_movement_cvars(registry: &mut CvarRegistry) -> Result<MovementCvars, String> {
+    let air_max_speed = registry.register(
+        CvarDef::new(
+            "arena_air_max_speed",
+            CvarValue::Float(TEST_MAP_MAX_AIR_SPEED),
+            "Arena air max speed.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let air_accel = registry.register(
+        CvarDef::new(
+            "arena_air_accel",
+            CvarValue::Float(TEST_MAP_AIR_ACCEL),
+            "Arena air acceleration.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let air_resistance = registry.register(
+        CvarDef::new(
+            "arena_air_resistance",
+            CvarValue::Float(TEST_MAP_AIR_RESISTANCE),
+            "Arena air resistance (speed-scaled).",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: Some(10.0),
+        }),
+    )?;
+    let air_resistance_speed_scale = registry.register(
+        CvarDef::new(
+            "arena_air_resistance_speed_scale",
+            CvarValue::Float(TEST_MAP_MAX_AIR_SPEED * 16.0),
+            "Arena air resistance reaches full strength at this speed.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.01),
+            max: None,
+        }),
+    )?;
+    let golden_target_deg = registry.register(
+        CvarDef::new(
+            "arena_golden_target_deg",
+            CvarValue::Float(TEST_MAP_GOLDEN_ANGLE_TARGET.to_degrees()),
+            "Golden angle target (degrees, view-forward relative).",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: Some(180.0),
+        }),
+    )?;
+    let golden_gain_min = registry.register(
+        CvarDef::new(
+            "arena_golden_gain_min",
+            CvarValue::Float(TEST_MAP_GOLDEN_ANGLE_GAIN_MIN),
+            "Golden angle minimum gain.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let golden_gain_peak = registry.register(
+        CvarDef::new(
+            "arena_golden_gain_peak",
+            CvarValue::Float(TEST_MAP_GOLDEN_ANGLE_GAIN_PEAK),
+            "Golden angle peak gain.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let golden_bonus_scale = registry.register(
+        CvarDef::new(
+            "arena_golden_bonus_scale",
+            CvarValue::Float(0.25),
+            "Golden angle bonus scale for uncapped speed growth.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let golden_blend_start = registry.register(
+        CvarDef::new(
+            "arena_golden_blend_start",
+            CvarValue::Float(TEST_MAP_GOLDEN_ANGLE_BLEND_START),
+            "Golden angle blend start speed.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let golden_blend_end = registry.register(
+        CvarDef::new(
+            "arena_golden_blend_end",
+            CvarValue::Float(TEST_MAP_GOLDEN_ANGLE_BLEND_END),
+            "Golden angle blend end speed.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let corridor_shaping_strength = registry.register(
+        CvarDef::new(
+            "arena_cs_strength_deg",
+            CvarValue::Float(TEST_MAP_CORRIDOR_SHAPING_STRENGTH_DEG),
+            "Corridor shaping strength (degrees/sec).",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let corridor_shaping_min_speed = registry.register(
+        CvarDef::new(
+            "arena_cs_min_speed",
+            CvarValue::Float(TEST_MAP_CORRIDOR_SHAPING_MIN_SPEED),
+            "Corridor shaping minimum speed.",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: None,
+        }),
+    )?;
+    let corridor_shaping_max_angle = registry.register(
+        CvarDef::new(
+            "arena_cs_max_angle_deg",
+            CvarValue::Float(TEST_MAP_CORRIDOR_SHAPING_MAX_ANGLE_DEG),
+            "Corridor shaping max angle per tick (degrees).",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: Some(180.0),
+        }),
+    )?;
+    let corridor_shaping_min_alignment = registry.register(
+        CvarDef::new(
+            "arena_cs_min_alignment",
+            CvarValue::Float(TEST_MAP_CORRIDOR_SHAPING_MIN_ALIGNMENT),
+            "Corridor shaping minimum alignment (dot).",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(-1.0),
+            max: Some(1.0),
+        }),
+    )?;
+    let dev_motor = registry.register(
+        CvarDef::new(
+            "dev_motor",
+            CvarValue::Int(1),
+            "Test map motor selection (1=arena, 2=rpg).",
+        )
+        .with_bounds(CvarBounds::Int {
+            min: Some(1),
+            max: Some(2),
+        })
+        .with_flags(CvarFlags::NO_PERSIST),
+    )?;
+    let dev_fixed_dt = registry.register(
+        CvarDef::new(
+            "dev_fixed_dt",
+            CvarValue::Float(0.0),
+            "Test map fixed timestep in seconds (0 disables).",
+        )
+        .with_bounds(CvarBounds::Float {
+            min: Some(0.0),
+            max: Some(1.0),
+        })
+        .with_flags(CvarFlags::NO_PERSIST),
+    )?;
+    let dev_substeps = registry.register(
+        CvarDef::new(
+            "dev_substeps",
+            CvarValue::Int(1),
+            "Test map substeps per fixed tick (1..16).",
+        )
+        .with_bounds(CvarBounds::Int {
+            min: Some(1),
+            max: Some(16),
+        })
+        .with_flags(CvarFlags::NO_PERSIST),
+    )?;
+    Ok(MovementCvars {
+        air_max_speed,
+        air_accel,
+        air_resistance,
+        air_resistance_speed_scale,
+        golden_target_deg,
+        golden_gain_min,
+        golden_gain_peak,
+        golden_bonus_scale,
+        golden_blend_start,
+        golden_blend_end,
+        corridor_shaping_strength,
+        corridor_shaping_min_speed,
+        corridor_shaping_max_angle,
+        corridor_shaping_min_alignment,
+        dev_motor,
+        dev_fixed_dt,
+        dev_substeps,
+    })
+}
+
+fn apply_movement_cvars(
+    cvars: &CvarRegistry,
+    ids: &MovementCvars,
+    runtime: &mut TestMapRuntime,
+    camera: &mut CameraState,
+) {
+    let config = runtime.motor_arena.config_mut();
+    if let Some(value) = cvar_float(cvars, ids.air_max_speed) {
+        config.max_speed_air = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.air_accel) {
+        config.air_accel = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.air_resistance) {
+        config.air_resistance = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.air_resistance_speed_scale) {
+        config.air_resistance_speed_scale = value.max(0.01);
+    }
+    if let Some(value) = cvar_float(cvars, ids.golden_target_deg) {
+        config.golden_angle_target = value.max(0.0).to_radians();
+    }
+    if let Some(value) = cvar_float(cvars, ids.golden_gain_min) {
+        config.golden_angle_gain_min = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.golden_gain_peak) {
+        config.golden_angle_gain_peak = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.golden_bonus_scale) {
+        config.golden_angle_bonus_scale = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.golden_blend_start) {
+        config.golden_angle_blend_speed_start = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.golden_blend_end) {
+        config.golden_angle_blend_speed_end = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.corridor_shaping_strength) {
+        config.corridor_shaping_strength = value.max(0.0).to_radians();
+    }
+    if let Some(value) = cvar_float(cvars, ids.corridor_shaping_min_speed) {
+        config.corridor_shaping_min_speed = value.max(0.0);
+    }
+    if let Some(value) = cvar_float(cvars, ids.corridor_shaping_max_angle) {
+        config.corridor_shaping_max_angle_per_tick = value.max(0.0).to_radians();
+    }
+    if let Some(value) = cvar_float(cvars, ids.corridor_shaping_min_alignment) {
+        config.corridor_shaping_min_alignment = value.clamp(-1.0, 1.0);
+    }
+    let motor_value = cvar_int(cvars, ids.dev_motor).unwrap_or(1);
+    let motor_kind = MotorKind::from_cvar(motor_value);
+    switch_test_map_motor(runtime, camera, motor_kind);
+}
+
 fn cvar_bool(cvars: &CvarRegistry, id: CvarId) -> Option<bool> {
     match cvars.get(id)?.value {
         engine_core::control_plane::CvarValue::Bool(value) => Some(value),
@@ -8435,6 +9255,13 @@ fn cvar_bool(cvars: &CvarRegistry, id: CvarId) -> Option<bool> {
 fn cvar_int(cvars: &CvarRegistry, id: CvarId) -> Option<i32> {
     match cvars.get(id)?.value {
         engine_core::control_plane::CvarValue::Int(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn cvar_float(cvars: &CvarRegistry, id: CvarId) -> Option<f32> {
+    match cvars.get(id)?.value {
+        engine_core::control_plane::CvarValue::Float(value) => Some(value),
         _ => None,
     }
 }
@@ -8550,6 +9377,86 @@ fn find_music_in_dir(
     Ok(None)
 }
 
+fn parse_map_request(map: &str) -> Result<MapRequest, String> {
+    let trimmed = map.trim();
+    if trimmed.is_empty() {
+        return Err("map name must not be empty".to_string());
+    }
+    if trimmed.contains(':') {
+        let key = AssetKey::parse(trimmed)
+            .map_err(|err| format!("invalid map asset id '{}': {}", trimmed, err))?;
+        if key.namespace() == "engine" && key.kind() == "test_map" {
+            return Ok(MapRequest::TestMap(key));
+        }
+        return Err(format!(
+            "map asset id must be engine:test_map, got {}",
+            key.canonical()
+        ));
+    }
+
+    let maybe_path = if let Some(stripped) = trimmed.strip_prefix("test_map/") {
+        Some(stripped)
+    } else if let Some(stripped) = trimmed.strip_prefix("test_maps/") {
+        Some(stripped)
+    } else if trimmed.ends_with(".toml") {
+        Some(trimmed)
+    } else {
+        None
+    };
+
+    if let Some(path) = maybe_path {
+        let key = AssetKey::from_parts("engine", "test_map", path)
+            .map_err(|err| format!("invalid test map path '{}': {}", path, err))?;
+        return Ok(MapRequest::TestMap(key));
+    }
+
+    Ok(MapRequest::Bsp(trimmed.to_string()))
+}
+
+fn parse_test_map_key_arg(value: &str) -> Result<AssetKey, String> {
+    match parse_map_request(value)? {
+        MapRequest::TestMap(key) => Ok(key),
+        MapRequest::Bsp(_) => Err("expected a test map id (engine:test_map/...)".to_string()),
+    }
+}
+
+fn load_scene(
+    asset_manager: &AssetManager,
+    quake_vfs: Option<&Vfs>,
+    map: &str,
+) -> Result<LoadedScene, ExitError> {
+    match parse_map_request(map).map_err(|err| ExitError::new(EXIT_USAGE, err))? {
+        MapRequest::Bsp(name) => {
+            if quake_vfs.is_none() {
+                return Err(ExitError::new(
+                    EXIT_QUAKE_DIR,
+                    "quake mounts not configured for map load",
+                ));
+            }
+            let (mesh, bounds, scene_collision, spawn) = load_bsp_scene(asset_manager, &name)?;
+            Ok(LoadedScene {
+                mesh,
+                bounds,
+                collision: Some(scene_collision),
+                spawn,
+                kind: SceneKind::Bsp,
+                test_map: None,
+            })
+        }
+        MapRequest::TestMap(key) => {
+            let (mesh, bounds, test_map) = load_test_map_scene(asset_manager, &key, false)?;
+            Ok(LoadedScene {
+                mesh,
+                bounds,
+                collision: None,
+                spawn: None,
+                kind: SceneKind::TestMap,
+                test_map: Some(test_map),
+            })
+        }
+    }
+}
+
 fn load_lmp_image(asset_manager: &AssetManager, asset: &str) -> Result<ImageData, ExitError> {
     let palette_bytes =
         load_quake_raw_asset(asset_manager, "gfx/palette.lmp", AssetBudgetTag::Boot)?;
@@ -8570,6 +9477,61 @@ fn load_lmp_image(asset_manager: &AssetManager, asset: &str) -> Result<ImageData
     );
 
     Ok(image)
+}
+
+fn load_test_map_scene(
+    asset_manager: &AssetManager,
+    key: &AssetKey,
+    reload: bool,
+) -> Result<(MeshData, Bounds, TestMapSceneData), ExitError> {
+    let asset = fetch_test_map_asset(asset_manager, key, reload)?;
+    println!(
+        "loaded {} via asset manager ({} solids)",
+        key.canonical(),
+        asset.solids.len()
+    );
+    let map = asset.map.clone();
+    let solids = asset.solids.clone();
+    let (mesh, bounds) = build_test_map_mesh(&map, &solids)?;
+    Ok((
+        mesh,
+        bounds,
+        TestMapSceneData {
+            key: key.clone(),
+            map,
+        },
+    ))
+}
+
+fn fetch_test_map_asset(
+    asset_manager: &AssetManager,
+    key: &AssetKey,
+    reload: bool,
+) -> Result<Arc<TestMapAsset>, ExitError> {
+    let opts = RequestOpts {
+        priority: AssetPriority::High,
+        budget_tag: AssetBudgetTag::Boot,
+    };
+    let handle = if reload {
+        asset_manager
+            .reload::<TestMapAsset>(key.clone(), opts)
+            .map_err(|err| {
+                ExitError::new(
+                    EXIT_SCENE,
+                    format!("test map reload failed ({}): {}", key.canonical(), err),
+                )
+            })?
+    } else {
+        asset_manager.request::<TestMapAsset>(key.clone(), opts)
+    };
+    asset_manager
+        .await_ready(&handle, Duration::from_secs(2))
+        .map_err(|err| {
+            ExitError::new(
+                EXIT_SCENE,
+                format!("test map load failed ({}): {}", key.canonical(), err),
+            )
+        })
 }
 
 fn load_bsp_scene(
@@ -8593,6 +9555,630 @@ fn load_bsp_scene(
 
     let (mesh, bounds, collision) = build_scene_mesh(&bsp)?;
     Ok((mesh, bounds, collision, spawn))
+}
+
+// NOTE: Test maps are a graybox-only renderer path. We build simple per-triangle
+// vertex colors from normals to keep this visualization deterministic and
+// dependency-free. This is intentionally minimal because it is expected to be
+// replaced by a proper render asset pipeline later, so keep changes local and
+// well-documented if you refactor this path.
+fn build_test_map_mesh(
+    map: &TestMap,
+    solids: &[ResolvedSolid],
+) -> Result<(MeshData, Bounds), ExitError> {
+    let scale = map.map_to_world_scale.unwrap_or(1.0);
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(ExitError::new(
+            EXIT_SCENE,
+            "test map scale must be finite and > 0",
+        ));
+    }
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut bounds = Bounds::empty();
+
+    for solid in solids {
+        let size = [
+            solid.size[0] * scale,
+            solid.size[1] * scale,
+            solid.size[2] * scale,
+        ];
+        let center = Vec3::from(solid.pos).scale(scale);
+        match solid.kind {
+            SolidKind::Box | SolidKind::BoxRot => add_test_map_box(
+                &mut vertices,
+                &mut indices,
+                &mut bounds,
+                center,
+                size,
+                solid.yaw_deg,
+                solid.rot_euler_deg,
+            )?,
+            SolidKind::Ramp => add_test_map_ramp(
+                &mut vertices,
+                &mut indices,
+                &mut bounds,
+                center,
+                size,
+                solid.yaw_deg,
+                solid.rot_euler_deg,
+            )?,
+            SolidKind::Cylinder => add_test_map_cylinder(
+                &mut vertices,
+                &mut indices,
+                &mut bounds,
+                center,
+                size,
+                solid.yaw_deg,
+                solid.rot_euler_deg,
+            )?,
+        }
+    }
+
+    let mesh = MeshData::new(vertices, indices).map_err(|err| {
+        ExitError::new(EXIT_SCENE, format!("test map mesh build failed: {}", err))
+    })?;
+    Ok((mesh, bounds))
+}
+
+fn test_map_motor_config() -> ArenaMotorConfig {
+    ArenaMotorConfig {
+        max_speed_ground: TEST_MAP_MOVE_SPEED,
+        max_speed_air: TEST_MAP_MAX_AIR_SPEED,
+        ground_accel: TEST_MAP_ACCEL,
+        air_accel: TEST_MAP_AIR_ACCEL,
+        friction: TEST_MAP_FRICTION,
+        stop_speed: TEST_MAP_STOP_SPEED,
+        gravity: TEST_MAP_GRAVITY,
+        jump_speed: TEST_MAP_JUMP_SPEED,
+        air_resistance: TEST_MAP_AIR_RESISTANCE,
+        air_resistance_speed_scale: TEST_MAP_MAX_AIR_SPEED * 16.0,
+        golden_angle_target: TEST_MAP_GOLDEN_ANGLE_TARGET,
+        golden_angle_gain_min: TEST_MAP_GOLDEN_ANGLE_GAIN_MIN,
+        golden_angle_gain_peak: TEST_MAP_GOLDEN_ANGLE_GAIN_PEAK,
+        golden_angle_bonus_scale: 0.25,
+        golden_angle_blend_speed_start: TEST_MAP_GOLDEN_ANGLE_BLEND_START,
+        golden_angle_blend_speed_end: TEST_MAP_GOLDEN_ANGLE_BLEND_END,
+        corridor_shaping_strength: TEST_MAP_CORRIDOR_SHAPING_STRENGTH_DEG.to_radians(),
+        corridor_shaping_min_speed: TEST_MAP_CORRIDOR_SHAPING_MIN_SPEED,
+        corridor_shaping_max_angle_per_tick: TEST_MAP_CORRIDOR_SHAPING_MAX_ANGLE_DEG.to_radians(),
+        corridor_shaping_min_alignment: TEST_MAP_CORRIDOR_SHAPING_MIN_ALIGNMENT,
+        jump_buffer_enabled: true,
+        jump_buffer_window: TEST_MAP_JUMP_BUFFER_WINDOW,
+        frictionless_jump_mode: FrictionlessJumpMode::Soft,
+        frictionless_jump_grace: TEST_MAP_BHOP_GRACE,
+        frictionless_jump_friction_scale: TEST_MAP_BHOP_FRICTION_SCALE,
+        frictionless_jump_friction_scale_best_angle: TEST_MAP_BHOP_FRICTION_SCALE_BEST_ANGLE,
+    }
+}
+
+fn test_map_rpg_motor_config() -> RpgMotorConfig {
+    RpgMotorConfig::default()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CameraMotorTuning {
+    speed: f32,
+    accel: f32,
+    friction: f32,
+    gravity: f32,
+    jump_speed: f32,
+}
+
+fn camera_tuning_from_arena(config: ArenaMotorConfig) -> CameraMotorTuning {
+    CameraMotorTuning {
+        speed: config.max_speed_ground,
+        accel: config.ground_accel,
+        friction: config.friction,
+        gravity: config.gravity,
+        jump_speed: config.jump_speed,
+    }
+}
+
+fn camera_tuning_from_rpg(config: RpgMotorConfig) -> CameraMotorTuning {
+    CameraMotorTuning {
+        speed: config.max_speed_ground,
+        accel: config.ground_accel,
+        friction: config.friction,
+        gravity: config.gravity,
+        jump_speed: config.jump_speed,
+    }
+}
+
+fn apply_test_map_camera_tuning(camera: &mut CameraState, tuning: CameraMotorTuning) {
+    camera.speed = tuning.speed;
+    camera.accel = tuning.accel;
+    camera.friction = tuning.friction;
+    camera.gravity = tuning.gravity;
+    camera.jump_speed = tuning.jump_speed;
+}
+
+fn snap_test_map_runtime_to_ground(runtime: &mut TestMapRuntime, bounds: &Bounds) {
+    let extent = bounds.extent();
+    let drop = (extent.y + extent.x.max(extent.z)).max(1.0) + runtime.capsule_offset + 2.0;
+    let desired = Vector::new(0.0, -drop, 0.0);
+    let result = runtime.collision.move_character(
+        &runtime.world,
+        runtime.position,
+        desired,
+        runtime.grounded,
+        1.0 / 60.0,
+    );
+    runtime.position = result.position;
+    runtime.prev_position = runtime.position;
+    runtime.grounded = result.grounded;
+    runtime.ground_normal = result.ground_normal;
+    runtime.prev_velocity = runtime.velocity;
+}
+
+// NOTE: Test map runtime uses a minimal Rapier KCC loop so we can walk
+// graybox collision today. Keep this code contained and well-commented so it
+// can be replaced by the full controller pipeline later without surprises.
+fn build_test_map_runtime(
+    data: &TestMapSceneData,
+    bounds: &Bounds,
+) -> Result<TestMapRuntime, ExitError> {
+    let arena_config = test_map_motor_config();
+    let rpg_config = test_map_rpg_motor_config();
+    let mut world = PhysicsWorld::new(Vector::new(0.0, -arena_config.gravity, 0.0));
+    let colliders = build_test_map_colliders(&data.map).map_err(|err| {
+        ExitError::new(
+            EXIT_SCENE,
+            format!("test map collider build failed: {}", err),
+        )
+    })?;
+    for collider in colliders.colliders {
+        world.insert_static_collider(collider.collider);
+    }
+    world.step(1.0 / 60.0);
+
+    let profile = CollisionProfile::arena_default();
+    let capsule_offset = profile.capsule_height * 0.5 + profile.capsule_radius;
+    let center = bounds.center();
+    let position = Isometry::translation(center.x, bounds.max.y + capsule_offset + 1.0, center.z);
+    let runtime = TestMapRuntime {
+        key: data.key.clone(),
+        world,
+        collision: CharacterCollision::new(profile),
+        position,
+        prev_position: position,
+        velocity: Vec3::zero(),
+        prev_velocity: Vec3::zero(),
+        grounded: false,
+        ground_normal: None,
+        capsule_offset,
+        motor_kind: MotorKind::Arena,
+        motor_arena: ArenaMotor::new(arena_config),
+        motor_rpg: RpgMotor::new(rpg_config),
+    };
+    Ok(runtime)
+}
+
+fn configure_test_map_camera(camera: &mut CameraState, bounds: &Bounds, tuning: CameraMotorTuning) {
+    camera.eye_height = TEST_MAP_EYE_HEIGHT;
+    apply_test_map_camera_tuning(camera, tuning);
+    camera.velocity = Vec3::zero();
+    camera.vertical_velocity = 0.0;
+    camera.on_ground = false;
+
+    let center = bounds.center();
+    let extent = bounds.extent().length().max(1.0);
+    let position = Vec3::new(
+        center.x,
+        center.y + camera.eye_height,
+        center.z + extent * 0.25,
+    );
+    let dir = center.sub(position).normalize_or_zero();
+    camera.pitch = dir.y.asin();
+    camera.yaw = dir.x.atan2(-dir.z);
+    camera.position = position;
+}
+
+fn switch_test_map_motor(
+    runtime: &mut TestMapRuntime,
+    camera: &mut CameraState,
+    motor_kind: MotorKind,
+) {
+    if runtime.motor_kind == motor_kind {
+        return;
+    }
+    runtime.motor_kind = motor_kind;
+    let (profile, tuning) = match motor_kind {
+        MotorKind::Arena => (
+            CollisionProfile::arena_default(),
+            camera_tuning_from_arena(runtime.motor_arena.config()),
+        ),
+        MotorKind::Rpg => (
+            CollisionProfile::rpg_default(),
+            camera_tuning_from_rpg(runtime.motor_rpg.config()),
+        ),
+    };
+    let origin_y = runtime.position.translation.y - runtime.capsule_offset;
+    runtime.collision.set_profile(profile);
+    runtime.capsule_offset = profile.capsule_height * 0.5 + profile.capsule_radius;
+    runtime.position.translation.y = origin_y + runtime.capsule_offset;
+    apply_test_map_camera_tuning(camera, tuning);
+    runtime.motor_arena.reset_state();
+    runtime.motor_rpg.reset_state();
+}
+
+fn sync_test_map_runtime_to_camera(runtime: &mut TestMapRuntime, camera: &CameraState) {
+    let origin = Vec3::new(
+        camera.position.x,
+        camera.position.y - camera.eye_height,
+        camera.position.z,
+    );
+    runtime.position = Isometry::translation(origin.x, origin.y + runtime.capsule_offset, origin.z);
+    runtime.prev_position = runtime.position;
+    runtime.velocity = Vec3::zero();
+    runtime.prev_velocity = Vec3::zero();
+    runtime.grounded = false;
+    runtime.ground_normal = None;
+    runtime.motor_arena.reset_state();
+    runtime.motor_rpg.reset_state();
+}
+
+fn update_test_map_runtime(
+    runtime: &mut TestMapRuntime,
+    camera: &mut CameraState,
+    input: &InputState,
+    dt: f32,
+) {
+    runtime.world.step(dt);
+    runtime.prev_position = runtime.position;
+    runtime.prev_velocity = runtime.velocity;
+    let move_x = bool_to_axis(input.right, input.left);
+    let move_y = bool_to_axis(input.forward, input.back);
+    let (desired, next_velocity) = match runtime.motor_kind {
+        MotorKind::Arena => {
+            let motor_state = ArenaMotorState {
+                velocity: Vector::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z),
+                grounded: runtime.grounded,
+                ground_normal: runtime.ground_normal,
+                yaw: camera.yaw,
+            };
+            let motor_output = runtime.motor_arena.step(
+                ArenaMotorInput {
+                    move_axis: [move_x, move_y],
+                    jump: input.jump_active(),
+                },
+                motor_state,
+                dt,
+            );
+            (motor_output.desired_translation, motor_output.next_velocity)
+        }
+        MotorKind::Rpg => {
+            let motor_state = RpgMotorState {
+                velocity: Vector::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z),
+                grounded: runtime.grounded,
+                ground_normal: runtime.ground_normal,
+                yaw: camera.yaw,
+            };
+            let motor_output = runtime.motor_rpg.step(
+                RpgMotorInput {
+                    move_axis: [move_x, move_y],
+                    jump: input.jump_active(),
+                },
+                motor_state,
+                dt,
+            );
+            (motor_output.desired_translation, motor_output.next_velocity)
+        }
+    };
+    let allow_step = runtime.grounded && !input.jump_active();
+    let result =
+        runtime
+            .collision
+            .move_character(&runtime.world, runtime.position, desired, allow_step, dt);
+    let mut next_velocity = next_velocity;
+    runtime.position = result.position;
+    runtime.grounded = result.grounded;
+    runtime.ground_normal = result.ground_normal;
+    if result.hit_ceiling && next_velocity.y > 0.0 {
+        next_velocity.y = 0.0;
+    }
+    if result.grounded && next_velocity.y < 0.0 {
+        let allow_downhill = result
+            .ground_normal
+            .map(|normal| normal.y < 0.99)
+            .unwrap_or(false);
+        if !allow_downhill {
+            next_velocity.y = 0.0;
+        }
+    }
+    if dt > 0.0 && result.hit_wall {
+        next_velocity.x = result.translation.x / dt;
+        next_velocity.z = result.translation.z / dt;
+        if let Some(wall_normal) = result.wall_normal {
+            let dot = next_velocity.dot(&wall_normal);
+            if dot < 0.0 {
+                next_velocity -= wall_normal * dot;
+            }
+        }
+    }
+    runtime.velocity = Vec3::new(next_velocity.x, next_velocity.y, next_velocity.z);
+
+    let origin_y = runtime.position.translation.y - runtime.capsule_offset;
+    camera.position = Vec3::new(
+        runtime.position.translation.x,
+        origin_y + camera.eye_height,
+        runtime.position.translation.z,
+    );
+    camera.velocity = Vec3::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z);
+    camera.vertical_velocity = runtime.velocity.y;
+    camera.on_ground = runtime.grounded;
+}
+
+fn apply_test_map_interpolation(runtime: &TestMapRuntime, camera: &mut CameraState, alpha: f32) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let prev = runtime.prev_position.translation;
+    let curr = runtime.position.translation;
+    let interp_x = prev.x + (curr.x - prev.x) * alpha;
+    let interp_y = prev.y + (curr.y - prev.y) * alpha;
+    let interp_z = prev.z + (curr.z - prev.z) * alpha;
+    let origin_y = interp_y - runtime.capsule_offset;
+    camera.position = Vec3::new(interp_x, origin_y + camera.eye_height, interp_z);
+    let prev_vel = runtime.prev_velocity;
+    let curr_vel = runtime.velocity;
+    let vel = Vec3::new(
+        prev_vel.x + (curr_vel.x - prev_vel.x) * alpha,
+        prev_vel.y + (curr_vel.y - prev_vel.y) * alpha,
+        prev_vel.z + (curr_vel.z - prev_vel.z) * alpha,
+    );
+    camera.velocity = vel;
+    camera.vertical_velocity = vel.y;
+    camera.on_ground = runtime.grounded;
+}
+
+fn add_test_map_box(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    bounds: &mut Bounds,
+    center: Vec3,
+    size: [f32; 3],
+    yaw_deg: Option<f32>,
+    rot_euler_deg: Option<[f32; 3]>,
+) -> Result<(), ExitError> {
+    let hx = size[0] * 0.5;
+    let hy = size[1] * 0.5;
+    let hz = size[2] * 0.5;
+    let local = [
+        Vec3::new(-hx, -hy, -hz),
+        Vec3::new(hx, -hy, -hz),
+        Vec3::new(hx, hy, -hz),
+        Vec3::new(-hx, hy, -hz),
+        Vec3::new(-hx, -hy, hz),
+        Vec3::new(hx, -hy, hz),
+        Vec3::new(hx, hy, hz),
+        Vec3::new(-hx, hy, hz),
+    ];
+    let mut points = [Vec3::zero(); 8];
+    for (index, value) in local.iter().enumerate() {
+        points[index] = transform_test_map_point(*value, center, yaw_deg, rot_euler_deg);
+    }
+
+    push_quad(
+        vertices, indices, bounds, points[4], points[5], points[6], points[7],
+    )?;
+    push_quad(
+        vertices, indices, bounds, points[1], points[0], points[3], points[2],
+    )?;
+    push_quad(
+        vertices, indices, bounds, points[0], points[4], points[7], points[3],
+    )?;
+    push_quad(
+        vertices, indices, bounds, points[5], points[1], points[2], points[6],
+    )?;
+    push_quad(
+        vertices, indices, bounds, points[3], points[7], points[6], points[2],
+    )?;
+    push_quad(
+        vertices, indices, bounds, points[0], points[1], points[5], points[4],
+    )?;
+    Ok(())
+}
+
+fn add_test_map_ramp(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    bounds: &mut Bounds,
+    center: Vec3,
+    size: [f32; 3],
+    yaw_deg: Option<f32>,
+    rot_euler_deg: Option<[f32; 3]>,
+) -> Result<(), ExitError> {
+    let half_length = size[0] * 0.5;
+    let half_height = size[1] * 0.5;
+    let half_width = size[2] * 0.5;
+    let local = [
+        Vec3::new(-half_length, -half_height, -half_width),
+        Vec3::new(half_length, -half_height, -half_width),
+        Vec3::new(half_length, half_height, -half_width),
+        Vec3::new(-half_length, -half_height, half_width),
+        Vec3::new(half_length, -half_height, half_width),
+        Vec3::new(half_length, half_height, half_width),
+    ];
+    let mut points = [Vec3::zero(); 6];
+    for (index, value) in local.iter().enumerate() {
+        points[index] = transform_test_map_point(*value, center, yaw_deg, rot_euler_deg);
+    }
+    let faces = [
+        [0, 1, 2],
+        [3, 5, 4],
+        [0, 3, 4],
+        [0, 4, 1],
+        [0, 2, 5],
+        [0, 5, 3],
+        [1, 4, 5],
+        [1, 5, 2],
+    ];
+    for face in faces {
+        push_triangle(
+            vertices,
+            indices,
+            bounds,
+            points[face[0]],
+            points[face[1]],
+            points[face[2]],
+        )?;
+    }
+    Ok(())
+}
+
+fn add_test_map_cylinder(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    bounds: &mut Bounds,
+    center: Vec3,
+    size: [f32; 3],
+    yaw_deg: Option<f32>,
+    rot_euler_deg: Option<[f32; 3]>,
+) -> Result<(), ExitError> {
+    let radius = size[0].max(size[2]) * 0.5;
+    let half_height = size[1] * 0.5;
+    let top_center = transform_test_map_point(
+        Vec3::new(0.0, half_height, 0.0),
+        center,
+        yaw_deg,
+        rot_euler_deg,
+    );
+    let bottom_center = transform_test_map_point(
+        Vec3::new(0.0, -half_height, 0.0),
+        center,
+        yaw_deg,
+        rot_euler_deg,
+    );
+
+    for segment in 0..TEST_MAP_CYLINDER_SEGMENTS {
+        let t0 = segment as f32 / TEST_MAP_CYLINDER_SEGMENTS as f32;
+        let t1 = (segment + 1) as f32 / TEST_MAP_CYLINDER_SEGMENTS as f32;
+        let a0 = t0 * TAU;
+        let a1 = t1 * TAU;
+        let (sin0, cos0) = a0.sin_cos();
+        let (sin1, cos1) = a1.sin_cos();
+        let local_bottom0 = Vec3::new(radius * cos0, -half_height, radius * sin0);
+        let local_bottom1 = Vec3::new(radius * cos1, -half_height, radius * sin1);
+        let local_top0 = Vec3::new(radius * cos0, half_height, radius * sin0);
+        let local_top1 = Vec3::new(radius * cos1, half_height, radius * sin1);
+
+        let bottom0 = transform_test_map_point(local_bottom0, center, yaw_deg, rot_euler_deg);
+        let bottom1 = transform_test_map_point(local_bottom1, center, yaw_deg, rot_euler_deg);
+        let top0 = transform_test_map_point(local_top0, center, yaw_deg, rot_euler_deg);
+        let top1 = transform_test_map_point(local_top1, center, yaw_deg, rot_euler_deg);
+
+        push_triangle(vertices, indices, bounds, bottom0, bottom1, top1)?;
+        push_triangle(vertices, indices, bounds, bottom0, top1, top0)?;
+
+        push_triangle(vertices, indices, bounds, top_center, top0, top1)?;
+        push_triangle(vertices, indices, bounds, bottom_center, bottom1, bottom0)?;
+    }
+    Ok(())
+}
+
+fn transform_test_map_point(
+    local: Vec3,
+    center: Vec3,
+    yaw_deg: Option<f32>,
+    rot_euler_deg: Option<[f32; 3]>,
+) -> Vec3 {
+    let rotated = apply_test_map_rotation(local, yaw_deg, rot_euler_deg);
+    center.add(rotated)
+}
+
+fn apply_test_map_rotation(
+    value: Vec3,
+    yaw_deg: Option<f32>,
+    rot_euler_deg: Option<[f32; 3]>,
+) -> Vec3 {
+    if let Some(euler) = rot_euler_deg {
+        let pitch = euler[0].to_radians();
+        let yaw = euler[1].to_radians();
+        let roll = euler[2].to_radians();
+        let value = rotate_x_axis(value, pitch);
+        let value = rotate_y_axis(value, yaw);
+        return rotate_z_axis(value, roll);
+    }
+    if let Some(yaw) = yaw_deg {
+        return rotate_y_axis(value, yaw.to_radians());
+    }
+    value
+}
+
+fn rotate_x_axis(value: Vec3, angle: f32) -> Vec3 {
+    let (sin, cos) = angle.sin_cos();
+    Vec3::new(
+        value.x,
+        value.y * cos - value.z * sin,
+        value.y * sin + value.z * cos,
+    )
+}
+
+fn rotate_y_axis(value: Vec3, angle: f32) -> Vec3 {
+    let (sin, cos) = angle.sin_cos();
+    Vec3::new(
+        value.x * cos + value.z * sin,
+        value.y,
+        -value.x * sin + value.z * cos,
+    )
+}
+
+fn rotate_z_axis(value: Vec3, angle: f32) -> Vec3 {
+    let (sin, cos) = angle.sin_cos();
+    Vec3::new(
+        value.x * cos - value.y * sin,
+        value.x * sin + value.y * cos,
+        value.z,
+    )
+}
+
+fn push_quad(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    bounds: &mut Bounds,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+    d: Vec3,
+) -> Result<(), ExitError> {
+    push_triangle(vertices, indices, bounds, a, b, c)?;
+    push_triangle(vertices, indices, bounds, a, c, d)?;
+    Ok(())
+}
+
+fn push_triangle(
+    vertices: &mut Vec<MeshVertex>,
+    indices: &mut Vec<u32>,
+    bounds: &mut Bounds,
+    a: Vec3,
+    b: Vec3,
+    c: Vec3,
+) -> Result<(), ExitError> {
+    let normal = b.sub(a).cross(c.sub(a));
+    if normal.length() <= 0.0 {
+        return Ok(());
+    }
+    let normal = normal.normalize_or_zero();
+    let color = normal.abs().scale(0.8).add(Vec3::new(0.2, 0.2, 0.2));
+    let base = u32::try_from(vertices.len())
+        .map_err(|_| ExitError::new(EXIT_SCENE, "vertex count overflow building test map mesh"))?;
+    vertices.push(MeshVertex {
+        position: a.to_array(),
+        color: color.to_array(),
+    });
+    vertices.push(MeshVertex {
+        position: b.to_array(),
+        color: color.to_array(),
+    });
+    vertices.push(MeshVertex {
+        position: c.to_array(),
+        color: color.to_array(),
+    });
+    indices.extend_from_slice(&[base, base + 1, base + 2]);
+    bounds.include(a);
+    bounds.include(b);
+    bounds.include(c);
+    Ok(())
 }
 
 fn build_scene_mesh(bsp: &Bsp) -> Result<(MeshData, Bounds, SceneCollision), ExitError> {
@@ -8967,6 +10553,8 @@ fn handle_non_video_key_input(
     window: &Window,
     settings: &mut Settings,
     settings_flags: &mut SettingsChangeFlags,
+    test_map_reload_requests: &mut VecDeque<AssetKey>,
+    active_test_map: Option<AssetKey>,
     console_fullscreen_override: &mut bool,
     input: &mut InputState,
     mouse_look: &mut bool,
@@ -9075,6 +10663,8 @@ fn handle_non_video_key_input(
                                 capture_requests,
                                 settings,
                                 settings_flags,
+                                test_map_reload_requests,
+                                active_test_map.clone(),
                             );
                         }
                     }
@@ -9117,7 +10707,7 @@ fn handle_non_video_key_input(
                 KeyCode::KeyS => input.back = pressed,
                 KeyCode::KeyA => input.left = pressed,
                 KeyCode::KeyD => input.right = pressed,
-                KeyCode::Space => input.jump = pressed,
+                KeyCode::Space => input.jump_keyboard = pressed,
                 KeyCode::ShiftLeft => input.down = pressed,
                 KeyCode::KeyF if pressed => {
                     *fly_mode = !*fly_mode;

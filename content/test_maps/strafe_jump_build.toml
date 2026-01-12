@@ -1,0 +1,26 @@
+version = 1
+name = "strafe_jump_build"
+map_to_world_scale = 1.0
+space_origin = [0.0, 0.0, 0.0]
+notes = "Wide lane for strafe-jump build and redirect checks."
+
+[[solids]]
+id = "floor"
+kind = "box"
+pos = [0.0, -0.5, 0.0]
+size = [120.0, 1.0, 24.0]
+tags = ["ground"]
+
+[[solids]]
+id = "lane_wall_left"
+kind = "box"
+pos = [0.0, 1.5, -12.4]
+size = [120.0, 3.0, 0.4]
+tags = ["wall"]
+
+[[solids]]
+id = "lane_wall_right"
+kind = "box"
+pos = [0.0, 1.5, 12.4]
+size = [120.0, 3.0, 0.4]
+tags = ["wall"]

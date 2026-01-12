@@ -26,6 +26,7 @@ use engine_core::mount_manifest::{load_mount_manifest, MountManifestEntry};
 use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
 use engine_core::quake_index::QuakeIndex;
 use engine_core::vfs::{MountKind, Vfs};
+use test_map::TestMap;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_USAGE: i32 = 2;
@@ -49,6 +50,7 @@ enum Commands {
     Vfs(VfsArgs),
     Console(ConsoleArgs),
     Content(ContentArgs),
+    TestMap(TestMapArgs),
     Quake(QuakeArgs),
 }
 
@@ -132,6 +134,12 @@ struct QuakeArgs {
     command: QuakeCommand,
 }
 
+#[derive(Parser)]
+struct TestMapArgs {
+    #[command(subcommand)]
+    command: TestMapCommand,
+}
+
 #[derive(Subcommand)]
 enum QuakeCommand {
     Index {
@@ -161,6 +169,14 @@ enum QuakeCommand {
 enum ConsoleCommand {
     DumpCvars,
     DumpCmds,
+}
+
+#[derive(Subcommand)]
+enum TestMapCommand {
+    Validate {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -311,6 +327,7 @@ fn main() {
         Commands::Vfs(args) => run_vfs(args),
         Commands::Console(args) => run_console(args),
         Commands::Content(args) => run_content(args),
+        Commands::TestMap(args) => run_test_map(args),
         Commands::Quake(args) => run_quake(args),
     };
     std::process::exit(exit_code);
@@ -558,6 +575,58 @@ fn run_quake(args: QuakeArgs) -> i32 {
         QuakeCommand::Which { index, path } => quake_which(index, &path),
         QuakeCommand::Dupes { index, limit } => quake_dupes(index, limit),
     }
+}
+
+fn run_test_map(args: TestMapArgs) -> i32 {
+    match args.command {
+        TestMapCommand::Validate { path } => test_map_validate(&path),
+    }
+}
+
+fn test_map_validate(path: &Path) -> i32 {
+    if !path.is_file() {
+        eprintln!("test map not found: {}", path.display());
+        return EXIT_USAGE;
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("test map read failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    let map = match TestMap::parse_toml(&text) {
+        Ok(map) => map,
+        Err(err) => {
+            eprintln!("test map parse failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    let validation = map.validate();
+    for warning in &validation.warnings {
+        eprintln!("warning: {}", warning);
+    }
+    if !validation.errors.is_empty() {
+        for error in &validation.errors {
+            eprintln!("error: {}", error);
+        }
+        return EXIT_USAGE;
+    }
+    let expanded = match map.expanded_solids() {
+        Ok(solids) => solids,
+        Err(err) => {
+            eprintln!("test map expand failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    println!(
+        "test map ok: name=\"{}\" solids={} generators={} expanded={}",
+        map.name,
+        map.solids.len(),
+        map.generators.len(),
+        expanded.len()
+    );
+    EXIT_SUCCESS
 }
 
 fn content_lint_ids(args: &ContentLintIdsArgs) -> i32 {
