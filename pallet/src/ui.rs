@@ -190,6 +190,7 @@ impl UiFacade {
         ctx: &mut UiFrameContext,
         state: &mut UiState,
         settings: &mut Settings,
+        config_profiles: &[String],
     ) {
         let _ = (ctx.dt_seconds, ctx.resolution, state.console_open);
         let mut output = UiOutput::default();
@@ -229,6 +230,26 @@ impl UiFacade {
                         MenuScreen::Options => {
                             ui.label("Options");
                             ui.add_space(6.0);
+                            let prev_profile = settings.active_profile.clone();
+                            egui::ComboBox::from_label("Config Profile")
+                                .selected_text(settings.active_profile.clone())
+                                .show_ui(ui, |ui| {
+                                    if config_profiles.is_empty() {
+                                        ui.label("No profiles found");
+                                    } else {
+                                        for profile in config_profiles {
+                                            ui.selectable_value(
+                                                &mut settings.active_profile,
+                                                profile.clone(),
+                                                profile.clone(),
+                                            );
+                                        }
+                                    }
+                                });
+                            let profile_changed = prev_profile != settings.active_profile;
+                            if profile_changed {
+                                output.settings_changed = true;
+                            }
                             self.refresh_resolutions(settings.resolution);
                             let prev_mode = settings.window_mode;
                             egui::ComboBox::from_label("Display Mode")
@@ -299,8 +320,11 @@ impl UiFacade {
                             }
                             let display_changed = prev_mode != settings.window_mode
                                 || prev_resolution != settings.resolution;
-                            output.settings_changed =
-                                scale || vsync || volume_changed || display_changed;
+                            output.settings_changed = output.settings_changed
+                                || scale
+                                || vsync
+                                || volume_changed
+                                || display_changed;
                             output.display_settings_changed = display_changed;
                         }
                     }

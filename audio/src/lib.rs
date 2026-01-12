@@ -280,14 +280,20 @@ impl AudioEngine {
 
     pub fn play_wav(&self, data: Vec<u8>) -> Result<(), AudioError> {
         let decoder = self.decode(data)?;
-        let mut state = self.state.lock().expect("audio state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         state.sfx.push(ActiveSound::new(decoder, 1.0, false));
         Ok(())
     }
 
     pub fn play_music(&self, data: Vec<u8>) -> Result<(), AudioError> {
         let decoder = self.decode(data)?;
-        let mut state = self.state.lock().expect("audio state poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         state.music = Some(ActiveSound::new(decoder, 0.6, false));
         Ok(())
     }
@@ -571,6 +577,6 @@ impl PcmStream {
 }
 
 fn mix_callback(state: &Arc<Mutex<AudioState>>, output: &mut FramesMut) {
-    let mut state = state.lock().expect("audio state poisoned");
+    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
     state.mix_into_output(output);
 }

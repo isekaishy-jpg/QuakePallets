@@ -118,7 +118,7 @@ pub struct CvarEntry {
     pub value: CvarValue,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CvarRegistry {
     entries: Vec<CvarEntry>,
     by_name: BTreeMap<String, CvarId>,
@@ -979,6 +979,46 @@ pub fn register_pallet_command_specs<U>(
         )
         .with_flags(CommandFlags::DEV_ONLY),
     )?;
+    registry.register_spec(CommandSpec::new(
+        "settings_list",
+        "List settings fields.",
+        "settings_list",
+    ))?;
+    registry.register_spec(CommandSpec::new(
+        "settings_get",
+        "Read a settings field.",
+        "settings_get <field>",
+    ))?;
+    registry.register_spec(CommandSpec::new(
+        "settings_set",
+        "Write a settings field.",
+        "settings_set <field> <value>",
+    ))?;
+    registry.register_spec(CommandSpec::new(
+        "settings_reset",
+        "Reset settings to defaults.",
+        "settings_reset",
+    ))?;
+    registry.register_spec(CommandSpec::new(
+        "cfg_list",
+        "List config profiles.",
+        "cfg_list",
+    ))?;
+    registry.register_spec(CommandSpec::new(
+        "cfg_select",
+        "Select active config profile.",
+        "cfg_select <name>",
+    ))?;
+    registry.register_spec(CommandSpec::new(
+        "cfg_save",
+        "Save config profile.",
+        "cfg_save <name>",
+    ))?;
+    registry.register_spec(CommandSpec::new(
+        "cfg_load",
+        "Load config profile.",
+        "cfg_load <name>",
+    ))?;
     Ok(())
 }
 

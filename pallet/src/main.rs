@@ -58,7 +58,10 @@ use video::{
 };
 use wgpu::util::DeviceExt;
 
-use settings::{Settings, WindowMode};
+use settings::{
+    config_path_for_profile, default_profile_name, parse_resolution, settings_lines,
+    write_config_lines, Settings, WindowMode,
+};
 use ui::{MenuMode, MenuScreen, ResolutionModel, UiFacade, UiFrameInput, UiState};
 
 mod settings;
@@ -1113,6 +1116,80 @@ fn load_smoke_script(asset_manager: &AssetManager, input: &str) -> Result<SmokeS
     })
 }
 
+fn config_profiles_dir() -> PathBuf {
+    config_path_for_profile(default_profile_name())
+        .parent()
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("config"))
+}
+
+fn normalize_profile_name(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("profile name is empty".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains(':') {
+        return Err("profile name must be a file name (no path separators)".to_string());
+    }
+    let name = if trimmed.to_ascii_lowercase().ends_with(".cfg") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.cfg")
+    };
+    Ok(name)
+}
+
+fn list_config_profiles(path_policy: &PathPolicy) -> Vec<String> {
+    let mut profiles = std::collections::BTreeSet::new();
+    let user_dir = config_profiles_dir();
+    if let Ok(entries) = std::fs::read_dir(&user_dir) {
+        for entry in entries.flatten() {
+            if let Ok(file_type) = entry.file_type() {
+                if !file_type.is_file() {
+                    continue;
+                }
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if name.to_ascii_lowercase().ends_with(".cfg") {
+                    profiles.insert(name.to_string());
+                }
+            }
+        }
+    }
+    let shipped_dir = path_policy.content_root().join("config").join("cvars");
+    if let Ok(entries) = std::fs::read_dir(&shipped_dir) {
+        for entry in entries.flatten() {
+            if let Ok(file_type) = entry.file_type() {
+                if !file_type.is_file() {
+                    continue;
+                }
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if name.to_ascii_lowercase().ends_with(".cfg") {
+                    profiles.insert(name.to_string());
+                }
+            }
+        }
+    }
+    profiles.into_iter().collect()
+}
+
+fn resolve_profile_path(path_policy: &PathPolicy, profile: &str) -> Result<PathBuf, String> {
+    let user_path = config_path_for_profile(profile);
+    if user_path.is_file() {
+        return Ok(user_path);
+    }
+    let shipped_path = path_policy
+        .content_root()
+        .join("config")
+        .join("cvars")
+        .join(profile);
+    if shipped_path.is_file() {
+        return Ok(shipped_path);
+    }
+    Err(format!("config profile not found: {}", profile))
+}
+
 fn build_smoke_report_path(label: &str) -> PathBuf {
     let sanitized: String = label
         .chars()
@@ -2066,6 +2143,29 @@ impl InputScript {
     }
 }
 
+#[derive(Default)]
+struct SettingsChangeFlags {
+    settings_changed: bool,
+    display_changed: bool,
+}
+
+impl SettingsChangeFlags {
+    fn mark_settings(&mut self, display_changed: bool) {
+        self.settings_changed = true;
+        if display_changed {
+            self.display_changed = true;
+        }
+    }
+
+    fn take_settings_changed(&mut self) -> bool {
+        std::mem::take(&mut self.settings_changed)
+    }
+
+    fn take_display_changed(&mut self) -> bool {
+        std::mem::take(&mut self.display_changed)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SmokeLine {
     number: usize,
@@ -2167,6 +2267,8 @@ impl SmokeRunner {
         console_async: ConsoleAsyncSender,
         log_filter_state: &Arc<Mutex<LogFilterState>>,
         capture_requests: &mut VecDeque<CaptureRequest>,
+        settings: &mut Settings,
+        settings_flags: &mut SettingsChangeFlags,
         capture_completed: u64,
         capture_failures: u64,
         capture_last_error: Option<&str>,
@@ -2278,6 +2380,8 @@ impl SmokeRunner {
             console_async,
             log_filter_state,
             capture_requests,
+            settings,
+            settings_flags,
         ) {
             return self.fail(Some(line_index), err);
         }
@@ -3508,6 +3612,7 @@ fn main() {
     let mut input_router = InputRouter::new();
     let mut ui_facade = UiFacade::new(window, renderer.device(), renderer.surface_format());
     let mut ui_state = UiState::default();
+    let mut settings_flags = SettingsChangeFlags::default();
     let text_fonts = TextFontSystem::new();
     let mut text_overlay = TextOverlay::new_with_font_system(
         renderer.device(),
@@ -3901,7 +4006,8 @@ fn main() {
                             &mut capture_requests,
                             &mut ui_state,
                             window,
-                            &settings,
+                            &mut settings,
+                            &mut settings_flags,
                             &mut console_fullscreen_override,
                             &mut input,
                             &mut mouse_look,
@@ -4221,7 +4327,8 @@ fn main() {
                                         &mut capture_requests,
                                         &mut ui_state,
                                         window,
-                                        &settings,
+                                        &mut settings,
+                                        &mut settings_flags,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4277,7 +4384,8 @@ fn main() {
                                         &mut capture_requests,
                                         &mut ui_state,
                                         window,
-                                        &settings,
+                                        &mut settings,
+                                        &mut settings_flags,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4315,7 +4423,8 @@ fn main() {
                                         &mut capture_requests,
                                         &mut ui_state,
                                         window,
-                                        &settings,
+                                        &mut settings,
+                                        &mut settings_flags,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4360,7 +4469,8 @@ fn main() {
                                         &mut capture_requests,
                                         &mut ui_state,
                                         window,
-                                        &settings,
+                                        &mut settings,
+                                        &mut settings_flags,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4398,7 +4508,8 @@ fn main() {
                                         &mut capture_requests,
                                         &mut ui_state,
                                         window,
-                                        &settings,
+                                        &mut settings,
+                                        &mut settings_flags,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4451,6 +4562,8 @@ fn main() {
                             console_async_sender.clone(),
                             &log_filter_state,
                             &mut capture_requests,
+                            &mut settings,
+                            &mut settings_flags,
                             capture_completed,
                             capture_failures,
                             capture_last_error.as_deref(),
@@ -4534,7 +4647,17 @@ fn main() {
                         ui_regression.as_ref().map(|_| UiRegressionChecks::new(resolution.ui_points));
                     let mut ui_ctx = ui_facade.begin_frame(frame_input);
                     ui_state.console_open = console.is_blocking();
-                    ui_facade.build_ui(&mut ui_ctx, &mut ui_state, &mut settings);
+                    let mut config_profiles = list_config_profiles(&path_policy);
+                    if !config_profiles.contains(&settings.active_profile) {
+                        config_profiles.push(settings.active_profile.clone());
+                    }
+                    config_profiles.sort();
+                    ui_facade.build_ui(
+                        &mut ui_ctx,
+                        &mut ui_state,
+                        &mut settings,
+                        &config_profiles,
+                    );
                     if let Some(checks) = ui_regression_checks.as_mut() {
                         checks.record_min_font(egui_min_font_px(&ui_ctx.egui_ctx));
                         checks.record_ui_bounds(ui_ctx.egui_ctx.used_rect());
@@ -4545,7 +4668,11 @@ fn main() {
                         ui_draw.output.wants_keyboard,
                         ui_draw.output.wants_pointer,
                     );
-                    if ui_draw.output.settings_changed {
+                    let settings_changed =
+                        ui_draw.output.settings_changed || settings_flags.take_settings_changed();
+                    let display_settings_changed = ui_draw.output.display_settings_changed
+                        || settings_flags.take_display_changed();
+                    if settings_changed {
                         if ui_regression.is_none() {
                             if let Err(err) = settings.save() {
                                 eprintln!("settings save failed: {}", err);
@@ -4555,7 +4682,7 @@ fn main() {
                             audio.set_master_volume(settings.master_volume);
                         }
                     }
-                    if ui_draw.output.display_settings_changed {
+                    if display_settings_changed {
                         apply_window_settings(window, &settings);
                         renderer.resize(renderer.window_inner_size());
                         if settings.window_mode != last_window_mode
@@ -6293,6 +6420,122 @@ fn parse_smoke_sleep_ms(args: &CommandArgs, usage: &str) -> Result<u64, String> 
     Ok(ms)
 }
 
+fn settings_field_value(settings: &Settings, field: &str) -> Option<String> {
+    match field {
+        "ui_scale" => Some(format!("{:.3}", settings.ui_scale)),
+        "vsync" => Some(format_settings_bool(settings.vsync).to_string()),
+        "master_volume" => Some(format!("{:.3}", settings.master_volume)),
+        "window_mode" => Some(settings.window_mode.as_str().to_string()),
+        "resolution" => Some(format!(
+            "{}x{}",
+            settings.resolution[0], settings.resolution[1]
+        )),
+        "active_profile" => Some(settings.active_profile.clone()),
+        _ => None,
+    }
+}
+
+fn is_settings_field(field: &str) -> bool {
+    matches!(
+        field,
+        "ui_scale" | "vsync" | "master_volume" | "window_mode" | "resolution" | "active_profile"
+    )
+}
+
+fn format_settings_bool(value: bool) -> &'static str {
+    if value {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+fn parse_settings_bool(value: &str) -> Result<bool, String> {
+    match value.trim() {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("invalid bool value: {}", value)),
+    }
+}
+
+fn apply_settings_field(
+    settings: &mut Settings,
+    field: &str,
+    value: &str,
+    flags: &mut SettingsChangeFlags,
+) -> Result<Option<(String, String)>, String> {
+    let before = settings_field_value(settings, field);
+    let mut display_changed = false;
+    match field {
+        "ui_scale" => {
+            let parsed = value
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| format!("invalid ui_scale: {}", value))?;
+            settings.ui_scale = parsed;
+            settings.normalize();
+        }
+        "vsync" => {
+            settings.vsync = parse_settings_bool(value)?;
+        }
+        "master_volume" => {
+            let parsed = value
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| format!("invalid master_volume: {}", value))?;
+            settings.master_volume = parsed;
+            settings.normalize();
+        }
+        "window_mode" => {
+            let mode = WindowMode::parse(value)
+                .ok_or_else(|| format!("invalid window_mode: {}", value))?;
+            settings.window_mode = mode;
+            display_changed = true;
+        }
+        "resolution" => {
+            let parsed =
+                parse_resolution(value).ok_or_else(|| format!("invalid resolution: {}", value))?;
+            settings.resolution = parsed;
+            settings.normalize();
+            display_changed = true;
+        }
+        "active_profile" => {
+            let profile = normalize_profile_name(value)?;
+            if settings.active_profile != profile {
+                settings.active_profile = profile;
+            }
+        }
+        _ => return Ok(None),
+    }
+    let after = settings_field_value(settings, field);
+    match (before, after) {
+        (Some(old), Some(new)) if old != new => {
+            flags.mark_settings(display_changed);
+            Ok(Some((old, new)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_persistable_cvar(entry: &engine_core::control_plane::CvarEntry) -> bool {
+    let flags = entry.def.flags;
+    !flags.contains(engine_core::control_plane::CvarFlags::NO_PERSIST)
+        && !flags.contains(engine_core::control_plane::CvarFlags::READ_ONLY)
+}
+
+fn parse_config_kv_line(line: &str) -> Option<(String, String)> {
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    let value = value.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some((key.to_string(), value.to_string()))
+    }
+}
+
 fn setup_ui_regression(
     ui_state: &mut UiState,
     console: &mut ConsoleState,
@@ -6645,6 +6888,8 @@ struct PalletCommandUser<'a> {
     quake_dir: Option<PathBuf>,
     console_async: ConsoleAsyncSender,
     capture_requests: &'a mut VecDeque<CaptureRequest>,
+    settings: &'a mut Settings,
+    settings_flags: &'a mut SettingsChangeFlags,
 }
 
 impl<'a> ExecPathResolver for PalletCommandUser<'a> {
@@ -6697,6 +6942,8 @@ fn dispatch_console_line(
     console_async: ConsoleAsyncSender,
     log_filter_state: &Arc<Mutex<LogFilterState>>,
     capture_requests: &mut VecDeque<CaptureRequest>,
+    settings: &mut Settings,
+    settings_flags: &mut SettingsChangeFlags,
 ) {
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
@@ -6710,6 +6957,8 @@ fn dispatch_console_line(
                 quake_dir,
                 console_async,
                 capture_requests,
+                settings,
+                settings_flags,
             };
             commands.dispatch_line(line, cvars, console, &mut user)
         }
@@ -6744,6 +6993,8 @@ fn dispatch_smoke_command(
     console_async: ConsoleAsyncSender,
     log_filter_state: &Arc<Mutex<LogFilterState>>,
     capture_requests: &mut VecDeque<CaptureRequest>,
+    settings: &mut Settings,
+    settings_flags: &mut SettingsChangeFlags,
 ) -> Result<(), String> {
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
@@ -6757,6 +7008,8 @@ fn dispatch_smoke_command(
                 quake_dir,
                 console_async,
                 capture_requests,
+                settings,
+                settings_flags,
             };
             commands.dispatch(&parsed.name, &parsed.args, cvars, console, &mut user)
         }
@@ -7227,6 +7480,283 @@ fn build_command_registry<'a>(
         "capture_frame",
         Box::new(move |ctx, args| {
             queue_capture_request(ctx, args, CaptureKind::Frame, capture_include_id)
+        }),
+    )?;
+    commands.set_handler(
+        "settings_list",
+        Box::new(|ctx, _args| {
+            let fields = [
+                "ui_scale",
+                "vsync",
+                "master_volume",
+                "window_mode",
+                "resolution",
+                "active_profile",
+            ];
+            for field in fields {
+                if let Some(value) = settings_field_value(ctx.user.settings, field) {
+                    ctx.output.push_line(format!("{field} = {value}"));
+                }
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "settings_get",
+        Box::new(|ctx, args| {
+            let field = args
+                .positional(0)
+                .ok_or_else(|| "usage: settings_get <field>".to_string())?;
+            if let Some(value) = settings_field_value(ctx.user.settings, field) {
+                ctx.output.push_line(format!("{field} = {value}"));
+                Ok(())
+            } else {
+                Err(format!("unknown settings field: {field}"))
+            }
+        }),
+    )?;
+    commands.set_handler(
+        "settings_set",
+        Box::new(|ctx, args| {
+            let field = args
+                .positional(0)
+                .ok_or_else(|| "usage: settings_set <field> <value>".to_string())?;
+            let value = args
+                .positional(1)
+                .ok_or_else(|| "usage: settings_set <field> <value>".to_string())?;
+            let change =
+                apply_settings_field(ctx.user.settings, field, value, ctx.user.settings_flags)?;
+            if let Some((old, new)) = change {
+                ctx.output.push_line(format!("{field}: {old} -> {new}"));
+            } else {
+                ctx.output.push_line(format!("{field}: unchanged"));
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "settings_reset",
+        Box::new(|ctx, _args| {
+            let active_profile = ctx.user.settings.active_profile.clone();
+            let previous = ctx.user.settings.clone();
+            let mut next = Settings {
+                active_profile,
+                ..Settings::default()
+            };
+            next.normalize();
+            let display_changed =
+                previous.window_mode != next.window_mode || previous.resolution != next.resolution;
+            let settings_changed = previous.ui_scale != next.ui_scale
+                || previous.vsync != next.vsync
+                || previous.master_volume != next.master_volume
+                || previous.window_mode != next.window_mode
+                || previous.resolution != next.resolution
+                || previous.active_profile != next.active_profile;
+            *ctx.user.settings = next;
+            if settings_changed {
+                ctx.user.settings_flags.mark_settings(display_changed);
+                ctx.output.push_line("settings_reset: ok".to_string());
+            } else {
+                ctx.output
+                    .push_line("settings_reset: no changes".to_string());
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "cfg_list",
+        Box::new(|ctx, _args| {
+            let mut profiles = list_config_profiles(ctx.user.path_policy);
+            let active = ctx.user.settings.active_profile.clone();
+            if !profiles.contains(&active) {
+                profiles.push(active.clone());
+            }
+            profiles.sort();
+            ctx.output
+                .push_line(format!("cfg profiles (active: {active})"));
+            for profile in profiles {
+                if profile == active {
+                    ctx.output.push_line(format!("* {profile}"));
+                } else {
+                    ctx.output.push_line(format!("- {profile}"));
+                }
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "cfg_select",
+        Box::new(|ctx, args| {
+            let name = args
+                .positional(0)
+                .ok_or_else(|| "usage: cfg_select <name>".to_string())?;
+            let profile = normalize_profile_name(name)?;
+            if ctx.user.settings.active_profile != profile {
+                let old = ctx.user.settings.active_profile.clone();
+                ctx.user.settings.active_profile = profile.clone();
+                ctx.user.settings_flags.mark_settings(false);
+                ctx.output
+                    .push_line(format!("active_profile: {old} -> {profile}"));
+            } else {
+                ctx.output
+                    .push_line("active_profile: unchanged".to_string());
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "cfg_save",
+        Box::new(|ctx, args| {
+            let name = args
+                .positional(0)
+                .ok_or_else(|| "usage: cfg_save <name>".to_string())?;
+            let profile = normalize_profile_name(name)?;
+            let path = config_path_for_profile(&profile);
+            let mut settings_snapshot = ctx.user.settings.clone();
+            settings_snapshot.active_profile = profile.clone();
+            let mut lines = settings_lines(&settings_snapshot);
+            let mut entries: Vec<_> = ctx
+                .cvars
+                .list()
+                .into_iter()
+                .filter(|entry| is_persistable_cvar(entry))
+                .collect();
+            entries.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+            for entry in entries {
+                lines.push(format!("{}={}", entry.def.name, entry.value.display()));
+            }
+            write_config_lines(&path, &lines).map_err(|err| format!("cfg_save failed: {}", err))?;
+            ctx.output
+                .push_line(format!("cfg_save: {}", path.display()));
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "cfg_load",
+        Box::new(|ctx, args| {
+            let name = args
+                .positional(0)
+                .ok_or_else(|| "usage: cfg_load <name>".to_string())?;
+            let profile = normalize_profile_name(name)?;
+            let path = resolve_profile_path(ctx.user.path_policy, &profile)?;
+            let contents = std::fs::read_to_string(&path)
+                .map_err(|err| format!("cfg_load failed: {}", err))?;
+            let mut staged_settings = ctx.user.settings.clone();
+            let mut staged_cvars = ctx.cvars.clone();
+            let mut staged_flags = SettingsChangeFlags::default();
+            let mut settings_changes = Vec::new();
+            let mut cvar_changes = Vec::new();
+            let mut command_lines = Vec::new();
+            let mut warnings = Vec::new();
+            for (index, line) in contents.lines().enumerate() {
+                let line_no = index + 1;
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                    continue;
+                }
+                if let Some((key, value)) = parse_config_kv_line(trimmed) {
+                    if key == "active_profile" || key == "version" {
+                        continue;
+                    }
+                    if is_settings_field(&key) {
+                        match apply_settings_field(
+                            &mut staged_settings,
+                            &key,
+                            &value,
+                            &mut staged_flags,
+                        ) {
+                            Ok(Some(change)) => {
+                                settings_changes
+                                    .push(format!("settings {key}: {} -> {}", change.0, change.1));
+                            }
+                            Ok(None) => {}
+                            Err(err) => warnings.push(format!(
+                                "cfg_load warning: {} line {}: {}",
+                                path.display(),
+                                line_no,
+                                err
+                            )),
+                        }
+                        continue;
+                    }
+                    if let Some(entry) = staged_cvars.get_by_name(&key) {
+                        let before = entry.value.display();
+                        match staged_cvars.set_from_str(&key, &value) {
+                            Ok(parsed) => {
+                                let after = parsed.display();
+                                if before != after {
+                                    cvar_changes.push(format!("cvar {key}: {before} -> {after}"));
+                                }
+                            }
+                            Err(err) => warnings.push(format!(
+                                "cfg_load warning: {} line {}: {}",
+                                path.display(),
+                                line_no,
+                                err
+                            )),
+                        }
+                        continue;
+                    }
+                    warnings.push(format!(
+                        "cfg_load warning: {} line {}: unknown key {}",
+                        path.display(),
+                        line_no,
+                        key
+                    ));
+                    continue;
+                }
+                match parse_command_line(trimmed) {
+                    Ok(Some(parsed)) => command_lines.push((line_no, parsed)),
+                    Ok(None) => continue,
+                    Err(err) => warnings.push(format!(
+                        "cfg_load warning: {} line {}: {}",
+                        path.display(),
+                        line_no,
+                        err
+                    )),
+                }
+            }
+            if staged_settings.active_profile != profile {
+                let old = staged_settings.active_profile.clone();
+                staged_settings.active_profile = profile.clone();
+                staged_flags.mark_settings(false);
+                settings_changes.push(format!("active_profile: {old} -> {profile}"));
+            }
+
+            *ctx.user.settings = staged_settings;
+            *ctx.cvars = staged_cvars;
+
+            let mut registry = build_command_registry(core_cvars)?;
+            for (line_no, parsed) in command_lines {
+                if let Err(err) =
+                    registry.dispatch(&parsed.name, &parsed.args, ctx.cvars, ctx.output, ctx.user)
+                {
+                    warnings.push(format!(
+                        "cfg_load warning: {} line {}: {}",
+                        path.display(),
+                        line_no,
+                        err
+                    ));
+                }
+            }
+
+            for line in settings_changes {
+                ctx.output.push_line(line);
+            }
+            for line in cvar_changes {
+                ctx.output.push_line(line);
+            }
+            for warning in warnings {
+                ctx.output.push_line(warning);
+            }
+            if staged_flags.settings_changed {
+                ctx.user
+                    .settings_flags
+                    .mark_settings(staged_flags.display_changed);
+            }
+            ctx.output
+                .push_line(format!("cfg_load: {}", path.display()));
+            Ok(())
         }),
     )?;
     commands.set_fallback(Box::new(|ctx, name, args| {
@@ -8435,7 +8965,8 @@ fn handle_non_video_key_input(
     capture_requests: &mut VecDeque<CaptureRequest>,
     ui_state: &mut UiState,
     window: &Window,
-    settings: &Settings,
+    settings: &mut Settings,
+    settings_flags: &mut SettingsChangeFlags,
     console_fullscreen_override: &mut bool,
     input: &mut InputState,
     mouse_look: &mut bool,
@@ -8542,6 +9073,8 @@ fn handle_non_video_key_input(
                                 console_async.clone(),
                                 log_filter_state,
                                 capture_requests,
+                                settings,
+                                settings_flags,
                             );
                         }
                     }

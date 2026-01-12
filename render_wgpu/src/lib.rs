@@ -19,6 +19,13 @@ pub use wgpu::SurfaceError as RenderError;
 
 mod text_overlay;
 
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 #[derive(Debug)]
 pub enum RenderInitError {
     Surface(wgpu::CreateSurfaceError),
@@ -256,12 +263,12 @@ impl UploadQueue {
     }
 
     pub fn set_limits(&self, limits: UploadLimits) {
-        let mut state = self.inner.state.lock().expect("upload queue lock poisoned");
+        let mut state = lock_unpoisoned(&self.inner.state);
         state.limits = limits;
     }
 
     pub fn metrics(&self) -> UploadQueueMetrics {
-        let state = self.inner.state.lock().expect("upload queue lock poisoned");
+        let state = lock_unpoisoned(&self.inner.state);
         UploadQueueMetrics {
             queued_jobs: state.queued_jobs(),
             queued_bytes: state.queued_bytes,
@@ -285,7 +292,7 @@ impl UploadQueue {
             payload: UploadPayload::Image { image },
         };
 
-        let mut state = self.inner.state.lock().expect("upload queue lock poisoned");
+        let mut state = lock_unpoisoned(&self.inner.state);
         state.push_job(job);
         state.queued_bytes = state.queued_bytes.saturating_add(bytes);
 
@@ -307,7 +314,7 @@ impl UploadQueue {
 
         loop {
             let job = {
-                let mut state = self.inner.state.lock().expect("upload queue lock poisoned");
+                let mut state = lock_unpoisoned(&self.inner.state);
                 let Some(job) = state.pop_next() else {
                     break;
                 };
@@ -353,7 +360,7 @@ impl UploadQueue {
         }
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        let mut state = self.inner.state.lock().expect("upload queue lock poisoned");
+        let mut state = lock_unpoisoned(&self.inner.state);
         state.last_drain_ms = Some(elapsed_ms);
         state.last_drain_jobs = drained_jobs;
         state.last_drain_bytes = drained_bytes;
@@ -379,7 +386,7 @@ pub struct UploadHandle<T> {
 
 impl<T> UploadHandle<T> {
     pub fn status(&self) -> UploadStatus {
-        let guard = self.slot.state.lock().expect("upload slot lock poisoned");
+        let guard = lock_unpoisoned(&self.slot.state);
         guard.status
     }
 
@@ -387,14 +394,14 @@ impl<T> UploadHandle<T> {
     where
         T: Any + Send + Sync + 'static,
     {
-        let guard = self.slot.state.lock().expect("upload slot lock poisoned");
+        let guard = lock_unpoisoned(&self.slot.state);
         let value = guard.value.as_ref()?;
         let value = Arc::clone(value);
         Arc::downcast::<T>(value).ok()
     }
 
     pub fn error(&self) -> Option<String> {
-        let guard = self.slot.state.lock().expect("upload slot lock poisoned");
+        let guard = lock_unpoisoned(&self.slot.state);
         guard.error.clone()
     }
 }
@@ -449,19 +456,19 @@ impl UploadSlot {
     }
 
     fn mark_uploading(&self) {
-        let mut guard = self.state.lock().expect("upload slot lock poisoned");
+        let mut guard = lock_unpoisoned(&self.state);
         guard.status = UploadStatus::Uploading;
     }
 
     fn finish(&self, value: Arc<dyn Any + Send + Sync>, upload_ms: u64) {
-        let mut guard = self.state.lock().expect("upload slot lock poisoned");
+        let mut guard = lock_unpoisoned(&self.state);
         guard.status = UploadStatus::Ready;
         guard.value = Some(value);
         guard.upload_ms = Some(upload_ms);
     }
 
     fn fail(&self, message: &str) {
-        let mut guard = self.state.lock().expect("upload slot lock poisoned");
+        let mut guard = lock_unpoisoned(&self.state);
         guard.status = UploadStatus::Failed;
         guard.error = Some(message.to_string());
         guard.upload_ms = Some(0);

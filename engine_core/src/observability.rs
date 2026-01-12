@@ -3,6 +3,13 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::logging;
 
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn sticky_cell() -> &'static Mutex<Option<String>> {
     static STICKY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     STICKY.get_or_init(|| Mutex::new(None))
@@ -10,18 +17,18 @@ fn sticky_cell() -> &'static Mutex<Option<String>> {
 
 pub fn set_sticky_error(message: impl Into<String>) {
     let message = message.into();
-    let mut guard = sticky_cell().lock().expect("sticky error lock poisoned");
+    let mut guard = lock_unpoisoned(sticky_cell());
     *guard = Some(message.clone());
     logging::error(message);
 }
 
 pub fn clear_sticky_error() {
-    let mut guard = sticky_cell().lock().expect("sticky error lock poisoned");
+    let mut guard = lock_unpoisoned(sticky_cell());
     *guard = None;
 }
 
 pub fn sticky_error() -> Option<String> {
-    let guard = sticky_cell().lock().expect("sticky error lock poisoned");
+    let guard = lock_unpoisoned(sticky_cell());
     guard.clone()
 }
 

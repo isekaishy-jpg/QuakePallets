@@ -9,6 +9,7 @@ const MAX_UI_SCALE: f32 = 2.0;
 const DEFAULT_RESOLUTION: [u32; 2] = [1280, 720];
 const MIN_RESOLUTION: [u32; 2] = [640, 480];
 const MAX_RESOLUTION: [u32; 2] = [7680, 4320];
+const DEFAULT_PROFILE_NAME: &str = "config.cfg";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowMode {
@@ -52,6 +53,7 @@ pub struct Settings {
     pub master_volume: f32,
     pub window_mode: WindowMode,
     pub resolution: [u32; 2],
+    pub active_profile: String,
 }
 
 impl Default for Settings {
@@ -63,29 +65,38 @@ impl Default for Settings {
             master_volume: 1.0,
             window_mode: WindowMode::Windowed,
             resolution: DEFAULT_RESOLUTION,
+            active_profile: DEFAULT_PROFILE_NAME.to_string(),
         }
     }
 }
 
 impl Settings {
     pub fn load() -> Self {
+        let path = settings_path();
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if let Some(settings) = Self::parse(&contents) {
+                return settings;
+            }
+        }
         let config_path = config_path();
         if let Ok(contents) = fs::read_to_string(&config_path) {
             if let Some(settings) = Self::parse(&contents) {
                 return settings;
             }
         }
-        let path = settings_path();
-        let Ok(contents) = fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        Self::parse(&contents).unwrap_or_else(Self::default)
+        let legacy_path = legacy_config_path();
+        if let Ok(contents) = fs::read_to_string(&legacy_path) {
+            if let Some(settings) = Self::parse(&contents) {
+                return settings;
+            }
+        }
+        Self::default()
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let data = format_settings_lines(self);
+        let data = settings_lines(self);
         write_config_lines(&settings_path(), &data)?;
-        merge_config_lines(&config_path(), &data)?;
+        merge_config_lines(&config_path_for_profile(&self.active_profile), &data)?;
         Ok(())
     }
 
@@ -112,7 +123,7 @@ impl Settings {
                     }
                 }
                 "vsync" => {
-                    if let Ok(value) = value.parse::<bool>() {
+                    if let Some(value) = parse_bool(value) {
                         settings.vsync = value;
                     }
                 }
@@ -131,6 +142,11 @@ impl Settings {
                         settings.resolution = value;
                     }
                 }
+                "active_profile" => {
+                    if let Some(profile) = sanitize_profile_name(value) {
+                        settings.active_profile = profile;
+                    }
+                }
                 _ => {}
             }
         }
@@ -139,11 +155,17 @@ impl Settings {
                 return Some(Self::default());
             }
         }
-        settings.ui_scale = settings.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
-        settings.master_volume = settings.master_volume.clamp(0.0, 1.0);
-        settings.resolution = clamp_resolution(settings.resolution);
+        settings.normalize();
         settings.version = SETTINGS_VERSION;
         Some(settings)
+    }
+
+    pub fn normalize(&mut self) {
+        self.ui_scale = self.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+        self.master_volume = self.master_volume.clamp(0.0, 1.0);
+        self.resolution = clamp_resolution(self.resolution);
+        self.active_profile = sanitize_profile_name(&self.active_profile)
+            .unwrap_or_else(|| DEFAULT_PROFILE_NAME.to_string());
     }
 }
 
@@ -152,24 +174,72 @@ fn settings_path() -> PathBuf {
 }
 
 fn config_path() -> PathBuf {
+    config_path_for_profile(DEFAULT_PROFILE_NAME)
+}
+
+fn legacy_config_path() -> PathBuf {
     user_config_root().join("config.cfg")
 }
 
-fn format_settings_lines(settings: &Settings) -> Vec<String> {
+pub fn default_profile_name() -> &'static str {
+    DEFAULT_PROFILE_NAME
+}
+
+pub fn config_path_for_profile(profile: &str) -> PathBuf {
+    user_config_root()
+        .join("config")
+        .join("cvars")
+        .join(profile)
+}
+
+pub fn settings_lines(settings: &Settings) -> Vec<String> {
     vec![
         format!("version={}", SETTINGS_VERSION),
         format!("ui_scale={:.3}", settings.ui_scale),
-        format!("vsync={}", settings.vsync),
+        format!("vsync={}", format_bool(settings.vsync)),
         format!("master_volume={:.3}", settings.master_volume),
         format!("window_mode={}", settings.window_mode.as_str()),
         format!(
             "resolution={}x{}",
             settings.resolution[0], settings.resolution[1]
         ),
+        format!("active_profile={}", settings.active_profile),
     ]
 }
 
-fn write_config_lines(path: &PathBuf, lines: &[String]) -> std::io::Result<()> {
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn format_bool(value: bool) -> &'static str {
+    if value {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+fn sanitize_profile_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains(':') {
+        return None;
+    }
+    let name = if trimmed.to_ascii_lowercase().ends_with(".cfg") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.cfg")
+    };
+    Some(name)
+}
+
+pub fn write_config_lines(path: &PathBuf, lines: &[String]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -178,7 +248,7 @@ fn write_config_lines(path: &PathBuf, lines: &[String]) -> std::io::Result<()> {
     fs::write(path, data)
 }
 
-fn merge_config_lines(path: &PathBuf, settings_lines: &[String]) -> std::io::Result<()> {
+pub fn merge_config_lines(path: &PathBuf, settings_lines: &[String]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -216,7 +286,7 @@ fn merge_config_lines(path: &PathBuf, settings_lines: &[String]) -> std::io::Res
     write_config_lines(path, &merged)
 }
 
-fn parse_resolution(value: &str) -> Option<[u32; 2]> {
+pub fn parse_resolution(value: &str) -> Option<[u32; 2]> {
     let (width, height) = value
         .split_once('x')
         .or_else(|| value.split_once(','))

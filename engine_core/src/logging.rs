@@ -27,18 +27,25 @@ fn default_logger(level: LogLevel, message: &str) {
     eprintln!("[{}] {}", level, message);
 }
 
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn logger_cell() -> &'static Mutex<Logger> {
     static LOGGER: OnceLock<Mutex<Logger>> = OnceLock::new();
     LOGGER.get_or_init(|| Mutex::new(Box::new(default_logger)))
 }
 
 pub fn set_logger(logger: impl Fn(LogLevel, &str) + Send + Sync + 'static) {
-    let mut guard = logger_cell().lock().expect("logger lock poisoned");
+    let mut guard = lock_unpoisoned(logger_cell());
     *guard = Box::new(logger);
 }
 
 pub fn log(level: LogLevel, message: impl AsRef<str>) {
-    let guard = logger_cell().lock().expect("logger lock poisoned");
+    let guard = lock_unpoisoned(logger_cell());
     (guard)(level, message.as_ref());
 }
 

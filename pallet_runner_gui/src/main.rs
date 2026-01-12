@@ -2387,6 +2387,7 @@ struct RunnerUi {
     egui_ctx: Context,
     egui_state: EguiState,
     egui_renderer: EguiRenderer,
+    frame_size: winit::dpi::PhysicalSize<u32>,
 }
 
 struct RunnerDrawData {
@@ -2410,6 +2411,7 @@ impl RunnerUi {
             egui_ctx,
             egui_state,
             egui_renderer,
+            frame_size: window.inner_size(),
         }
     }
 
@@ -2417,9 +2419,25 @@ impl RunnerUi {
         self.egui_state.on_window_event(window, event).consumed
     }
 
-    fn begin_frame(&mut self, window: &Window, time_seconds: f64) -> Context {
+    fn begin_frame(
+        &mut self,
+        window: &Window,
+        time_seconds: f64,
+        frame_size: winit::dpi::PhysicalSize<u32>,
+    ) -> Context {
         let mut raw_input = self.egui_state.take_egui_input(window);
+        let pixels_per_point = egui_winit::pixels_per_point(&self.egui_ctx, window);
+        let screen_size = egui::vec2(
+            frame_size.width as f32 / pixels_per_point,
+            frame_size.height as f32 / pixels_per_point,
+        );
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size));
+        if let Some(viewport) = raw_input.viewports.get_mut(&egui::ViewportId::ROOT) {
+            viewport.native_pixels_per_point = Some(pixels_per_point);
+            viewport.inner_rect = raw_input.screen_rect;
+        }
         raw_input.time = Some(time_seconds);
+        self.frame_size = frame_size;
         self.egui_ctx.begin_frame(raw_input);
         self.egui_ctx.clone()
     }
@@ -2435,10 +2453,7 @@ impl RunnerUi {
             paint_jobs,
             textures_delta: full_output.textures_delta,
             screen_descriptor: ScreenDescriptor {
-                size_in_pixels: {
-                    let size = window.inner_size();
-                    [size.width, size.height]
-                },
+                size_in_pixels: [self.frame_size.width, self.frame_size.height],
                 pixels_per_point: egui_winit::pixels_per_point(&self.egui_ctx, window),
             },
         }
@@ -2513,7 +2528,6 @@ fn main() {
     let mut app = RunnerApp::new();
     let start_time = Instant::now();
     let mut last_frame = start_time;
-    let mut pending_resize = false;
 
     window.set_visible(true);
 
@@ -2530,22 +2544,20 @@ fn main() {
                     }
                     WindowEvent::Resized(size) => {
                         if size.width > 0 && size.height > 0 {
-                            if !app.custom_maximized {
+                            if !window.is_maximized() && !app.custom_maximized {
                                 app.last_windowed_size = size;
                             }
                             renderer.resize(size);
-                            pending_resize = false;
                         }
                     }
                     WindowEvent::ScaleFactorChanged { .. } => {
                         let size = renderer.window_inner_size();
                         if size.width > 0 && size.height > 0 {
                             renderer.resize(size);
-                            pending_resize = false;
                         }
                     }
                     WindowEvent::Moved(position) => {
-                        if !app.custom_maximized {
+                        if !window.is_maximized() && !app.custom_maximized {
                             app.last_windowed_pos = position;
                         }
                     }
@@ -2554,32 +2566,24 @@ fn main() {
                         if size.width == 0 || size.height == 0 {
                             return;
                         }
-                        if pending_resize {
+                        if size != renderer.size() {
                             renderer.resize(size);
-                            pending_resize = false;
-                            return;
                         }
                         let now = Instant::now();
                         let time_seconds = (now - start_time).as_secs_f64();
                         let _dt = now - last_frame;
                         last_frame = now;
 
-                        let ctx = ui.begin_frame(window, time_seconds);
+                        let ctx = ui.begin_frame(window, time_seconds, size);
                         app.ui(&ctx, window);
                         if let Some(action) = app.take_window_action() {
                             match action {
                                 WindowAction::Minimize => window.set_minimized(true),
                                 WindowAction::MaximizeToggle => {
-                                    // TODO(runner): Custom maximize resizes the window, but the UI layout
-                                    // does not expand; needs follow-up before enabling real maximize behavior.
                                     if app.custom_maximized {
                                         app.custom_maximized = false;
                                         let _ = window.request_inner_size(app.last_windowed_size);
                                         window.set_outer_position(app.last_windowed_pos);
-                                        pending_resize = true;
-                                    } else if window.is_maximized() {
-                                        window.set_maximized(false);
-                                        pending_resize = true;
                                     } else {
                                         app.custom_maximized = true;
                                         app.last_windowed_size = window.inner_size();
@@ -2590,10 +2594,10 @@ fn main() {
                                             .current_monitor()
                                             .or_else(|| window.primary_monitor())
                                         {
+                                            let target_size = monitor.size();
                                             window.set_outer_position(monitor.position());
-                                            let _ = window.request_inner_size(monitor.size());
+                                            let _ = window.request_inner_size(target_size);
                                         }
-                                        pending_resize = true;
                                     }
                                 }
                                 WindowAction::Close => {

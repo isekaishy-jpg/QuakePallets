@@ -476,7 +476,13 @@ impl AssetManager {
             .config
             .lock()
             .expect("asset config lock poisoned");
-        guard.sync_policy = policy;
+        let effective = if matches!(policy, SyncLoadPolicy::Panic) && !cfg!(debug_assertions) {
+            logging::warn("sync load panic policy is disabled in release builds; using warn");
+            SyncLoadPolicy::Warn
+        } else {
+            policy
+        };
+        guard.sync_policy = effective;
     }
 
     pub fn begin_tick(&self) {
