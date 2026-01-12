@@ -16,6 +16,10 @@ pub enum BspError {
         size: u32,
         stride: u32,
     },
+    LumpTooLarge {
+        lump: LumpType,
+        count: usize,
+    },
 }
 
 impl fmt::Display for BspError {
@@ -37,6 +41,14 @@ impl fmt::Display for BspError {
                 size,
                 stride
             ),
+            BspError::LumpTooLarge { lump, count } => {
+                write!(
+                    f,
+                    "bsp lump is too large: {} (count {})",
+                    lump.name(),
+                    count
+                )
+            }
         }
     }
 }
@@ -278,6 +290,8 @@ fn parse_header(data: &[u8]) -> Result<BspHeader, BspError> {
 }
 
 fn parse_planes(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Plane>, BspError> {
+    const MAX_LUMP_ELEMENTS: usize = 1_000_000;
+
     let lump = lumps[LumpType::Planes as usize];
     if lump.length == 0 {
         return Ok(Vec::new());
@@ -291,7 +305,14 @@ fn parse_planes(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Plane>, B
     }
 
     let slice = lump_slice(data, lump);
-    let mut planes = Vec::with_capacity(slice.len() / 20);
+    let count = slice.len() / 20;
+    if count > MAX_LUMP_ELEMENTS {
+        return Err(BspError::LumpTooLarge {
+            lump: LumpType::Planes,
+            count,
+        });
+    }
+    let mut planes = Vec::with_capacity(count);
     for chunk in slice.chunks_exact(20) {
         planes.push(Plane {
             normal: [
@@ -307,6 +328,8 @@ fn parse_planes(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Plane>, B
 }
 
 fn parse_vertices(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[f32; 3]>, BspError> {
+    const MAX_LUMP_ELEMENTS: usize = 1_000_000;
+
     let lump = lumps[LumpType::Vertices as usize];
     if lump.length == 0 {
         return Ok(Vec::new());
@@ -320,7 +343,14 @@ fn parse_vertices(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[f32; 3
     }
 
     let slice = lump_slice(data, lump);
-    let mut vertices = Vec::with_capacity(slice.len() / 12);
+    let count = slice.len() / 12;
+    if count > MAX_LUMP_ELEMENTS {
+        return Err(BspError::LumpTooLarge {
+            lump: LumpType::Vertices,
+            count,
+        });
+    }
+    let mut vertices = Vec::with_capacity(count);
     for chunk in slice.chunks_exact(12) {
         vertices.push([
             read_f32_le(&chunk[0..4]),
@@ -332,6 +362,8 @@ fn parse_vertices(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[f32; 3
 }
 
 fn parse_edges(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[u16; 2]>, BspError> {
+    const MAX_LUMP_ELEMENTS: usize = 1_000_000;
+
     let lump = lumps[LumpType::Edges as usize];
     if lump.length == 0 {
         return Ok(Vec::new());
@@ -345,7 +377,14 @@ fn parse_edges(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[u16; 2]>,
     }
 
     let slice = lump_slice(data, lump);
-    let mut edges = Vec::with_capacity(slice.len() / 4);
+    let count = slice.len() / 4;
+    if count > MAX_LUMP_ELEMENTS {
+        return Err(BspError::LumpTooLarge {
+            lump: LumpType::Edges,
+            count,
+        });
+    }
+    let mut edges = Vec::with_capacity(count);
     for chunk in slice.chunks_exact(4) {
         edges.push([read_u16_le(&chunk[0..2]), read_u16_le(&chunk[2..4])]);
     }
@@ -353,6 +392,8 @@ fn parse_edges(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<[u16; 2]>,
 }
 
 fn parse_surfedges(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<i32>, BspError> {
+    const MAX_LUMP_ELEMENTS: usize = 1_000_000;
+
     let lump = lumps[LumpType::SurfEdges as usize];
     if lump.length == 0 {
         return Ok(Vec::new());
@@ -366,7 +407,14 @@ fn parse_surfedges(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<i32>, 
     }
 
     let slice = lump_slice(data, lump);
-    let mut surfedges = Vec::with_capacity(slice.len() / 4);
+    let count = slice.len() / 4;
+    if count > MAX_LUMP_ELEMENTS {
+        return Err(BspError::LumpTooLarge {
+            lump: LumpType::SurfEdges,
+            count,
+        });
+    }
+    let mut surfedges = Vec::with_capacity(count);
     for chunk in slice.chunks_exact(4) {
         surfedges.push(read_i32_le(&chunk[0..4]));
     }
@@ -374,6 +422,8 @@ fn parse_surfedges(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<i32>, 
 }
 
 fn parse_faces(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Face>, BspError> {
+    const MAX_LUMP_ELEMENTS: usize = 1_000_000;
+
     let lump = lumps[LumpType::Faces as usize];
     if lump.length == 0 {
         return Ok(Vec::new());
@@ -387,7 +437,14 @@ fn parse_faces(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Face>, Bsp
     }
 
     let slice = lump_slice(data, lump);
-    let mut faces = Vec::with_capacity(slice.len() / 20);
+    let count = slice.len() / 20;
+    if count > MAX_LUMP_ELEMENTS {
+        return Err(BspError::LumpTooLarge {
+            lump: LumpType::Faces,
+            count,
+        });
+    }
+    let mut faces = Vec::with_capacity(count);
     for chunk in slice.chunks_exact(20) {
         let plane_id = read_u16_le(&chunk[0..2]);
         let side = read_u16_le(&chunk[2..4]);
@@ -410,6 +467,8 @@ fn parse_faces(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Face>, Bsp
 }
 
 fn parse_clipnodes(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<ClipNode>, BspError> {
+    const MAX_LUMP_ELEMENTS: usize = 1_000_000;
+
     let lump = lumps[LumpType::ClipNodes as usize];
     if lump.length == 0 {
         return Ok(Vec::new());
@@ -423,7 +482,14 @@ fn parse_clipnodes(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<ClipNo
     }
 
     let slice = lump_slice(data, lump);
-    let mut nodes = Vec::with_capacity(slice.len() / 8);
+    let count = slice.len() / 8;
+    if count > MAX_LUMP_ELEMENTS {
+        return Err(BspError::LumpTooLarge {
+            lump: LumpType::ClipNodes,
+            count,
+        });
+    }
+    let mut nodes = Vec::with_capacity(count);
     for chunk in slice.chunks_exact(8) {
         let plane_id = read_i32_le(&chunk[0..4]);
         let child0 = read_i16_le(&chunk[4..6]) as i32;
@@ -437,6 +503,8 @@ fn parse_clipnodes(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<ClipNo
 }
 
 fn parse_models(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Model>, BspError> {
+    const MAX_LUMP_ELEMENTS: usize = 1_000_000;
+
     let lump = lumps[LumpType::Models as usize];
     if lump.length == 0 {
         return Ok(Vec::new());
@@ -450,7 +518,14 @@ fn parse_models(data: &[u8], lumps: &[Lump; LUMP_COUNT]) -> Result<Vec<Model>, B
     }
 
     let slice = lump_slice(data, lump);
-    let mut models = Vec::with_capacity(slice.len() / 64);
+    let count = slice.len() / 64;
+    if count > MAX_LUMP_ELEMENTS {
+        return Err(BspError::LumpTooLarge {
+            lump: LumpType::Models,
+            count,
+        });
+    }
+    let mut models = Vec::with_capacity(count);
     for chunk in slice.chunks_exact(64) {
         let headnode = [
             read_i32_le(&chunk[36..40]),

@@ -9,6 +9,7 @@ pub enum PakError {
     InvalidHeader,
     DirectoryOutOfBounds,
     DirectorySizeNotMultiple,
+    TooManyEntries { entries: usize },
     EntryOutOfBounds { name: String },
     NameNotUtf8,
     UnsafePath(String),
@@ -22,6 +23,9 @@ impl fmt::Display for PakError {
             PakError::DirectoryOutOfBounds => write!(f, "pak directory out of bounds"),
             PakError::DirectorySizeNotMultiple => {
                 write!(f, "pak directory size is not a multiple of 64")
+            }
+            PakError::TooManyEntries { entries } => {
+                write!(f, "pak directory has too many entries: {}", entries)
             }
             PakError::EntryOutOfBounds { name } => {
                 write!(f, "pak entry out of bounds: {}", name)
@@ -123,6 +127,8 @@ pub fn read_pak(path: &Path) -> Result<PakFile, PakError> {
 }
 
 pub fn parse_pak(data: Vec<u8>) -> Result<PakFile, PakError> {
+    const MAX_PAK_ENTRIES: usize = 100_000;
+
     if data.len() < 12 {
         return Err(PakError::InvalidHeader);
     }
@@ -143,6 +149,11 @@ pub fn parse_pak(data: Vec<u8>) -> Result<PakFile, PakError> {
     }
 
     let entry_count = dir_size / 64;
+    if entry_count > MAX_PAK_ENTRIES {
+        return Err(PakError::TooManyEntries {
+            entries: entry_count,
+        });
+    }
     let mut entries = Vec::with_capacity(entry_count);
     for i in 0..entry_count {
         let base = dir_offset + i * 64;
