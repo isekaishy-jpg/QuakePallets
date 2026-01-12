@@ -3,3 +3,4 @@ ui_regression/
 dist/
 .pallet/
 content/build/
+captures/

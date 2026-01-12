@@ -56,20 +56,20 @@ Extend the existing registry-backed control plane with developer-grade console U
 
 ### Tasks
 - [ ] Provide capture commands:
-  - [ ] `capture_screenshot [path]`
-  - [ ] `capture_frame [path]` (if distinct from screenshot)
+  - [x] `capture_screenshot [path]`
+  - [x] `capture_frame [path]` (if distinct from screenshot)
 - [ ] Output policy:
-  - [ ] consistent default directory
-  - [ ] stable naming scheme
-  - [ ] capture includes enough context in filename or sidecar (resolution, mode, map name if available)
-  - [ ] align capture naming/location with UI regression outputs where possible
+  - [x] consistent default directory
+  - [x] stable naming scheme
+  - [x] capture includes enough context in filename or sidecar (resolution, mode, map name if available)
+  - [x] align capture naming/location with UI regression outputs where possible
 - [ ] Integrate capture with console scripts:
-  - [ ] allow `exec` scripts to trigger capture
-- [ ] Ensure capture works while overlays are enabled.
-- [ ] Add cvar `capture_include_overlays` (default 1) to include/exclude overlays in capture output.
+  - [x] allow `exec` scripts to trigger capture
+- [x] Ensure capture works while overlays are enabled.
+- [x] Add cvar `capture_include_overlays` (default 1) to include/exclude overlays in capture output.
 
 **DoD**
-- [ ] A single `dev_exec` script can produce at least one capture artifact with stable naming.
+- [x] A single `dev_exec` script can produce at least one capture artifact with stable naming.
 
 ---
 
@@ -80,24 +80,24 @@ Enable non-interactive “run a scenario then exit” flows suitable for local a
 
 ### Tasks
 - [ ] Add a CLI mode that runs a provided script and exits:
-  - [ ] `--smoke <script>`
-  - [ ] `--smoke` is distinct from `--input-script` (no overlapping semantics)
+  - [x] `--smoke <script>`
+  - [x] `--smoke` is distinct from `--input-script` (no overlapping semantics)
 - [ ] Script completion semantics:
-  - [ ] Define success vs failure (exit codes)
-  - [ ] Define timeouts:
-    - [ ] `--gtimeout-ms <ms>` global timeout for the whole smoke run
-    - [ ] `ttimeout_ms <ms>` per-step timeout control inside scripts
+  - [x] Define success vs failure (exit codes)
+  - [x] Define timeouts:
+    - [x] `--gtimeout-ms <ms>` global timeout for the whole smoke run
+    - [x] `ttimeout_ms <ms>` per-step timeout control inside scripts
 - [ ] Add minimal script primitives:
-  - [ ] `sleep_ms <ms>` (sleeps for wall-clock time)
-  - [ ] `ttimeout_ms <ms>` (sets/overrides the per-script step timeout used by subsequent waits/captures)
+  - [x] `sleep_ms <ms>` (sleeps for wall-clock time)
+  - [x] `ttimeout_ms <ms>` (sets/overrides the per-script step timeout used by subsequent waits/captures)
 - [ ] Failure surfaces:
-  - [ ] on failure, print a clear reason (command + line number + error)
-  - [ ] write a summary report file
+  - [x] on failure, print a clear reason (command + line number + error)
+  - [x] write a summary report file
 
 **DoD**
-- [ ] A smoke run can execute a script, produce a capture, and exit with:
-  - [ ] code 0 on success
-  - [ ] nonzero on script/command failure or timeout
+- [x] A smoke run can execute a script, produce a capture, and exit with:
+  - [x] code 0 on success
+  - [x] nonzero on script/command failure or timeout
 
 ---
 
@@ -131,6 +131,8 @@ Enable non-interactive “run a scenario then exit” flows suitable for local a
 - [ ] Loading rules:
   - [ ] `cfg_load` applies settings-backed fields via Settings (and persists them)
   - [ ] `cfg_load` prints clear diffs for changed cvars/settings (name + old + new)
+- [ ] Hot-add behavior:
+  - [ ] newly saved config files are immediately loadable without restart (no stale failed cache)
 
 **DoD**
 - [ ] A setting can be changed via console, applies live when supported, and persists via `settings.cfg`.

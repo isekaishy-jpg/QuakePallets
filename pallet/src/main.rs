@@ -20,8 +20,9 @@ use engine_core::asset_resolver::{
     AssetLayer, AssetResolver, AssetSource, ResolveReport, ResolvedLocation, ResolvedPath,
 };
 use engine_core::control_plane::{
-    register_core_commands, register_core_cvars, register_pallet_command_specs, CommandArgs,
-    CommandOutput, CommandRegistry, CoreCvars, CvarId, CvarRegistry, ExecPathResolver, ExecSource,
+    parse_command_line, register_core_commands, register_core_cvars, register_pallet_command_specs,
+    CommandArgs, CommandOutput, CommandRegistry, CoreCvars, CvarId, CvarRegistry, ExecPathResolver,
+    ExecSource, ParsedCommand,
 };
 use engine_core::jobs::{JobQueue, Jobs};
 use engine_core::level_manifest::{
@@ -72,6 +73,7 @@ const EXIT_IMAGE: i32 = 12;
 const EXIT_BSP: i32 = 13;
 const EXIT_SCENE: i32 = 14;
 const EXIT_UI_REGRESSION: i32 = 20;
+const EXIT_SMOKE: i32 = 30;
 const DEFAULT_SFX: &str = "sound/misc/menu1.wav";
 const QUAKE_VROOT: &str = "raw/quake";
 const HUD_FONT_SIZE: f32 = 16.0;
@@ -117,6 +119,9 @@ const PERF_HUD_UPDATE_MS: u64 = 250;
 const PERF_HUD_EPS_MS: f32 = 0.1;
 const PERF_HUD_LINES: usize = 4;
 const HUD_STATS_UPDATE_MS: u64 = 250;
+const SMOKE_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+const SMOKE_DEFAULT_STEP_TIMEOUT_MS: u64 = 5_000;
+const SMOKE_REPORT_DIR: &str = ".pallet/smoke_reports";
 const STRESS_GLYPH_TARGET: usize = 50_000;
 const STRESS_LOG_LINES: usize = 5_000;
 const STRESS_EDIT_DURATION_MS: u64 = 5_000;
@@ -372,6 +377,8 @@ struct CliArgs {
     playlist: Option<String>,
     script: Option<String>,
     input_script: bool,
+    smoke_script: Option<String>,
+    smoke_timeout_ms: Option<u64>,
     ui_regression: Option<UiRegressionArgs>,
     debug_resolution: bool,
 }
@@ -1069,6 +1076,91 @@ fn load_console_welcome_lines(asset_manager: &AssetManager) -> Option<Vec<String
         .await_ready(&handle, Duration::from_secs(2))
         .ok()?;
     Some(asset.text.lines().map(|line| line.to_string()).collect())
+}
+
+fn load_smoke_script(asset_manager: &AssetManager, input: &str) -> Result<SmokeScript, String> {
+    let key = config_asset_key("scripts", input)?;
+    let handle = asset_manager.request::<ConfigAsset>(
+        key.clone(),
+        RequestOpts {
+            priority: AssetPriority::High,
+            budget_tag: AssetBudgetTag::Boot,
+        },
+    );
+    let asset = asset_manager
+        .await_ready(&handle, Duration::from_secs(2))
+        .map_err(|err| format!("smoke load failed ({}): {}", key.canonical(), err))?;
+    let mut lines = Vec::new();
+    for (index, line) in asset.text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        lines.push(SmokeLine {
+            number: index + 1,
+            text: trimmed.to_string(),
+        });
+    }
+    if lines.is_empty() {
+        return Err(format!("smoke script is empty: {}", key.canonical()));
+    }
+    Ok(SmokeScript {
+        label: key.canonical().to_string(),
+        lines,
+    })
+}
+
+fn build_smoke_report_path(label: &str) -> PathBuf {
+    let sanitized: String = label
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    let name = if sanitized.is_empty() {
+        "smoke_report".to_string()
+    } else {
+        sanitized
+    };
+    PathBuf::from(SMOKE_REPORT_DIR).join(format!("{}_report.txt", name))
+}
+
+fn write_smoke_report(
+    path: &Path,
+    script_label: &str,
+    duration: Duration,
+    global_timeout_ms: u64,
+    failure: Option<&SmokeFailure>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("smoke report dir create failed: {}", err))?;
+    }
+    let mut report = String::new();
+    report.push_str("smoke report\n");
+    report.push_str(&format!("script: {}\n", script_label));
+    report.push_str(&format!("duration_ms: {}\n", duration.as_millis()));
+    report.push_str(&format!("global_timeout_ms: {}\n", global_timeout_ms));
+    match failure {
+        Some(failure) => {
+            report.push_str("status: failed\n");
+            report.push_str(&format!("line: {}\n", failure.line));
+            report.push_str(&format!("command: {}\n", failure.command));
+            report.push_str(&format!("error: {}\n", failure.reason));
+        }
+        None => {
+            report.push_str("status: success\n");
+        }
+    }
+    std::fs::write(path, report).map_err(|err| format!("smoke report write failed: {}", err))
+}
+
+fn format_smoke_failure(failure: &SmokeFailure) -> String {
+    format!(
+        "smoke error: line {}: {} ({})",
+        failure.line, failure.command, failure.reason
+    )
 }
 
 fn config_asset_key(subdir: &str, input: &str) -> Result<AssetKey, String> {
@@ -1971,6 +2063,248 @@ impl InputScript {
     fn advance(&mut self, now: Instant) {
         self.step = self.step.saturating_add(1);
         self.next_at = now + Duration::from_millis(INPUT_SCRIPT_STEP_DELAY_MS);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SmokeLine {
+    number: usize,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
+struct SmokeScript {
+    label: String,
+    lines: Vec<SmokeLine>,
+}
+
+#[derive(Clone, Debug)]
+struct SmokeFailure {
+    line: usize,
+    command: String,
+    reason: String,
+}
+
+enum SmokeState {
+    Ready,
+    Sleeping {
+        until: Instant,
+        deadline: Instant,
+        line_index: usize,
+    },
+    WaitingCapture {
+        target: u64,
+        deadline: Instant,
+        line_index: usize,
+        failure_count: u64,
+    },
+}
+
+enum SmokeTick {
+    Running,
+    Success,
+    Failed(SmokeFailure),
+}
+
+struct SmokeRunner {
+    script: SmokeScript,
+    index: usize,
+    start_at: Instant,
+    global_deadline: Instant,
+    global_timeout_ms: u64,
+    step_timeout_ms: u64,
+    report_path: PathBuf,
+    state: SmokeState,
+}
+
+impl SmokeRunner {
+    fn new(
+        script: SmokeScript,
+        now: Instant,
+        global_timeout_ms: u64,
+        report_path: PathBuf,
+    ) -> Self {
+        Self {
+            script,
+            index: 0,
+            start_at: now,
+            global_deadline: now + Duration::from_millis(global_timeout_ms),
+            global_timeout_ms,
+            step_timeout_ms: SMOKE_DEFAULT_STEP_TIMEOUT_MS,
+            report_path,
+            state: SmokeState::Ready,
+        }
+    }
+
+    fn active_line_index(&self) -> Option<usize> {
+        match &self.state {
+            SmokeState::Ready => {
+                if self.index < self.script.lines.len() {
+                    Some(self.index)
+                } else {
+                    None
+                }
+            }
+            SmokeState::Sleeping { line_index, .. } => Some(*line_index),
+            SmokeState::WaitingCapture { line_index, .. } => Some(*line_index),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tick(
+        &mut self,
+        now: Instant,
+        console: &mut ConsoleState,
+        perf: &mut PerfState,
+        cvars: &mut CvarRegistry,
+        core_cvars: &CoreCvars,
+        script: Option<&mut ScriptRuntime>,
+        path_policy: &PathPolicy,
+        asset_manager: &AssetManager,
+        upload_queue: UploadQueue,
+        quake_vfs: Option<Arc<Vfs>>,
+        quake_dir: Option<PathBuf>,
+        console_async: ConsoleAsyncSender,
+        log_filter_state: &Arc<Mutex<LogFilterState>>,
+        capture_requests: &mut VecDeque<CaptureRequest>,
+        capture_completed: u64,
+        capture_failures: u64,
+        capture_last_error: Option<&str>,
+    ) -> SmokeTick {
+        if now >= self.global_deadline {
+            let reason = format!("global timeout after {} ms", self.global_timeout_ms);
+            return self.fail(self.active_line_index(), reason);
+        }
+
+        match &self.state {
+            SmokeState::Sleeping {
+                until,
+                deadline,
+                line_index,
+            } => {
+                if now >= *until {
+                    self.state = SmokeState::Ready;
+                    return SmokeTick::Running;
+                }
+                if now >= *deadline {
+                    let reason = format!("step timeout after {} ms", self.step_timeout_ms);
+                    return self.fail(Some(*line_index), reason);
+                }
+                return SmokeTick::Running;
+            }
+            SmokeState::WaitingCapture {
+                target,
+                deadline,
+                line_index,
+                failure_count,
+            } => {
+                if capture_failures > *failure_count {
+                    let reason = capture_last_error
+                        .map(|value| format!("capture failed: {}", value))
+                        .unwrap_or_else(|| "capture failed".to_string());
+                    return self.fail(Some(*line_index), reason);
+                }
+                if capture_completed >= *target {
+                    self.state = SmokeState::Ready;
+                    return SmokeTick::Running;
+                }
+                if now >= *deadline {
+                    let reason = format!("capture timeout after {} ms", self.step_timeout_ms);
+                    return self.fail(Some(*line_index), reason);
+                }
+                return SmokeTick::Running;
+            }
+            SmokeState::Ready => {}
+        }
+
+        if self.index >= self.script.lines.len() {
+            return SmokeTick::Success;
+        }
+
+        let line_index = self.index;
+        let line = &self.script.lines[line_index];
+        let parsed = match parse_command_line(&line.text) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => {
+                self.index = self.index.saturating_add(1);
+                return SmokeTick::Running;
+            }
+            Err(err) => {
+                return self.fail(Some(line_index), format!("parse error: {}", err));
+            }
+        };
+        let name = parsed.name.as_str();
+        if name == "ttimeout_ms" {
+            match parse_smoke_timeout_ms(&parsed.args, "ttimeout_ms <ms>") {
+                Ok(ms) => {
+                    self.step_timeout_ms = ms;
+                    self.index = self.index.saturating_add(1);
+                    return SmokeTick::Running;
+                }
+                Err(err) => return self.fail(Some(line_index), err),
+            }
+        }
+        if name == "sleep_ms" {
+            match parse_smoke_sleep_ms(&parsed.args, "sleep_ms <ms>") {
+                Ok(ms) => {
+                    let until = now + Duration::from_millis(ms);
+                    let deadline = now + Duration::from_millis(self.step_timeout_ms);
+                    self.state = SmokeState::Sleeping {
+                        until,
+                        deadline,
+                        line_index,
+                    };
+                    self.index = self.index.saturating_add(1);
+                    return SmokeTick::Running;
+                }
+                Err(err) => return self.fail(Some(line_index), err),
+            }
+        }
+
+        let is_capture = matches!(name, "capture_screenshot" | "capture_frame");
+        let pending_before = capture_requests.len() as u64;
+        if let Err(err) = dispatch_smoke_command(
+            &parsed,
+            console,
+            perf,
+            cvars,
+            core_cvars,
+            script,
+            path_policy,
+            asset_manager,
+            upload_queue,
+            quake_vfs,
+            quake_dir,
+            console_async,
+            log_filter_state,
+            capture_requests,
+        ) {
+            return self.fail(Some(line_index), err);
+        }
+        if is_capture {
+            let deadline = now + Duration::from_millis(self.step_timeout_ms);
+            let target = capture_completed.saturating_add(pending_before + 1);
+            self.state = SmokeState::WaitingCapture {
+                target,
+                deadline,
+                line_index,
+                failure_count: capture_failures,
+            };
+        }
+        self.index = self.index.saturating_add(1);
+        SmokeTick::Running
+    }
+
+    fn fail(&self, line_index: Option<usize>, reason: String) -> SmokeTick {
+        let (line_number, command) = line_index
+            .and_then(|idx| self.script.lines.get(idx))
+            .map(|line| (line.number, line.text.clone()))
+            .unwrap_or_else(|| (0, "<none>".to_string()));
+        SmokeTick::Failed(SmokeFailure {
+            line: line_number,
+            command,
+            reason,
+        })
     }
 }
 
@@ -3162,6 +3496,13 @@ fn main() {
         sender: console_async_tx,
     };
     let log_filter_state = Arc::new(Mutex::new(LogFilterState::default()));
+    let mut capture_requests: VecDeque<CaptureRequest> = VecDeque::new();
+    let mut capture_sequence: u32 = 0;
+    let mut capture_frame: Option<FrameCapture> = None;
+    let mut capture_completed: u64 = 0;
+    let mut capture_failures: u64 = 0;
+    let mut capture_last_error: Option<String> = None;
+    let mut current_map: Option<String> = None;
     let mut modifiers = ModifiersState::default();
     let mut last_cursor_pos = PhysicalPosition::new(0.0, 0.0);
     let mut input_router = InputRouter::new();
@@ -3343,6 +3684,33 @@ fn main() {
 
     let mut input_script = if args.input_script {
         Some(InputScript::new(Instant::now(), &settings))
+    } else {
+        None
+    };
+    let mut smoke_runner = if let Some(script_name) = args.smoke_script.as_deref() {
+        let script = match load_smoke_script(&asset_manager, script_name) {
+            Ok(script) => script,
+            Err(err) => {
+                eprintln!("{}", err);
+                std::process::exit(EXIT_SMOKE);
+            }
+        };
+        let timeout_ms = args.smoke_timeout_ms.unwrap_or(SMOKE_DEFAULT_TIMEOUT_MS);
+        let report_path = build_smoke_report_path(&script.label);
+        println!(
+            "smoke: running {} (timeout {} ms)",
+            script.label, timeout_ms
+        );
+        console.push_line(format!(
+            "smoke: running {} (timeout {} ms)",
+            script.label, timeout_ms
+        ));
+        Some(SmokeRunner::new(
+            script,
+            Instant::now(),
+            timeout_ms,
+            report_path,
+        ))
     } else {
         None
     };
@@ -3530,6 +3898,7 @@ fn main() {
                             quake_dir.as_ref(),
                             &console_async_sender,
                             &log_filter_state,
+                            &mut capture_requests,
                             &mut ui_state,
                             window,
                             &settings,
@@ -3802,6 +4171,7 @@ fn main() {
                                             ) {
                                                 Ok(()) => {
                                                     ui_state.close_menu();
+                                                    current_map = Some(map.clone());
                                                 }
                                                 Err(err) => {
                                                     eprintln!("{}", err.message);
@@ -3848,6 +4218,7 @@ fn main() {
                                         quake_dir.as_ref(),
                                         &console_async_sender,
                                         &log_filter_state,
+                                        &mut capture_requests,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3903,6 +4274,7 @@ fn main() {
                                         quake_dir.as_ref(),
                                         &console_async_sender,
                                         &log_filter_state,
+                                        &mut capture_requests,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3940,6 +4312,7 @@ fn main() {
                                         quake_dir.as_ref(),
                                         &console_async_sender,
                                         &log_filter_state,
+                                        &mut capture_requests,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -3984,6 +4357,7 @@ fn main() {
                                         quake_dir.as_ref(),
                                         &console_async_sender,
                                         &log_filter_state,
+                                        &mut capture_requests,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -4021,6 +4395,7 @@ fn main() {
                                         quake_dir.as_ref(),
                                         &console_async_sender,
                                         &log_filter_state,
+                                        &mut capture_requests,
                                         &mut ui_state,
                                         window,
                                         &settings,
@@ -4059,6 +4434,75 @@ fn main() {
                     if finish_input_script {
                         input_script = None;
                         println!("input script: done");
+                    }
+                    if let Some(runner) = smoke_runner.as_mut() {
+                        match runner.tick(
+                            now,
+                            &mut console,
+                            &mut perf,
+                            &mut cvars,
+                            &core_cvars,
+                            script.as_mut(),
+                            &path_policy,
+                            &asset_manager,
+                            upload_queue.clone(),
+                            quake_vfs.clone(),
+                            quake_dir.clone(),
+                            console_async_sender.clone(),
+                            &log_filter_state,
+                            &mut capture_requests,
+                            capture_completed,
+                            capture_failures,
+                            capture_last_error.as_deref(),
+                        ) {
+                            SmokeTick::Running => {}
+                            SmokeTick::Success => {
+                                let duration = runner.start_at.elapsed();
+                                if let Err(err) = write_smoke_report(
+                                    &runner.report_path,
+                                    &runner.script.label,
+                                    duration,
+                                    runner.global_timeout_ms,
+                                    None,
+                                ) {
+                                    eprintln!("{}", err);
+                                }
+                                println!(
+                                    "smoke: success (report: {})",
+                                    runner.report_path.display()
+                                );
+                                console.push_line(format!(
+                                    "smoke: success (report: {})",
+                                    runner.report_path.display()
+                                ));
+                                exit_code_handle.set(EXIT_SUCCESS);
+                                elwt.exit();
+                                return;
+                            }
+                            SmokeTick::Failed(failure) => {
+                                let duration = runner.start_at.elapsed();
+                                let message = format_smoke_failure(&failure);
+                                console.push_line(message.clone());
+                                observability::set_sticky_error(message.clone());
+                                if let Err(err) = write_smoke_report(
+                                    &runner.report_path,
+                                    &runner.script.label,
+                                    duration,
+                                    runner.global_timeout_ms,
+                                    Some(&failure),
+                                ) {
+                                    eprintln!("{}", err);
+                                }
+                                eprintln!(
+                                    "{} (report: {})",
+                                    message,
+                                    runner.report_path.display()
+                                );
+                                exit_code_handle.set(EXIT_SMOKE);
+                                elwt.exit();
+                                return;
+                            }
+                        }
                     }
                     let mut skip_render = false;
                     let dpi_scale = ui_regression
@@ -4148,6 +4592,7 @@ fn main() {
                                     ui_state.close_menu();
                                     mouse_look = true;
                                     mouse_grabbed = set_cursor_mode(window, mouse_look);
+                                    current_map = Some(map.clone());
                                 }
                                 Err(err) => {
                                     eprintln!("{}", err.message);
@@ -5262,6 +5707,144 @@ fn main() {
                         return;
                     }
 
+                    if ui_regression_capture.is_none() {
+                        if let Some(request) = capture_requests.pop_front() {
+                            let include_overlays = request.include_overlays;
+                            let capture_size = resolution.physical_px;
+                            let needs_new_capture = capture_frame
+                                .as_ref()
+                                .map(|capture| capture.size() != capture_size)
+                                .unwrap_or(true);
+                            if needs_new_capture {
+                                match FrameCapture::new(
+                                    renderer.device(),
+                                    capture_size,
+                                    renderer.surface_format(),
+                                ) {
+                                    Ok(new_capture) => {
+                                        capture_frame = Some(new_capture);
+                                    }
+                                    Err(err) => {
+                                        record_capture_failure(
+                                            &mut console,
+                                            format!("capture error: capture init failed: {}", err),
+                                            &mut capture_failures,
+                                            &mut capture_last_error,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            let Some(capture) = capture_frame.as_ref() else {
+                                record_capture_failure(
+                                    &mut console,
+                                    "capture error: capture pipeline unavailable".to_string(),
+                                    &mut capture_failures,
+                                    &mut capture_last_error,
+                                );
+                                return;
+                            };
+                            let render_result = if include_overlays {
+                                renderer.render_with_overlay_and_capture(render_overlay, capture)
+                            } else {
+                                renderer.render_with_overlay_and_capture(
+                                    |_device, _queue, _encoder, _view, _format| {},
+                                    capture,
+                                )
+                            };
+                            match render_result {
+                                Ok(()) => {
+                                    perf.update(PerfTimings {
+                                        egui_build_ms,
+                                        glyphon_prepare_ms: glyphon_timings.prepare_ms,
+                                        glyphon_render_ms: glyphon_timings.render_ms,
+                                    });
+                                    if boot.on_present(now, window) && boot_apply_fullscreen {
+                                        apply_window_settings(window, &settings);
+                                        renderer.resize(renderer.window_inner_size());
+                                        pending_resize_clear = true;
+                                        boot_apply_fullscreen = false;
+                                    }
+                                }
+                                Err(RenderCaptureError::Surface(err)) => match err {
+                                    RenderError::Lost | RenderError::Outdated => {
+                                        renderer.resize(renderer.size());
+                                    }
+                                    RenderError::OutOfMemory => {
+                                        record_capture_failure(
+                                            &mut console,
+                                            "capture error: out of memory".to_string(),
+                                            &mut capture_failures,
+                                            &mut capture_last_error,
+                                        );
+                                        return;
+                                    }
+                                    _ => {
+                                        record_capture_failure(
+                                            &mut console,
+                                            format!("capture error: render failed: {}", err),
+                                            &mut capture_failures,
+                                            &mut capture_last_error,
+                                        );
+                                        return;
+                                    }
+                                },
+                                Err(RenderCaptureError::Capture(err)) => {
+                                    record_capture_failure(
+                                        &mut console,
+                                        format!("capture error: capture encode failed: {}", err),
+                                        &mut capture_failures,
+                                        &mut capture_last_error,
+                                    );
+                                    return;
+                                }
+                            }
+                            let rgba = match capture.read_rgba(renderer.device()) {
+                                Ok(data) => data,
+                                Err(err) => {
+                                    record_capture_failure(
+                                        &mut console,
+                                        format!("capture error: readback failed: {}", err),
+                                        &mut capture_failures,
+                                        &mut capture_last_error,
+                                    );
+                                    return;
+                                }
+                            };
+                            let path = request.path.unwrap_or_else(|| {
+                                capture_sequence = capture_sequence.saturating_add(1);
+                                build_default_capture_path(
+                                    request.kind,
+                                    capture_sequence,
+                                    capture_size,
+                                    settings.window_mode,
+                                    current_map.as_deref(),
+                                )
+                            });
+                            if let Err(err) = write_png(
+                                &path,
+                                capture_size[0],
+                                capture_size[1],
+                                &rgba,
+                            ) {
+                                record_capture_failure(
+                                    &mut console,
+                                    format!("capture error: write failed: {}", err),
+                                    &mut capture_failures,
+                                    &mut capture_last_error,
+                                );
+                                return;
+                            }
+                            capture_completed = capture_completed.saturating_add(1);
+                            console.push_line(format!(
+                                "{} saved: {}",
+                                request.kind.label(),
+                                path.display()
+                            ));
+                            return;
+                        }
+                    }
+
                     match renderer.render_with_overlay(render_overlay) {
                         Ok(()) => {
                             perf.update(PerfTimings {
@@ -5355,6 +5938,8 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
     let mut playlist = None;
     let mut script = None;
     let mut input_script = false;
+    let mut smoke_script = None;
+    let mut smoke_timeout_ms = None;
     let mut ui_regression_shot = None;
     let mut ui_regression_res = None;
     let mut ui_regression_dpi = None;
@@ -5467,6 +6052,24 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
             "--input-script" => {
                 input_script = true;
             }
+            "--smoke" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| ArgParseError::Message("--smoke expects a script".into()))?;
+                smoke_script = Some(value);
+            }
+            "--gtimeout-ms" => {
+                let value = args.next().ok_or_else(|| {
+                    ArgParseError::Message("--gtimeout-ms expects milliseconds".into())
+                })?;
+                let parsed = value.parse::<u64>().map_err(|_| {
+                    ArgParseError::Message("--gtimeout-ms expects milliseconds".into())
+                })?;
+                if parsed == 0 {
+                    return Err(ArgParseError::Message("--gtimeout-ms must be > 0".into()));
+                }
+                smoke_timeout_ms = Some(parsed);
+            }
             "--ui-regression-shot" => {
                 let value = args.next().ok_or_else(|| {
                     ArgParseError::Message("--ui-regression-shot expects a path".into())
@@ -5578,13 +6181,24 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
         None
     };
 
+    if smoke_timeout_ms.is_some() && smoke_script.is_none() {
+        return Err(ArgParseError::Message(
+            "--gtimeout-ms requires --smoke".into(),
+        ));
+    }
+    if smoke_script.is_some() && input_script {
+        return Err(ArgParseError::Message(
+            "--smoke cannot be combined with --input-script".into(),
+        ));
+    }
     if ui_regression.is_some()
         && (show_image.is_some()
             || map.is_some()
             || play_movie.is_some()
             || playlist.is_some()
             || script.is_some()
-            || input_script)
+            || input_script
+            || smoke_script.is_some())
     {
         return Err(ArgParseError::Message(
             "--ui-regression-* cannot be combined with other modes".into(),
@@ -5604,13 +6218,15 @@ fn parse_args() -> Result<CliArgs, ArgParseError> {
         playlist,
         script,
         input_script,
+        smoke_script,
+        smoke_timeout_ms,
         ui_regression,
         debug_resolution,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: pallet [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--mount-manifest <name-or-path>] [--content-root <path>] [--dev-root <path>] [--config-root <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <name>] [--script <name>] [--input-script] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
+    eprintln!("usage: pallet [--quake-dir <path>] [--mount-dir <vroot> <path>] [--mount-pak <vroot> <path>] [--mount-pk3 <vroot> <path>] [--mount-manifest <name-or-path>] [--content-root <path>] [--dev-root <path>] [--config-root <path>] [--show-image <asset>] [--map <name>] [--play-movie <file>] [--playlist <name>] [--script <name>] [--input-script] [--smoke <script> [--gtimeout-ms <ms>]] [--debug-resolution] [--ui-regression-shot <path> --ui-regression-res <WxH> --ui-regression-dpi <scale> --ui-regression-ui-scale <scale> --ui-regression-screen <main|options>]");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --show-image gfx/conback.lmp");
     eprintln!("example: pallet --show-image engine:texture/ui/pallet_runner_gui_icon.png");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1");
@@ -5619,6 +6235,7 @@ fn print_usage() {
     eprintln!("example: pallet --playlist movies_playlist.txt");
     eprintln!("example: pallet --mount-pk3 raw/q3 \"C:\\\\Quake3\\\\baseq3\\\\pak0.pk3\" --show-image raw/q3/gfx/2d/console.tga");
     eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --input-script");
+    eprintln!("example: pallet --quake-dir \"C:\\\\Quake\" --map e1m1 --smoke smoke_capture.cfg --gtimeout-ms 60000");
     eprintln!(
         "example: pallet --mount-manifest default.txt --show-image raw/quake/gfx/conback.lmp"
     );
@@ -5645,6 +6262,35 @@ fn parse_scale_arg(value: &str) -> Result<f32, ()> {
     } else {
         Err(())
     }
+}
+
+fn parse_smoke_timeout_ms(args: &CommandArgs, usage: &str) -> Result<u64, String> {
+    if args.raw_tokens().len() != 1 {
+        return Err(format!("usage: {}", usage));
+    }
+    let value = args
+        .positional(0)
+        .ok_or_else(|| format!("usage: {}", usage))?;
+    let ms = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid timeout: {}", value))?;
+    if ms == 0 {
+        return Err("timeout must be > 0".to_string());
+    }
+    Ok(ms)
+}
+
+fn parse_smoke_sleep_ms(args: &CommandArgs, usage: &str) -> Result<u64, String> {
+    if args.raw_tokens().len() != 1 {
+        return Err(format!("usage: {}", usage));
+    }
+    let value = args
+        .positional(0)
+        .ok_or_else(|| format!("usage: {}", usage))?;
+    let ms = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid sleep_ms: {}", value))?;
+    Ok(ms)
 }
 
 fn setup_ui_regression(
@@ -5998,6 +6644,7 @@ struct PalletCommandUser<'a> {
     quake_vfs: Option<Arc<Vfs>>,
     quake_dir: Option<PathBuf>,
     console_async: ConsoleAsyncSender,
+    capture_requests: &'a mut VecDeque<CaptureRequest>,
 }
 
 impl<'a> ExecPathResolver for PalletCommandUser<'a> {
@@ -6049,6 +6696,7 @@ fn dispatch_console_line(
     quake_dir: Option<PathBuf>,
     console_async: ConsoleAsyncSender,
     log_filter_state: &Arc<Mutex<LogFilterState>>,
+    capture_requests: &mut VecDeque<CaptureRequest>,
 ) {
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
@@ -6061,6 +6709,7 @@ fn dispatch_console_line(
                 quake_vfs,
                 quake_dir,
                 console_async,
+                capture_requests,
             };
             commands.dispatch_line(line, cvars, console, &mut user)
         }
@@ -6079,6 +6728,87 @@ fn dispatch_console_line(
     apply_cvar_changes(cvars, perf, core_cvars, asset_manager, log_filter_state);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_smoke_command(
+    parsed: &ParsedCommand,
+    console: &mut ConsoleState,
+    perf: &mut PerfState,
+    cvars: &mut CvarRegistry,
+    core_cvars: &CoreCvars,
+    script: Option<&mut ScriptRuntime>,
+    path_policy: &PathPolicy,
+    asset_manager: &AssetManager,
+    upload_queue: UploadQueue,
+    quake_vfs: Option<Arc<Vfs>>,
+    quake_dir: Option<PathBuf>,
+    console_async: ConsoleAsyncSender,
+    log_filter_state: &Arc<Mutex<LogFilterState>>,
+    capture_requests: &mut VecDeque<CaptureRequest>,
+) -> Result<(), String> {
+    let dispatch_result = match build_command_registry(core_cvars) {
+        Ok(mut commands) => {
+            let mut user = PalletCommandUser {
+                perf,
+                script,
+                path_policy,
+                asset_manager,
+                upload_queue,
+                quake_vfs,
+                quake_dir,
+                console_async,
+                capture_requests,
+            };
+            commands.dispatch(&parsed.name, &parsed.args, cvars, console, &mut user)
+        }
+        Err(err) => Err(err),
+    };
+    if let Err(err) = dispatch_result {
+        let message = format!("error: {}", err);
+        console.push_line(message.clone());
+        observability::set_sticky_error(message);
+        apply_cvar_changes(cvars, perf, core_cvars, asset_manager, log_filter_state);
+        return Err(err);
+    }
+    apply_cvar_changes(cvars, perf, core_cvars, asset_manager, log_filter_state);
+    Ok(())
+}
+
+fn queue_capture_request(
+    ctx: &mut engine_core::control_plane::CommandContext<'_, PalletCommandUser<'_>>,
+    args: &CommandArgs,
+    kind: CaptureKind,
+    include_id: CvarId,
+) -> Result<(), String> {
+    if args.positionals().len() > 1 {
+        return Err(format!("usage: {} [path]", kind.label()));
+    }
+    let path = args.positional(0).map(PathBuf::from);
+    let include_overlays = cvar_bool(ctx.cvars, include_id).unwrap_or(true);
+    ctx.user.capture_requests.push_back(CaptureRequest {
+        kind,
+        path: path.clone(),
+        include_overlays,
+    });
+    if let Some(path) = path {
+        ctx.output
+            .push_line(format!("{}: scheduled {}", kind.label(), path.display()));
+    } else {
+        ctx.output.push_line(format!("{}: scheduled", kind.label()));
+    }
+    Ok(())
+}
+
+fn record_capture_failure(
+    console: &mut ConsoleState,
+    message: String,
+    capture_failures: &mut u64,
+    capture_last_error: &mut Option<String>,
+) {
+    console.push_line(message.clone());
+    *capture_failures = capture_failures.saturating_add(1);
+    *capture_last_error = Some(message);
+}
+
 fn build_command_registry<'a>(
     core_cvars: &'a CoreCvars,
 ) -> Result<CommandRegistry<'a, PalletCommandUser<'a>>, String> {
@@ -6090,6 +6820,7 @@ fn build_command_registry<'a>(
     let asset_decode_budget_id = core_cvars.asset_decode_budget_ms;
     let asset_upload_budget_id = core_cvars.asset_upload_budget_ms;
     let asset_io_budget_id = core_cvars.asset_io_budget_kb;
+    let capture_include_id = core_cvars.capture_include_overlays;
     commands.set_handler(
         "logfill",
         Box::new(|ctx, args| {
@@ -6484,6 +7215,18 @@ fn build_command_registry<'a>(
                 JobQueue::Io,
                 move || run_content_validate(path_policy, quake_dir),
             )
+        }),
+    )?;
+    commands.set_handler(
+        "capture_screenshot",
+        Box::new(move |ctx, args| {
+            queue_capture_request(ctx, args, CaptureKind::Screenshot, capture_include_id)
+        }),
+    )?;
+    commands.set_handler(
+        "capture_frame",
+        Box::new(move |ctx, args| {
+            queue_capture_request(ctx, args, CaptureKind::Frame, capture_include_id)
         }),
     )?;
     commands.set_fallback(Box::new(|ctx, name, args| {
@@ -7013,6 +7756,35 @@ impl LogFilterState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CaptureKind {
+    Screenshot,
+    Frame,
+}
+
+impl CaptureKind {
+    fn label(self) -> &'static str {
+        match self {
+            CaptureKind::Screenshot => "capture_screenshot",
+            CaptureKind::Frame => "capture_frame",
+        }
+    }
+
+    fn file_prefix(self) -> &'static str {
+        match self {
+            CaptureKind::Screenshot => "screenshot",
+            CaptureKind::Frame => "frame",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CaptureRequest {
+    kind: CaptureKind,
+    path: Option<PathBuf>,
+    include_overlays: bool,
+}
+
 fn log_level_rank(level: LogLevel) -> u8 {
     match level {
         LogLevel::Error => 0,
@@ -7058,6 +7830,47 @@ fn update_perf_overlay(perf: &mut PerfState, cvars: &CvarRegistry, core: &CoreCv
         perf.show_overlay = next;
         perf.hud_dirty = true;
     }
+}
+
+fn sanitize_capture_segment(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+        } else {
+            output.push('_');
+        }
+    }
+    let trimmed = output.trim_matches('_');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_default_capture_path(
+    kind: CaptureKind,
+    seq: u32,
+    resolution: [u32; 2],
+    window_mode: WindowMode,
+    map_name: Option<&str>,
+) -> PathBuf {
+    let mut name = format!(
+        "{}_{:04}_{}x{}_{}",
+        kind.file_prefix(),
+        seq,
+        resolution[0],
+        resolution[1],
+        sanitize_capture_segment(window_mode.as_str()),
+    );
+    if let Some(map) = map_name {
+        let map = sanitize_capture_segment(map);
+        name.push('_');
+        name.push_str(&map);
+    }
+    name.push_str(".png");
+    PathBuf::from("captures").join(name)
 }
 
 fn apply_cvar_changes(
@@ -7619,6 +8432,7 @@ fn handle_non_video_key_input(
     quake_dir: Option<&PathBuf>,
     console_async: &ConsoleAsyncSender,
     log_filter_state: &Arc<Mutex<LogFilterState>>,
+    capture_requests: &mut VecDeque<CaptureRequest>,
     ui_state: &mut UiState,
     window: &Window,
     settings: &Settings,
@@ -7727,6 +8541,7 @@ fn handle_non_video_key_input(
                                 quake_dir.cloned(),
                                 console_async.clone(),
                                 log_filter_state,
+                                capture_requests,
                             );
                         }
                     }

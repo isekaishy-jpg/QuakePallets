@@ -624,6 +624,7 @@ pub struct CoreCvars {
     pub dbg_mounts: CvarId,
     pub log_level: CvarId,
     pub log_filter: CvarId,
+    pub capture_include_overlays: CvarId,
     pub asset_decode_budget_ms: CvarId,
     pub asset_upload_budget_ms: CvarId,
     pub asset_io_budget_kb: CvarId,
@@ -690,6 +691,14 @@ pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, Str
         )
         .with_flags(CvarFlags::DEV_ONLY),
     )?;
+    let capture_include_overlays = registry.register(
+        CvarDef::new(
+            "capture_include_overlays",
+            CvarValue::Bool(true),
+            "Include overlays in captures (0/1).",
+        )
+        .with_flags(CvarFlags::DEV_ONLY),
+    )?;
     let asset_decode_budget_ms = registry.register(
         CvarDef::new(
             "asset_decode_budget_ms",
@@ -737,6 +746,7 @@ pub fn register_core_cvars(registry: &mut CvarRegistry) -> Result<CoreCvars, Str
         dbg_mounts,
         log_level,
         log_filter,
+        capture_include_overlays,
         asset_decode_budget_ms,
         asset_upload_budget_ms,
         asset_io_budget_kb,
@@ -950,6 +960,22 @@ pub fn register_pallet_command_specs<U>(
             "dev_content_validate",
             "Validate level manifests (async).",
             "dev_content_validate",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "capture_screenshot",
+            "Capture a screenshot (png).",
+            "capture_screenshot [path]",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "capture_frame",
+            "Capture a rendered frame (png).",
+            "capture_frame [path]",
         )
         .with_flags(CommandFlags::DEV_ONLY),
     )?;
