@@ -190,19 +190,19 @@ These become your harness “must pass” gates:
 - [x] Add performance counters (collider count, triangle count loaded, KCC query cost).
 
 ### M9 — Console + debug surface + test harness
-- [ ] Add commands (examples; adapt to your naming rules):
+- [x] Add commands (examples; adapt to your naming rules):
   - `dev_collision_draw` (toggle)
   - `dev_collision_dump_near_player radius=...` (uses `chunk_bounds_bvh`)
   - `player_set_profile arena|rpg`
   - `player_dump_state`
   - `player_tune_set <param> <value>` (dev-only) / `player_tune_list`
-- [ ] Implement automated harness maps for acceptance tests:
+- [x] Implement automated harness maps for acceptance tests:
   - crisp stop lane
   - 90° redirect pad
   - strafe-jump build course
   - doorway corridor at speed
   - **soft bhop retention course** (repeated landings with buffered/held jump)
-- [ ] Record/replay input traces for regression (strongly recommended; minimal implementation acceptable).
+- [x] Record/replay input traces for regression (strongly recommended; minimal implementation acceptable).
 
 ### M10 — Convergence and documentation
 - [ ] Migrate gameplay to the extracted controller module (remove/disable old movement path).

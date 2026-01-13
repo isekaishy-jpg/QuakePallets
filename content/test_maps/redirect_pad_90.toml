@@ -1,0 +1,55 @@
+version = 1
+name = "redirect_pad_90"
+map_to_world_scale = 1.0
+space_origin = [0.0, 0.0, 0.0]
+notes = "90 degree redirect pad for strafe tests."
+
+[[solids]]
+id = "lane_x"
+kind = "box"
+pos = [0.0, -0.5, 0.0]
+size = [60.0, 1.0, 8.0]
+tags = ["ground"]
+
+[[solids]]
+id = "lane_z"
+kind = "box"
+pos = [30.0, -0.5, 30.0]
+size = [8.0, 1.0, 60.0]
+tags = ["ground"]
+
+[[solids]]
+id = "x_wall_left"
+kind = "box"
+pos = [0.0, 1.5, -4.2]
+size = [60.0, 3.0, 0.4]
+tags = ["wall"]
+
+[[solids]]
+id = "x_wall_right"
+kind = "box"
+pos = [0.0, 1.5, 4.2]
+size = [60.0, 3.0, 0.4]
+tags = ["wall"]
+
+[[solids]]
+id = "z_wall_left"
+kind = "box"
+pos = [25.8, 1.5, 30.0]
+size = [0.4, 3.0, 60.0]
+tags = ["wall"]
+
+[[solids]]
+id = "z_wall_right"
+kind = "box"
+pos = [34.2, 1.5, 30.0]
+size = [0.4, 3.0, 60.0]
+tags = ["wall"]
+
+[[solids]]
+id = "redirect_pad"
+kind = "box_rot"
+pos = [27.0, 1.5, 1.8]
+size = [6.0, 3.0, 0.4]
+yaw_deg = 45.0
+tags = ["wall"]

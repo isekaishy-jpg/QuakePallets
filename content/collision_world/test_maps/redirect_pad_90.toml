@@ -1,0 +1,89 @@
+version = 1
+partition_kind = "quadtree2d"
+space_origin = [0.0, 0.0, 0.0]
+map_to_world_scale = 1.0
+
+[root_bounds]
+min = [-30.0, -1.0, -4.399999618530273]
+max = [34.400001525878906, 3.0, 60.0]
+
+[[chunks]]
+chunk_id = "lane_x"
+aabb_min = [-30.0, -1.0, -4.0]
+aabb_max = [30.0, 0.0, 4.0]
+payload_ref = "inline:test_map/lane_x"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "lane_z"
+aabb_min = [26.0, -1.0, 0.0]
+aabb_max = [34.0, 0.0, 60.0]
+payload_ref = "inline:test_map/lane_z"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "x_wall_left"
+aabb_min = [-30.0, 0.0, -4.399999618530273]
+aabb_max = [30.0, 3.0, -3.999999761581421]
+payload_ref = "inline:test_map/x_wall_left"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "x_wall_right"
+aabb_min = [-30.0, 0.0, 3.999999761581421]
+aabb_max = [30.0, 3.0, 4.399999618530273]
+payload_ref = "inline:test_map/x_wall_right"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "z_wall_left"
+aabb_min = [25.599998474121094, 0.0, 0.0]
+aabb_max = [26.0, 3.0, 60.0]
+payload_ref = "inline:test_map/z_wall_left"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "z_wall_right"
+aabb_min = [34.0, 0.0, 0.0]
+aabb_max = [34.400001525878906, 3.0, 60.0]
+payload_ref = "inline:test_map/z_wall_right"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "redirect_pad"
+aabb_min = [24.737258911132813, 0.0, -0.4627416133880615]
+aabb_max = [29.262741088867188, 3.0, 4.062741279602051]
+payload_ref = "inline:test_map/redirect_pad"
+triangle_count = 12
+
+[chunk_bounds_bvh]
+root = 2
+leaf_indices = [0, 2, 3, 4, 6, 1, 5]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -4.399999618530273]
+max = [30.0, 3.0, 4.399999618530273]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 0
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [24.737258911132813, -1.0, -0.4627416133880615]
+max = [34.400001525878906, 3.0, 60.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 3
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+left = 0
+right = 1
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -4.399999618530273]
+max = [34.400001525878906, 3.0, 60.0]

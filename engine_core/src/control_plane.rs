@@ -1069,6 +1069,86 @@ pub fn register_pallet_command_specs<U>(
         "Load config profile.",
         "cfg_load <name>",
     ))?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_collision_draw",
+            "Toggle collision debug overlay.",
+            "dev_collision_draw [0|1]",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_collision_dump_near_player",
+            "Dump collision chunks near the player.",
+            "dev_collision_dump_near_player [radius]",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "player_set_profile",
+            "Switch movement profile.",
+            "player_set_profile <arena|rpg>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "player_dump_state",
+            "Dump player movement state.",
+            "player_dump_state",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "player_tune_set",
+            "Set a movement tuning parameter.",
+            "player_tune_set <param> <value>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "player_tune_list",
+            "List movement tuning parameters.",
+            "player_tune_list",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_input_record",
+            "Start recording an input trace.",
+            "dev_input_record <name>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_input_record_stop",
+            "Stop recording an input trace.",
+            "dev_input_record_stop",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_input_replay",
+            "Replay an input trace.",
+            "dev_input_replay <name>",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
+    registry.register_spec(
+        CommandSpec::new(
+            "dev_input_replay_stop",
+            "Stop input trace playback.",
+            "dev_input_replay_stop",
+        )
+        .with_flags(CommandFlags::DEV_ONLY),
+    )?;
     Ok(())
 }
 

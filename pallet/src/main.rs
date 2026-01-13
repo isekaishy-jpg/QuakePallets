@@ -627,7 +627,7 @@ struct MusicTrack {
     data: Vec<u8>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct InputState {
     forward: bool,
     back: bool,
@@ -657,6 +657,11 @@ struct MovementCvars {
     dev_motor: CvarId,
     dev_fixed_dt: CvarId,
     dev_substeps: CvarId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CollisionDebugCvars {
+    dev_collision_draw: CvarId,
 }
 
 impl InputState {
@@ -2284,6 +2289,7 @@ impl InputRouter {
 }
 
 const INPUT_SCRIPT_STEP_DELAY_MS: u64 = 200;
+const INPUT_TRACE_DIR: &str = ".pallet/input_traces";
 
 struct InputScript {
     step: usize,
@@ -2310,6 +2316,178 @@ impl InputScript {
         self.step = self.step.saturating_add(1);
         self.next_at = now + Duration::from_millis(INPUT_SCRIPT_STEP_DELAY_MS);
     }
+}
+
+#[derive(Clone)]
+struct InputTraceFrame {
+    dt: f32,
+    yaw: f32,
+    pitch: f32,
+    input: InputState,
+}
+
+struct InputTraceRecorder {
+    name: String,
+    frames: Vec<InputTraceFrame>,
+}
+
+impl InputTraceRecorder {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            frames: Vec::new(),
+        }
+    }
+
+    fn push_frame(&mut self, dt: f32, input: InputState, camera: &CameraState) {
+        self.frames.push(InputTraceFrame {
+            dt,
+            yaw: camera.yaw,
+            pitch: camera.pitch,
+            input,
+        });
+    }
+}
+
+struct InputTracePlayback {
+    name: String,
+    frames: Vec<InputTraceFrame>,
+    index: usize,
+}
+
+impl InputTracePlayback {
+    fn new(name: String, frames: Vec<InputTraceFrame>) -> Self {
+        Self {
+            name,
+            frames,
+            index: 0,
+        }
+    }
+
+    fn next_frame(&mut self) -> Option<InputTraceFrame> {
+        if self.index >= self.frames.len() {
+            None
+        } else {
+            let frame = self.frames[self.index].clone();
+            self.index = self.index.saturating_add(1);
+            Some(frame)
+        }
+    }
+}
+
+fn input_trace_path(name: &str) -> Result<PathBuf, String> {
+    if name.trim().is_empty() {
+        return Err("input trace name must not be empty".to_string());
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    {
+        return Err("input trace name must be [a-z0-9_-]".to_string());
+    }
+    Ok(PathBuf::from(INPUT_TRACE_DIR).join(format!("{name}.trace")))
+}
+
+fn serialize_input_trace(frames: &[InputTraceFrame]) -> String {
+    let mut text = String::from("# pallet_input_trace_v1\n");
+    for frame in frames {
+        text.push_str(&format!(
+            "{:.6} {:.6} {:.6} {} {} {} {} {} {}\n",
+            frame.dt,
+            frame.yaw,
+            frame.pitch,
+            bool_to_bit(frame.input.forward),
+            bool_to_bit(frame.input.back),
+            bool_to_bit(frame.input.left),
+            bool_to_bit(frame.input.right),
+            bool_to_bit(frame.input.jump_active()),
+            bool_to_bit(frame.input.down),
+        ));
+    }
+    text
+}
+
+fn parse_input_trace(text: &str) -> Result<Vec<InputTraceFrame>, String> {
+    let mut frames = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() != 9 {
+            return Err(format!("trace line {} malformed", index + 1));
+        }
+        let dt = parts[0]
+            .parse::<f32>()
+            .map_err(|_| format!("trace line {} dt invalid", index + 1))?;
+        let yaw = parts[1]
+            .parse::<f32>()
+            .map_err(|_| format!("trace line {} yaw invalid", index + 1))?;
+        let pitch = parts[2]
+            .parse::<f32>()
+            .map_err(|_| format!("trace line {} pitch invalid", index + 1))?;
+        let forward = parse_trace_bit(parts[3], index)?;
+        let back = parse_trace_bit(parts[4], index)?;
+        let left = parse_trace_bit(parts[5], index)?;
+        let right = parse_trace_bit(parts[6], index)?;
+        let jump = parse_trace_bit(parts[7], index)?;
+        let down = parse_trace_bit(parts[8], index)?;
+        let input = InputState {
+            forward,
+            back,
+            left,
+            right,
+            jump_keyboard: jump,
+            jump_mouse: false,
+            down,
+        };
+        frames.push(InputTraceFrame {
+            dt,
+            yaw,
+            pitch,
+            input,
+        });
+    }
+    Ok(frames)
+}
+
+fn parse_trace_bit(value: &str, line_index: usize) -> Result<bool, String> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(format!("trace line {} bool invalid", line_index + 1)),
+    }
+}
+
+fn bool_to_bit(value: bool) -> u8 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn write_input_trace(recorder: InputTraceRecorder) -> Result<PathBuf, String> {
+    let path = input_trace_path(&recorder.name)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("trace dir create failed: {}", err))?;
+    }
+    let text = serialize_input_trace(&recorder.frames);
+    std::fs::write(&path, text).map_err(|err| format!("trace write failed: {}", err))?;
+    Ok(path)
+}
+
+fn load_input_trace(name: &str) -> Result<InputTracePlayback, String> {
+    let path = input_trace_path(name)?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| format!("trace read failed ({}): {}", path.display(), err))?;
+    let frames = parse_input_trace(&text)?;
+    if frames.is_empty() {
+        return Err("trace contains no frames".to_string());
+    }
+    Ok(InputTracePlayback::new(name.to_string(), frames))
 }
 
 #[derive(Default)]
@@ -3832,6 +4010,13 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
+    let collision_debug_cvars = match register_collision_debug_cvars(&mut cvars) {
+        Ok(cvars) => cvars,
+        Err(err) => {
+            eprintln!("collision debug cvar init failed: {}", err);
+            std::process::exit(EXIT_USAGE);
+        }
+    };
     if let Some(value) = args.dev_motor {
         if let Err(err) = cvars.set(movement_cvars.dev_motor, CvarValue::Int(value)) {
             eprintln!("--dev-motor {}", err);
@@ -3989,6 +4174,8 @@ fn main() {
     } else {
         None
     };
+    let mut input_trace_record: Option<InputTraceRecorder> = None;
+    let mut input_trace_playback: Option<InputTracePlayback> = None;
     let mut smoke_runner = if let Some(script_name) = args.smoke_script.as_deref() {
         let script = match load_smoke_script(&asset_manager, script_name) {
             Ok(script) => script,
@@ -4207,6 +4394,10 @@ fn main() {
                             &mut settings_flags,
                             &mut test_map_reload_requests,
                             test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
+                            test_map_runtime.as_mut(),
+                            &mut camera,
+                            &mut input_trace_record,
+                            &mut input_trace_playback,
                             &mut console_fullscreen_override,
                             &mut input,
                             &mut mouse_look,
@@ -4214,7 +4405,6 @@ fn main() {
                             &mut was_mouse_look,
                             scene_active,
                             &mut fly_mode,
-                            &mut camera,
                             collision.as_ref(),
                             audio.as_ref(),
                             sfx_data.as_ref(),
@@ -4354,6 +4544,7 @@ fn main() {
                         && scene_active
                         && mouse_look
                         && !mouse_grabbed
+                        && input_trace_playback.is_none()
                     {
                         if ignore_cursor_move {
                             ignore_cursor_move = false;
@@ -4434,7 +4625,7 @@ fn main() {
                         renderer.prewarm_yuv_pipeline();
                         pending_video_prewarm = false;
                     }
-                    let dt = (now - last_frame).as_secs_f32().min(0.1);
+                    let mut dt = (now - last_frame).as_secs_f32().min(0.1);
                     last_frame = now;
                     if video.is_some() && console.is_blocking() {
                         console.force_closed();
@@ -4537,6 +4728,10 @@ fn main() {
                                         &mut settings_flags,
                                         &mut test_map_reload_requests,
                                         test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
+                                        test_map_runtime.as_mut(),
+                                        &mut camera,
+                                        &mut input_trace_record,
+                                        &mut input_trace_playback,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4544,7 +4739,6 @@ fn main() {
                                         &mut was_mouse_look,
                                         scene_active,
                                         &mut fly_mode,
-                                        &mut camera,
                                         collision.as_ref(),
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
@@ -4596,6 +4790,10 @@ fn main() {
                                         &mut settings_flags,
                                         &mut test_map_reload_requests,
                                         test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
+                                        test_map_runtime.as_mut(),
+                                        &mut camera,
+                                        &mut input_trace_record,
+                                        &mut input_trace_playback,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4603,7 +4801,6 @@ fn main() {
                                         &mut was_mouse_look,
                                         scene_active,
                                         &mut fly_mode,
-                                        &mut camera,
                                         collision.as_ref(),
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
@@ -4637,6 +4834,10 @@ fn main() {
                                         &mut settings_flags,
                                         &mut test_map_reload_requests,
                                         test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
+                                        test_map_runtime.as_mut(),
+                                        &mut camera,
+                                        &mut input_trace_record,
+                                        &mut input_trace_playback,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4644,7 +4845,6 @@ fn main() {
                                         &mut was_mouse_look,
                                         scene_active,
                                         &mut fly_mode,
-                                        &mut camera,
                                         collision.as_ref(),
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
@@ -4685,6 +4885,10 @@ fn main() {
                                         &mut settings_flags,
                                         &mut test_map_reload_requests,
                                         test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
+                                        test_map_runtime.as_mut(),
+                                        &mut camera,
+                                        &mut input_trace_record,
+                                        &mut input_trace_playback,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4692,7 +4896,6 @@ fn main() {
                                         &mut was_mouse_look,
                                         scene_active,
                                         &mut fly_mode,
-                                        &mut camera,
                                         collision.as_ref(),
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
@@ -4726,6 +4929,10 @@ fn main() {
                                         &mut settings_flags,
                                         &mut test_map_reload_requests,
                                         test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
+                                        test_map_runtime.as_mut(),
+                                        &mut camera,
+                                        &mut input_trace_record,
+                                        &mut input_trace_playback,
                                         &mut console_fullscreen_override,
                                         &mut input,
                                         &mut mouse_look,
@@ -4733,7 +4940,6 @@ fn main() {
                                         &mut was_mouse_look,
                                         scene_active,
                                         &mut fly_mode,
-                                        &mut camera,
                                         collision.as_ref(),
                                         audio.as_ref(),
                                         sfx_data.as_ref(),
@@ -5302,6 +5508,29 @@ fn main() {
                         }
                     }
 
+                    let mut finished_trace = None;
+                    if let Some(playback) = input_trace_playback.as_mut() {
+                        if let Some(frame) = playback.next_frame() {
+                            dt = frame.dt.clamp(1.0e-4, 0.1);
+                            input = frame.input;
+                            camera.yaw = frame.yaw;
+                            camera.pitch = frame.pitch;
+                        } else {
+                            finished_trace = Some(playback.name.clone());
+                        }
+                    }
+                    if let Some(name) = finished_trace {
+                        input_trace_playback = None;
+                        console.push_line(format!("input replay complete: {}", name));
+                    }
+                    if input_trace_playback.is_none() {
+                        if let Some(recorder) = input_trace_record.as_mut() {
+                            if scene_active {
+                                recorder.push_frame(dt, input, &camera);
+                            }
+                        }
+                    }
+
                     if scene_active {
                 if let Some(runtime) = test_map_runtime.as_mut() {
                     apply_movement_cvars(&cvars, &movement_cvars, runtime, &mut camera);
@@ -5454,6 +5683,9 @@ fn main() {
                         }
                         let dbg_overlay_enabled =
                             cvar_bool(&cvars, core_cvars.dbg_overlay).unwrap_or(false);
+                        let show_collision = dbg_overlay_enabled
+                            && cvar_bool(&cvars, collision_debug_cvars.dev_collision_draw)
+                                .unwrap_or(false);
                         let show_movement = dbg_overlay_enabled
                             && cvar_bool(&cvars, core_cvars.dbg_movement).unwrap_or(false);
                         if let Some((dbg_text, dbg_lines)) = debug_overlay.update(
@@ -5490,28 +5722,32 @@ fn main() {
                                         if loopback.is_some() { "loopback" } else { "offline" }
                                     ));
                                 }
-                                if let Some(runtime) = test_map_runtime.as_ref() {
-                                    let collision_world = &runtime.collision_world;
-                                    let interest = collision_interest_bounds(
-                                        runtime.position.translation.vector,
-                                        COLLISION_INTEREST_RADIUS,
-                                    );
-                                    let nearby_chunks = select_collision_chunks(
-                                        &collision_world.world,
-                                        CollisionChunkSelection::Bounds(interest),
-                                    )
-                                    .len();
-                                    lines.push(format!(
-                                        "collision: chunks={} loaded={} colliders={} tris={}",
-                                        collision_world.world.chunks.len(),
-                                        collision_world.loaded_chunks.len(),
-                                        collision_world.collider_handles.len(),
-                                        collision_world.triangle_count
-                                    ));
-                                    lines.push(format!(
-                                        "collision_near={} kcc_ms={:.3}",
-                                        nearby_chunks, runtime.kcc_query_ms
-                                    ));
+                                if show_collision {
+                                    if let Some(runtime) = test_map_runtime.as_ref() {
+                                        let collision_world = &runtime.collision_world;
+                                        let interest = collision_interest_bounds(
+                                            runtime.position.translation.vector,
+                                            COLLISION_INTEREST_RADIUS,
+                                        );
+                                        let nearby_chunks = select_collision_chunks(
+                                            &collision_world.world,
+                                            CollisionChunkSelection::Bounds(interest),
+                                        )
+                                        .len();
+                                        lines.push(format!(
+                                            "collision: chunks={} loaded={} colliders={} tris={}",
+                                            collision_world.world.chunks.len(),
+                                            collision_world.loaded_chunks.len(),
+                                            collision_world.collider_handles.len(),
+                                            collision_world.triangle_count
+                                        ));
+                                        lines.push(format!(
+                                            "collision_near={} kcc_ms={:.3}",
+                                            nearby_chunks, runtime.kcc_query_ms
+                                        ));
+                                    } else {
+                                        lines.push("collision: <inactive>".to_string());
+                                    }
                                 }
                                 if show_movement {
                                     if let Some(runtime) = test_map_runtime.as_ref() {
@@ -6445,6 +6681,7 @@ fn main() {
                     && scene_active
                     && mouse_look
                     && mouse_grabbed
+                    && input_trace_playback.is_none()
                 {
                     if let DeviceEvent::MouseMotion { delta } = event {
                         camera.apply_mouse(delta.0, delta.1);
@@ -7345,6 +7582,10 @@ struct PalletCommandUser<'a> {
     settings_flags: &'a mut SettingsChangeFlags,
     test_map_reload_requests: &'a mut VecDeque<AssetKey>,
     active_test_map: Option<AssetKey>,
+    test_map_runtime: Option<&'a mut TestMapRuntime>,
+    camera: Option<&'a mut CameraState>,
+    input_trace_record: &'a mut Option<InputTraceRecorder>,
+    input_trace_playback: &'a mut Option<InputTracePlayback>,
 }
 
 impl<'a> ExecPathResolver for PalletCommandUser<'a> {
@@ -7401,6 +7642,10 @@ fn dispatch_console_line(
     settings_flags: &mut SettingsChangeFlags,
     test_map_reload_requests: &mut VecDeque<AssetKey>,
     active_test_map: Option<AssetKey>,
+    test_map_runtime: Option<&mut TestMapRuntime>,
+    camera: Option<&mut CameraState>,
+    input_trace_record: &mut Option<InputTraceRecorder>,
+    input_trace_playback: &mut Option<InputTracePlayback>,
 ) {
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
@@ -7418,6 +7663,10 @@ fn dispatch_console_line(
                 settings_flags,
                 test_map_reload_requests,
                 active_test_map,
+                test_map_runtime,
+                camera,
+                input_trace_record,
+                input_trace_playback,
             };
             commands.dispatch_line(line, cvars, console, &mut user)
         }
@@ -7456,6 +7705,8 @@ fn dispatch_smoke_command(
     settings_flags: &mut SettingsChangeFlags,
 ) -> Result<(), String> {
     let mut test_map_reload_requests = VecDeque::new();
+    let mut input_trace_record = None;
+    let mut input_trace_playback = None;
     let dispatch_result = match build_command_registry(core_cvars) {
         Ok(mut commands) => {
             let mut user = PalletCommandUser {
@@ -7472,6 +7723,10 @@ fn dispatch_smoke_command(
                 settings_flags,
                 test_map_reload_requests: &mut test_map_reload_requests,
                 active_test_map: None,
+                test_map_runtime: None,
+                camera: None,
+                input_trace_record: &mut input_trace_record,
+                input_trace_playback: &mut input_trace_playback,
             };
             commands.dispatch(&parsed.name, &parsed.args, cvars, console, &mut user)
         }
@@ -7544,6 +7799,122 @@ fn register_cvar_alias_command<'a>(
         }),
     )?;
     Ok(())
+}
+
+struct PlayerTuneParam {
+    name: &'static str,
+    cvar_name: &'static str,
+    help: &'static str,
+}
+
+const PLAYER_TUNE_PARAMS: &[PlayerTuneParam] = &[
+    PlayerTuneParam {
+        name: "air_max_speed",
+        cvar_name: "arena_air_max_speed",
+        help: "Arena air max speed.",
+    },
+    PlayerTuneParam {
+        name: "air_accel",
+        cvar_name: "arena_air_accel",
+        help: "Arena air acceleration.",
+    },
+    PlayerTuneParam {
+        name: "air_resist",
+        cvar_name: "arena_air_resistance",
+        help: "Arena air resistance.",
+    },
+    PlayerTuneParam {
+        name: "air_resist_scale",
+        cvar_name: "arena_air_resistance_speed_scale",
+        help: "Arena air resistance speed scaling.",
+    },
+    PlayerTuneParam {
+        name: "golden_target_deg",
+        cvar_name: "arena_golden_target_deg",
+        help: "Golden angle target (degrees).",
+    },
+    PlayerTuneParam {
+        name: "golden_gain_min",
+        cvar_name: "arena_golden_gain_min",
+        help: "Golden angle min gain.",
+    },
+    PlayerTuneParam {
+        name: "golden_gain_peak",
+        cvar_name: "arena_golden_gain_peak",
+        help: "Golden angle peak gain.",
+    },
+    PlayerTuneParam {
+        name: "golden_bonus_scale",
+        cvar_name: "arena_golden_bonus_scale",
+        help: "Golden angle bonus scale.",
+    },
+    PlayerTuneParam {
+        name: "golden_blend_start",
+        cvar_name: "arena_golden_blend_start",
+        help: "Golden angle blend start speed.",
+    },
+    PlayerTuneParam {
+        name: "golden_blend_end",
+        cvar_name: "arena_golden_blend_end",
+        help: "Golden angle blend end speed.",
+    },
+    PlayerTuneParam {
+        name: "cs_strength_deg",
+        cvar_name: "arena_cs_strength_deg",
+        help: "Corridor shaping strength (deg/sec).",
+    },
+    PlayerTuneParam {
+        name: "cs_min_speed",
+        cvar_name: "arena_cs_min_speed",
+        help: "Corridor shaping minimum speed.",
+    },
+    PlayerTuneParam {
+        name: "cs_max_angle_deg",
+        cvar_name: "arena_cs_max_angle_deg",
+        help: "Corridor shaping max angle per tick (degrees).",
+    },
+    PlayerTuneParam {
+        name: "cs_min_align",
+        cvar_name: "arena_cs_min_alignment",
+        help: "Corridor shaping minimum alignment.",
+    },
+];
+
+fn resolve_player_tune_param(name: &str) -> Option<&'static PlayerTuneParam> {
+    PLAYER_TUNE_PARAMS
+        .iter()
+        .find(|param| param.name == name || param.cvar_name == name)
+}
+
+fn parse_motor_kind(input: &str) -> Result<MotorKind, String> {
+    match input {
+        "arena" => Ok(MotorKind::Arena),
+        "rpg" => Ok(MotorKind::Rpg),
+        "1" => Ok(MotorKind::Arena),
+        "2" => Ok(MotorKind::Rpg),
+        _ => Err("expected arena or rpg".to_string()),
+    }
+}
+
+fn motor_kind_label(kind: MotorKind) -> &'static str {
+    match kind {
+        MotorKind::Arena => "arena",
+        MotorKind::Rpg => "rpg",
+    }
+}
+
+fn parse_radius_arg(args: &CommandArgs, default_radius: f32) -> Result<f32, String> {
+    let Some(raw) = args.positional(0) else {
+        return Ok(default_radius);
+    };
+    let value = raw.strip_prefix("radius=").unwrap_or(raw);
+    let radius = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid radius: {}", raw))?;
+    if radius <= 0.0 {
+        return Err("radius must be > 0".to_string());
+    }
+    Ok(radius)
 }
 
 fn build_command_registry<'a>(
@@ -8056,6 +8427,239 @@ fn build_command_registry<'a>(
                 JobQueue::Io,
                 move || run_content_validate(path_policy, quake_dir),
             )
+        }),
+    )?;
+    commands.set_handler(
+        "dev_collision_draw",
+        Box::new(|ctx, args| {
+            let current = match ctx.cvars.get_by_name("dev_collision_draw") {
+                Some(entry) => match entry.value {
+                    CvarValue::Bool(value) => value,
+                    _ => false,
+                },
+                None => return Err("dev_collision_draw cvar missing".to_string()),
+            };
+            let next = match parse_toggle_arg(args)? {
+                Some(value) => value,
+                None => !current,
+            };
+            let value = if next { "1" } else { "0" };
+            ctx.cvars.set_from_str("dev_collision_draw", value)?;
+            ctx.output.push_line(format!(
+                "collision draw: {}",
+                if next { "on" } else { "off" }
+            ));
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "dev_collision_dump_near_player",
+        Box::new(|ctx, args| {
+            let radius = parse_radius_arg(args, COLLISION_INTEREST_RADIUS)?;
+            let runtime = ctx
+                .user
+                .test_map_runtime
+                .as_ref()
+                .ok_or_else(|| "no test map runtime loaded".to_string())?;
+            let interest = collision_interest_bounds(runtime.position.translation.vector, radius);
+            let selected = select_collision_chunks(
+                &runtime.collision_world.world,
+                CollisionChunkSelection::Bounds(interest),
+            );
+            ctx.output.push_line(format!(
+                "collision near: radius={:.2} chunks={}",
+                radius,
+                selected.len()
+            ));
+            for index in selected {
+                let chunk = match runtime
+                    .collision_world
+                    .world
+                    .chunks
+                    .get(index as usize)
+                {
+                    Some(chunk) => chunk,
+                    None => continue,
+                };
+                let loaded = runtime.collision_world.loaded_chunks.contains(&index);
+                ctx.output.push_line(format!(
+                    "- {} loaded={} tris={} bounds=({:.2},{:.2},{:.2})..({:.2},{:.2},{:.2}) payload={}",
+                    chunk.chunk_id,
+                    if loaded { "yes" } else { "no" },
+                    chunk.triangle_count,
+                    chunk.aabb_min[0],
+                    chunk.aabb_min[1],
+                    chunk.aabb_min[2],
+                    chunk.aabb_max[0],
+                    chunk.aabb_max[1],
+                    chunk.aabb_max[2],
+                    chunk.payload_ref
+                ));
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "player_set_profile",
+        Box::new(|ctx, args| {
+            let value = args
+                .positional(0)
+                .ok_or_else(|| "usage: player_set_profile <arena|rpg>".to_string())?;
+            let kind = parse_motor_kind(value)?;
+            let cvar_value = if matches!(kind, MotorKind::Arena) {
+                "1"
+            } else {
+                "2"
+            };
+            ctx.cvars.set_from_str("dev_motor", cvar_value)?;
+            if let (Some(runtime), Some(camera)) =
+                (ctx.user.test_map_runtime.as_mut(), ctx.user.camera.as_mut())
+            {
+                switch_test_map_motor(runtime, camera, kind);
+            }
+            ctx.output
+                .push_line(format!("player profile: {}", motor_kind_label(kind)));
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "player_dump_state",
+        Box::new(|ctx, _args| {
+            let runtime = ctx
+                .user
+                .test_map_runtime
+                .as_ref()
+                .ok_or_else(|| "no test map runtime loaded".to_string())?;
+            let pos = runtime.position.translation;
+            let vel = runtime.velocity;
+            let speed = (vel.x * vel.x + vel.y * vel.y + vel.z * vel.z).sqrt();
+            ctx.output.push_line(format!(
+                "player: motor={} grounded={}",
+                motor_kind_label(runtime.motor_kind),
+                runtime.grounded
+            ));
+            ctx.output
+                .push_line(format!("pos: {:.3} {:.3} {:.3}", pos.x, pos.y, pos.z));
+            ctx.output.push_line(format!(
+                "vel: {:.3} {:.3} {:.3} speed={:.3}",
+                vel.x, vel.y, vel.z, speed
+            ));
+            if let Some(normal) = runtime.ground_normal {
+                ctx.output.push_line(format!(
+                    "ground_normal: {:.3} {:.3} {:.3}",
+                    normal.x, normal.y, normal.z
+                ));
+            }
+            ctx.output.push_line(format!(
+                "capsule_offset: {:.3} kcc_ms={:.3}",
+                runtime.capsule_offset, runtime.kcc_query_ms
+            ));
+            if let Some(camera) = ctx.user.camera.as_ref() {
+                ctx.output.push_line(format!(
+                    "camera: yaw={:.2} pitch={:.2}",
+                    camera.yaw.to_degrees(),
+                    camera.pitch.to_degrees()
+                ));
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "player_tune_set",
+        Box::new(|ctx, args| {
+            let param = args
+                .positional(0)
+                .ok_or_else(|| "usage: player_tune_set <param> <value>".to_string())?;
+            let value = args
+                .positional(1)
+                .ok_or_else(|| "usage: player_tune_set <param> <value>".to_string())?;
+            let cvar_name = resolve_player_tune_param(param)
+                .map(|param| param.cvar_name)
+                .unwrap_or(param);
+            let parsed = ctx
+                .cvars
+                .set_from_str(cvar_name, value)
+                .map_err(|err| format!("{err} (use player_tune_list)"))?;
+            ctx.output
+                .push_line(format!("{cvar_name} = {}", parsed.display()));
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "player_tune_list",
+        Box::new(|ctx, _args| {
+            ctx.output.push_line("player tune params:".to_string());
+            for param in PLAYER_TUNE_PARAMS {
+                if let Some(entry) = ctx.cvars.get_by_name(param.cvar_name) {
+                    ctx.output.push_line(format!(
+                        "{} = {} ({}) - {}",
+                        param.name,
+                        entry.value.display(),
+                        param.cvar_name,
+                        param.help
+                    ));
+                }
+            }
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "dev_input_record",
+        Box::new(|ctx, args| {
+            let name = args
+                .positional(0)
+                .ok_or_else(|| "usage: dev_input_record <name>".to_string())?;
+            if ctx.user.input_trace_playback.is_some() {
+                return Err("input replay active".to_string());
+            }
+            if ctx.user.input_trace_record.is_some() {
+                return Err("input record already active".to_string());
+            }
+            *ctx.user.input_trace_record = Some(InputTraceRecorder::new(name.to_string()));
+            ctx.output
+                .push_line(format!("input record: started {}", name));
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "dev_input_record_stop",
+        Box::new(|ctx, _args| {
+            let recorder = ctx
+                .user
+                .input_trace_record
+                .take()
+                .ok_or_else(|| "input record not active".to_string())?;
+            let path = write_input_trace(recorder)?;
+            ctx.output
+                .push_line(format!("input record: wrote {}", path.display()));
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "dev_input_replay",
+        Box::new(|ctx, args| {
+            let name = args
+                .positional(0)
+                .ok_or_else(|| "usage: dev_input_replay <name>".to_string())?;
+            if ctx.user.input_trace_record.is_some() {
+                return Err("input record active".to_string());
+            }
+            let playback = load_input_trace(name)?;
+            *ctx.user.input_trace_playback = Some(playback);
+            ctx.output
+                .push_line(format!("input replay: started {}", name));
+            Ok(())
+        }),
+    )?;
+    commands.set_handler(
+        "dev_input_replay_stop",
+        Box::new(|ctx, _args| {
+            if ctx.user.input_trace_playback.take().is_some() {
+                ctx.output.push_line("input replay: stopped".to_string());
+            } else {
+                ctx.output.push_line("input replay: not active".to_string());
+            }
+            Ok(())
         }),
     )?;
     commands.set_handler(
@@ -9015,6 +9619,22 @@ fn apply_cvar_changes(
             }
         }
     }
+}
+
+fn register_collision_debug_cvars(
+    registry: &mut CvarRegistry,
+) -> Result<CollisionDebugCvars, String> {
+    let mut flags = CvarFlags::DEV_ONLY;
+    flags.insert(CvarFlags::NO_PERSIST);
+    let dev_collision_draw = registry.register(
+        CvarDef::new(
+            "dev_collision_draw",
+            CvarValue::Bool(false),
+            "Draw collision debug overlay.",
+        )
+        .with_flags(flags),
+    )?;
+    Ok(CollisionDebugCvars { dev_collision_draw })
 }
 
 fn register_movement_cvars(registry: &mut CvarRegistry) -> Result<MovementCvars, String> {
@@ -10772,6 +11392,10 @@ fn handle_non_video_key_input(
     settings_flags: &mut SettingsChangeFlags,
     test_map_reload_requests: &mut VecDeque<AssetKey>,
     active_test_map: Option<AssetKey>,
+    test_map_runtime: Option<&mut TestMapRuntime>,
+    camera: &mut CameraState,
+    input_trace_record: &mut Option<InputTraceRecorder>,
+    input_trace_playback: &mut Option<InputTracePlayback>,
     console_fullscreen_override: &mut bool,
     input: &mut InputState,
     mouse_look: &mut bool,
@@ -10779,7 +11403,6 @@ fn handle_non_video_key_input(
     was_mouse_look: &mut bool,
     scene_active: bool,
     fly_mode: &mut bool,
-    camera: &mut CameraState,
     collision: Option<&SceneCollision>,
     audio: Option<&Rc<AudioEngine>>,
     sfx_data: Option<&Vec<u8>>,
@@ -10882,6 +11505,10 @@ fn handle_non_video_key_input(
                                 settings_flags,
                                 test_map_reload_requests,
                                 active_test_map.clone(),
+                                test_map_runtime,
+                                Some(camera),
+                                input_trace_record,
+                                input_trace_playback,
                             );
                         }
                     }
