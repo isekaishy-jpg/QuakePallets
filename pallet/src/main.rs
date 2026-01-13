@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audio::AudioEngine;
-use character_collision::{CharacterCollision, CollisionProfile};
+use character_collision::CollisionProfile;
 use character_motor_arena::{
     build_move_intent, golden_angle_metrics, ArenaMotor, ArenaMotorConfig, ArenaMotorInput,
     ArenaMotorState, FrictionlessJumpMode,
@@ -54,6 +54,11 @@ use platform_winit::{
     create_window, ControlFlow, CursorGrabMode, DeviceEvent, ElementState, Event, Fullscreen, Ime,
     KeyCode, ModifiersState, MouseButton, MouseScrollDelta, PhysicalKey, PhysicalPosition,
     PhysicalSize, Window, WindowEvent,
+};
+use player_camera::PlayerCamera;
+use player_controller::{
+    DirectInputAdapter, InputIntent, Motor as ControllerMotor, MotorContext, MotorOutput,
+    PlayerController, PlayerKinematics, RawInput,
 };
 use rapier3d::math::{Isometry, Vector};
 use rapier3d::prelude::{ColliderHandle, Real};
@@ -477,6 +482,103 @@ impl MotorKind {
     }
 }
 
+struct DualMotor {
+    kind: MotorKind,
+    arena: ArenaMotor,
+    rpg: RpgMotor,
+}
+
+impl DualMotor {
+    fn new(arena_config: ArenaMotorConfig, rpg_config: RpgMotorConfig) -> Self {
+        Self {
+            kind: MotorKind::Arena,
+            arena: ArenaMotor::new(arena_config),
+            rpg: RpgMotor::new(rpg_config),
+        }
+    }
+
+    fn kind(&self) -> MotorKind {
+        self.kind
+    }
+
+    fn set_kind(&mut self, kind: MotorKind) {
+        if self.kind == kind {
+            return;
+        }
+        self.kind = kind;
+        self.reset_states();
+    }
+
+    fn reset_states(&mut self) {
+        self.arena.reset_state();
+        self.rpg.reset_state();
+    }
+
+    fn arena_config(&self) -> ArenaMotorConfig {
+        self.arena.config()
+    }
+
+    fn arena_config_mut(&mut self) -> &mut ArenaMotorConfig {
+        self.arena.config_mut()
+    }
+
+    fn rpg_config(&self) -> RpgMotorConfig {
+        self.rpg.config()
+    }
+}
+
+impl ControllerMotor for DualMotor {
+    fn step(
+        &mut self,
+        input: &InputIntent,
+        state: &PlayerKinematics,
+        ctx: MotorContext,
+    ) -> MotorOutput {
+        match self.kind {
+            MotorKind::Arena => {
+                let motor_state = ArenaMotorState {
+                    velocity: state.velocity,
+                    grounded: state.grounded,
+                    ground_normal: state.ground_normal,
+                    yaw: ctx.yaw,
+                };
+                let motor_output = self.arena.step(
+                    ArenaMotorInput {
+                        move_axis: input.move_axis,
+                        jump: input.jump,
+                    },
+                    motor_state,
+                    ctx.dt,
+                );
+                MotorOutput {
+                    desired_translation: motor_output.desired_translation,
+                    next_velocity: motor_output.next_velocity,
+                }
+            }
+            MotorKind::Rpg => {
+                let motor_state = RpgMotorState {
+                    velocity: state.velocity,
+                    grounded: state.grounded,
+                    ground_normal: state.ground_normal,
+                    yaw: ctx.yaw,
+                };
+                let motor_output = self.rpg.step(
+                    RpgMotorInput {
+                        move_axis: input.move_axis,
+                        jump: input.jump,
+                    },
+                    motor_state,
+                    ctx.dt,
+                );
+                MotorOutput {
+                    desired_translation: motor_output.desired_translation,
+                    next_velocity: motor_output.next_velocity,
+                }
+            }
+        }
+    }
+}
+
 struct LoadedScene {
     mesh: MeshData,
     bounds: Bounds,
@@ -503,8 +605,8 @@ struct CollisionWorldRuntime {
 struct TestMapRuntime {
     key: AssetKey,
     world: PhysicsWorld,
-    collision: CharacterCollision,
     collision_world: CollisionWorldRuntime,
+    controller: PlayerController<DirectInputAdapter, DualMotor>,
     position: Isometry<Real>,
     prev_position: Isometry<Real>,
     velocity: Vec3,
@@ -512,9 +614,6 @@ struct TestMapRuntime {
     grounded: bool,
     ground_normal: Option<Vector<Real>>,
     capsule_offset: f32,
-    motor_kind: MotorKind,
-    motor_arena: ArenaMotor,
-    motor_rpg: RpgMotor,
     kcc_query_ms: f32,
 }
 
@@ -566,12 +665,16 @@ fn enter_map_scene(
         .map(|data| build_test_map_runtime(&data, &scene.bounds))
         .transpose()?;
     if let Some(runtime) = test_map_runtime.as_mut() {
-        let tuning = match runtime.motor_kind {
-            MotorKind::Arena => camera_tuning_from_arena(runtime.motor_arena.config()),
-            MotorKind::Rpg => camera_tuning_from_rpg(runtime.motor_rpg.config()),
+        let tuning = match runtime.controller.motor().kind() {
+            MotorKind::Arena => camera_tuning_from_arena(runtime.controller.motor().arena_config()),
+            MotorKind::Rpg => camera_tuning_from_rpg(runtime.controller.motor().rpg_config()),
         };
         configure_test_map_camera(camera, &scene.bounds, tuning);
         snap_test_map_runtime_to_ground(runtime, &scene.bounds);
+        runtime
+            .controller
+            .camera_mut()
+            .set_look(camera.yaw, camera.pitch);
         let origin_y = runtime.position.translation.y - runtime.capsule_offset;
         camera.position = Vec3::new(
             runtime.position.translation.x,
@@ -582,8 +685,7 @@ fn enter_map_scene(
         camera.vertical_velocity = 0.0;
         camera.on_ground = runtime.grounded;
         runtime.velocity = Vec3::zero();
-        runtime.motor_arena.reset_state();
-        runtime.motor_rpg.reset_state();
+        runtime.controller.motor_mut().reset_states();
         *fly_mode = false;
     }
     *scene_active = true;
@@ -3880,6 +3982,7 @@ fn main() {
         }
     }
 
+    let lua_command_queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
     let mut script: Option<ScriptRuntime> = None;
     if let Some(script_name) = args.script.as_deref() {
         let key = match script_asset_key(script_name) {
@@ -3902,11 +4005,16 @@ fn main() {
         )));
         let spawn_state = Rc::clone(&host_state);
         let sound_state = Rc::clone(&host_state);
+        let cmd_queue = Rc::clone(&lua_command_queue);
         let callbacks = HostCallbacks {
             spawn_entity: Box::new(move |request| spawn_state.borrow_mut().spawn_entity(request)),
             play_sound: Box::new(move |asset| sound_state.borrow_mut().play_sound(asset)),
             log: Box::new(move |msg| {
                 println!("[lua] {}", msg);
+            }),
+            run_command: Box::new(move |line| {
+                cmd_queue.borrow_mut().push_back(line);
+                Ok(())
             }),
         };
         let mut engine = match ScriptEngine::new(ScriptConfig::default(), callbacks) {
@@ -4168,7 +4276,6 @@ fn main() {
             Instant::now(),
         );
     }
-
     let mut input_script = if args.input_script {
         Some(InputScript::new(Instant::now(), &settings))
     } else {
@@ -5183,6 +5290,30 @@ fn main() {
                             eprintln!("lua on_tick failed: {}", err);
                         }
                     }
+                    drain_lua_command_queue(
+                        &lua_command_queue,
+                        &mut console,
+                        &mut perf,
+                        &mut cvars,
+                        &core_cvars,
+                        &path_policy,
+                        &asset_manager,
+                        upload_queue.clone(),
+                        quake_vfs.clone(),
+                        quake_dir.clone(),
+                        console_async_sender.clone(),
+                        &log_filter_state,
+                        &mut capture_requests,
+                        &mut settings,
+                        &mut settings_flags,
+                        &mut test_map_reload_requests,
+                        test_map_runtime.as_ref().map(|runtime| runtime.key.clone()),
+                        &mut test_map_runtime,
+                        &mut camera,
+                        &mut input_trace_record,
+                        &mut input_trace_playback,
+                        &mut script,
+                    );
 
                     if next_video.is_none() {
                         let should_start = next_video_start_at
@@ -5756,9 +5887,10 @@ fn main() {
                                             bool_to_axis(input.forward, input.back),
                                         ];
                                         let (intent_mag, max_speed, golden_config) =
-                                            match runtime.motor_kind {
+                                            match runtime.controller.motor().kind() {
                                                 MotorKind::Arena => {
-                                                    let config = runtime.motor_arena.config();
+                                                    let config =
+                                                        runtime.controller.motor().arena_config();
                                                     let intent = build_move_intent(
                                                         camera.yaw,
                                                         move_axis,
@@ -5773,7 +5905,8 @@ fn main() {
                                                     (intent.mag, max_speed, Some(config))
                                                 }
                                                 MotorKind::Rpg => {
-                                                    let config = runtime.motor_rpg.config();
+                                                    let config =
+                                                        runtime.controller.motor().rpg_config();
                                                     let intent = build_move_intent_rpg(
                                                         camera.yaw,
                                                         move_axis,
@@ -7743,6 +7876,64 @@ fn dispatch_smoke_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn drain_lua_command_queue(
+    queue: &Rc<RefCell<VecDeque<String>>>,
+    console: &mut ConsoleState,
+    perf: &mut PerfState,
+    cvars: &mut CvarRegistry,
+    core_cvars: &CoreCvars,
+    path_policy: &PathPolicy,
+    asset_manager: &AssetManager,
+    upload_queue: UploadQueue,
+    quake_vfs: Option<Arc<Vfs>>,
+    quake_dir: Option<PathBuf>,
+    console_async: ConsoleAsyncSender,
+    log_filter_state: &Arc<Mutex<LogFilterState>>,
+    capture_requests: &mut VecDeque<CaptureRequest>,
+    settings: &mut Settings,
+    settings_flags: &mut SettingsChangeFlags,
+    test_map_reload_requests: &mut VecDeque<AssetKey>,
+    active_test_map: Option<AssetKey>,
+    test_map_runtime: &mut Option<TestMapRuntime>,
+    camera: &mut CameraState,
+    input_trace_record: &mut Option<InputTraceRecorder>,
+    input_trace_playback: &mut Option<InputTracePlayback>,
+    script: &mut Option<ScriptRuntime>,
+) {
+    loop {
+        let line = queue.borrow_mut().pop_front();
+        let Some(line) = line else {
+            break;
+        };
+        console.push_line(format!("> {}", line));
+        dispatch_console_line(
+            &line,
+            console,
+            perf,
+            cvars,
+            core_cvars,
+            script.as_mut(),
+            path_policy,
+            asset_manager,
+            upload_queue.clone(),
+            quake_vfs.clone(),
+            quake_dir.clone(),
+            console_async.clone(),
+            log_filter_state,
+            capture_requests,
+            settings,
+            settings_flags,
+            test_map_reload_requests,
+            active_test_map.clone(),
+            test_map_runtime.as_mut(),
+            Some(camera),
+            input_trace_record,
+            input_trace_playback,
+        );
+    }
+}
+
 fn queue_capture_request(
     ctx: &mut engine_core::control_plane::CommandContext<'_, PalletCommandUser<'_>>,
     args: &CommandArgs,
@@ -8535,7 +8726,7 @@ fn build_command_registry<'a>(
             let speed = (vel.x * vel.x + vel.y * vel.y + vel.z * vel.z).sqrt();
             ctx.output.push_line(format!(
                 "player: motor={} grounded={}",
-                motor_kind_label(runtime.motor_kind),
+                motor_kind_label(runtime.controller.motor().kind()),
                 runtime.grounded
             ));
             ctx.output
@@ -9855,7 +10046,7 @@ fn apply_movement_cvars(
     runtime: &mut TestMapRuntime,
     camera: &mut CameraState,
 ) {
-    let config = runtime.motor_arena.config_mut();
+    let config = runtime.controller.motor_mut().arena_config_mut();
     if let Some(value) = cvar_float(cvars, ids.air_max_speed) {
         config.max_speed_air = value.max(0.0);
     }
@@ -10434,7 +10625,7 @@ fn snap_test_map_runtime_to_ground(runtime: &mut TestMapRuntime, bounds: &Bounds
     let extent = bounds.extent();
     let drop = (extent.y + extent.x.max(extent.z)).max(1.0) + runtime.capsule_offset + 2.0;
     let desired = Vector::new(0.0, -drop, 0.0);
-    let result = runtime.collision.move_character(
+    let result = runtime.controller.collision_mut().move_character(
         &runtime.world,
         runtime.position,
         desired,
@@ -10446,6 +10637,11 @@ fn snap_test_map_runtime_to_ground(runtime: &mut TestMapRuntime, bounds: &Bounds
     runtime.grounded = result.grounded;
     runtime.ground_normal = result.ground_normal;
     runtime.prev_velocity = runtime.velocity;
+    let state = runtime.controller.state_mut();
+    state.position = runtime.position;
+    state.velocity = Vector::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z);
+    state.grounded = runtime.grounded;
+    state.ground_normal = runtime.ground_normal;
 }
 
 enum CollisionChunkSelection {
@@ -10543,9 +10739,8 @@ fn build_test_map_collision_runtime(
     })
 }
 
-// NOTE: Test map runtime uses a minimal Rapier KCC loop so we can walk
-// graybox collision today. Keep this code contained and well-commented so it
-// can be replaced by the full controller pipeline later without surprises.
+// NOTE: Test map runtime routes through the shared controller module
+// (input -> motor -> collision -> camera) so gameplay and tests stay aligned.
 fn build_test_map_runtime(
     data: &TestMapSceneData,
     bounds: &Bounds,
@@ -10560,11 +10755,14 @@ fn build_test_map_runtime(
     let capsule_offset = profile.capsule_height * 0.5 + profile.capsule_radius;
     let center = bounds.center();
     let position = Isometry::translation(center.x, bounds.max.y + capsule_offset + 1.0, center.z);
+    let motor = DualMotor::new(arena_config, rpg_config);
+    let camera = PlayerCamera::new(TEST_MAP_EYE_HEIGHT);
+    let controller = PlayerController::new(DirectInputAdapter, motor, profile, camera, position);
     let runtime = TestMapRuntime {
         key: data.key.clone(),
         world,
-        collision: CharacterCollision::new(profile),
         collision_world,
+        controller,
         position,
         prev_position: position,
         velocity: Vec3::zero(),
@@ -10572,9 +10770,6 @@ fn build_test_map_runtime(
         grounded: false,
         ground_normal: None,
         capsule_offset,
-        motor_kind: MotorKind::Arena,
-        motor_arena: ArenaMotor::new(arena_config),
-        motor_rpg: RpgMotor::new(rpg_config),
         kcc_query_ms: 0.0,
     };
     Ok(runtime)
@@ -10605,27 +10800,31 @@ fn switch_test_map_motor(
     camera: &mut CameraState,
     motor_kind: MotorKind,
 ) {
-    if runtime.motor_kind == motor_kind {
+    if runtime.controller.motor().kind() == motor_kind {
         return;
     }
-    runtime.motor_kind = motor_kind;
+    runtime.controller.motor_mut().set_kind(motor_kind);
     let (profile, tuning) = match motor_kind {
         MotorKind::Arena => (
             CollisionProfile::arena_default(),
-            camera_tuning_from_arena(runtime.motor_arena.config()),
+            camera_tuning_from_arena(runtime.controller.motor().arena_config()),
         ),
         MotorKind::Rpg => (
             CollisionProfile::rpg_default(),
-            camera_tuning_from_rpg(runtime.motor_rpg.config()),
+            camera_tuning_from_rpg(runtime.controller.motor().rpg_config()),
         ),
     };
     let origin_y = runtime.position.translation.y - runtime.capsule_offset;
-    runtime.collision.set_profile(profile);
+    runtime.controller.collision_mut().set_profile(profile);
     runtime.capsule_offset = profile.capsule_height * 0.5 + profile.capsule_radius;
     runtime.position.translation.y = origin_y + runtime.capsule_offset;
+    runtime.prev_position = runtime.position;
+    let state = runtime.controller.state_mut();
+    state.position = runtime.position;
+    state.velocity = Vector::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z);
+    state.grounded = runtime.grounded;
+    state.ground_normal = runtime.ground_normal;
     apply_test_map_camera_tuning(camera, tuning);
-    runtime.motor_arena.reset_state();
-    runtime.motor_rpg.reset_state();
 }
 
 fn sync_test_map_runtime_to_camera(runtime: &mut TestMapRuntime, camera: &CameraState) {
@@ -10640,8 +10839,16 @@ fn sync_test_map_runtime_to_camera(runtime: &mut TestMapRuntime, camera: &Camera
     runtime.prev_velocity = Vec3::zero();
     runtime.grounded = false;
     runtime.ground_normal = None;
-    runtime.motor_arena.reset_state();
-    runtime.motor_rpg.reset_state();
+    runtime
+        .controller
+        .camera_mut()
+        .set_look(camera.yaw, camera.pitch);
+    runtime.controller.motor_mut().reset_states();
+    let state = runtime.controller.state_mut();
+    state.position = runtime.position;
+    state.velocity = Vector::zeros();
+    state.grounded = false;
+    state.ground_normal = None;
     runtime.kcc_query_ms = 0.0;
 }
 
@@ -10656,58 +10863,30 @@ fn update_test_map_runtime(
     runtime.prev_velocity = runtime.velocity;
     let move_x = bool_to_axis(input.right, input.left);
     let move_y = bool_to_axis(input.forward, input.back);
-    let (desired, next_velocity) = match runtime.motor_kind {
-        MotorKind::Arena => {
-            let motor_state = ArenaMotorState {
-                velocity: Vector::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z),
-                grounded: runtime.grounded,
-                ground_normal: runtime.ground_normal,
-                yaw: camera.yaw,
-            };
-            let motor_output = runtime.motor_arena.step(
-                ArenaMotorInput {
-                    move_axis: [move_x, move_y],
-                    jump: input.jump_active(),
-                },
-                motor_state,
-                dt,
-            );
-            (motor_output.desired_translation, motor_output.next_velocity)
-        }
-        MotorKind::Rpg => {
-            let motor_state = RpgMotorState {
-                velocity: Vector::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z),
-                grounded: runtime.grounded,
-                ground_normal: runtime.ground_normal,
-                yaw: camera.yaw,
-            };
-            let motor_output = runtime.motor_rpg.step(
-                RpgMotorInput {
-                    move_axis: [move_x, move_y],
-                    jump: input.jump_active(),
-                },
-                motor_state,
-                dt,
-            );
-            (motor_output.desired_translation, motor_output.next_velocity)
-        }
+    let raw_input = RawInput {
+        move_x,
+        move_y,
+        jump: input.jump_active(),
+        look_delta: [0.0, 0.0],
     };
-    let allow_step = runtime.grounded && !input.jump_active();
+    runtime
+        .controller
+        .camera_mut()
+        .set_look(camera.yaw, camera.pitch);
     let kcc_start = Instant::now();
-    let result =
-        runtime
-            .collision
-            .move_character(&runtime.world, runtime.position, desired, allow_step, dt);
+    let frame = runtime.controller.tick(&runtime.world, raw_input, dt);
     runtime.kcc_query_ms = update_kcc_query_ms(runtime.kcc_query_ms, kcc_start.elapsed());
-    let mut next_velocity = next_velocity;
-    runtime.position = result.position;
-    runtime.grounded = result.grounded;
-    runtime.ground_normal = result.ground_normal;
-    if result.hit_ceiling && next_velocity.y > 0.0 {
+    runtime.position = frame.kinematics.position;
+    runtime.grounded = frame.kinematics.grounded;
+    runtime.ground_normal = frame.kinematics.ground_normal;
+
+    let mut next_velocity = frame.kinematics.velocity;
+    if frame.collision.hit_ceiling && next_velocity.y > 0.0 {
         next_velocity.y = 0.0;
     }
-    if result.grounded && next_velocity.y < 0.0 {
-        let allow_downhill = result
+    if frame.kinematics.grounded && next_velocity.y < 0.0 {
+        let allow_downhill = frame
+            .kinematics
             .ground_normal
             .map(|normal| normal.y < 0.99)
             .unwrap_or(false);
@@ -10715,24 +10894,13 @@ fn update_test_map_runtime(
             next_velocity.y = 0.0;
         }
     }
-    if dt > 0.0 && result.hit_wall {
-        next_velocity.x = result.translation.x / dt;
-        next_velocity.z = result.translation.z / dt;
-        if let Some(wall_normal) = result.wall_normal {
-            let dot = next_velocity.dot(&wall_normal);
-            if dot < 0.0 {
-                next_velocity -= wall_normal * dot;
-            }
-        }
-    }
     runtime.velocity = Vec3::new(next_velocity.x, next_velocity.y, next_velocity.z);
+    let state = runtime.controller.state_mut();
+    state.velocity = next_velocity;
 
-    let origin_y = runtime.position.translation.y - runtime.capsule_offset;
-    camera.position = Vec3::new(
-        runtime.position.translation.x,
-        origin_y + camera.eye_height,
-        runtime.position.translation.z,
-    );
+    camera.position = Vec3::new(frame.camera.eye.x, frame.camera.eye.y, frame.camera.eye.z);
+    camera.yaw = frame.camera.yaw;
+    camera.pitch = frame.camera.pitch;
     camera.velocity = Vec3::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z);
     camera.vertical_velocity = runtime.velocity.y;
     camera.on_ground = runtime.grounded;

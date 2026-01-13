@@ -2268,6 +2268,8 @@ dependencies = [
  "net_transport",
  "physics_rapier",
  "platform_winit",
+ "player_camera",
+ "player_controller",
  "png",
  "rapier3d",
  "render_wgpu",

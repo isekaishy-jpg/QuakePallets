@@ -37,6 +37,7 @@ pub struct HostCallbacks {
     pub spawn_entity: Box<dyn FnMut(SpawnRequest) -> u32>,
     pub play_sound: Box<dyn FnMut(String) -> Result<(), String>>,
     pub log: Box<dyn FnMut(String)>,
+    pub run_command: Box<dyn FnMut(String) -> Result<(), String>>,
 }
 
 pub struct ScriptEngine {
@@ -242,6 +243,13 @@ fn register_globals(
         Ok(())
     })?;
     globals.set("log", log)?;
+
+    let cmd_callbacks = Rc::clone(&callbacks);
+    let cmd = lua.create_function_mut(move |_lua, line: String| {
+        (cmd_callbacks.borrow_mut().run_command)(line).map_err(mlua::Error::RuntimeError)?;
+        Ok(())
+    })?;
+    globals.set("cmd", cmd)?;
 
     let register_commands = Rc::clone(&commands);
     let register_command =

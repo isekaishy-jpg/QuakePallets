@@ -19,6 +19,8 @@ server = { path = "../net/server", version = "0.1.0" }
 net_transport = { path = "../net/net_transport", version = "0.1.0" }
 physics_rapier = { path = "../physics_rapier", version = "0.1.0" }
 platform_winit = { path = "../platform_winit", version = "0.1.0" }
+player_camera = { path = "../player_camera", version = "0.1.0" }
+player_controller = { path = "../player_controller", version = "0.1.0" }
 render_wgpu = { path = "../render_wgpu", version = "0.1.0" }
 script_lua = { path = "../script_lua", version = "0.1.0" }
 test_map = { path = "../test_map", version = "0.1.0" }

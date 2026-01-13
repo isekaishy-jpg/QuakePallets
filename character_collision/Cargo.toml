@@ -8,5 +8,5 @@ license = "MIT OR Apache-2.0"
 path = "src/lib.rs"
 
 [dependencies]
-physics_rapier = { path = "../physics_rapier" }
+physics_rapier = { path = "../physics_rapier", version = "0.1.0" }
 rapier3d = { version = "0.22.0" }

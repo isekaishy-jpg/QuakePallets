@@ -175,6 +175,14 @@ impl<A: InputAdapter, M: Motor> PlayerController<A, M> {
         &mut self.collision
     }
 
+    pub fn motor(&self) -> &M {
+        &self.motor
+    }
+
+    pub fn motor_mut(&mut self) -> &mut M {
+        &mut self.motor
+    }
+
     pub fn camera(&self) -> &PlayerCamera {
         &self.camera
     }

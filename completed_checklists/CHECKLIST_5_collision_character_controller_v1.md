@@ -205,22 +205,22 @@ These become your harness “must pass” gates:
 - [x] Record/replay input traces for regression (strongly recommended; minimal implementation acceptable).
 
 ### M10 — Convergence and documentation
-- [ ] Migrate gameplay to the extracted controller module (remove/disable old movement path).
-- [ ] Document:
+- [x] Migrate gameplay to the extracted controller module (remove/disable old movement path).
+- [x] Document:
   - the partition-agnostic collision asset contract
   - clean-room constraints (no Quake entities, no bespoke step logic)
   - how to add new map sources (future full-mesh path)
   - how to add a new movement profile
   - minimal `chunk_bounds_bvh` design and how to extend it for streaming
-- [ ] Add “upgrade to octree3d” note:
+- [x] Add “upgrade to octree3d” note:
   - same asset contract; only `partition_kind` and cooker partitioner change
   - runtime remains bounds-driven selection + chunk loading
 
 ---
 
 ## Explicit “space to upgrade to octree3d” requirements (baked into v1)
-- [ ] `partition_kind` is an enum and stored in the asset (not implied).
-- [ ] `space_origin` and `root_bounds` are stored and used as the stable reference for partitioning and debugging.
-- [ ] `chunk_bounds_bvh` is present and used for selection (debug now; streaming later).
-- [ ] Runtime selection uses **chunk AABB intersection**, not quadtree coordinates.
-- [ ] Any quadtree node keys are **debug hints only** (never required for correctness).
+- [x] `partition_kind` is an enum and stored in the asset (not implied).
+- [x] `space_origin` and `root_bounds` are stored and used as the stable reference for partitioning and debugging.
+- [x] `chunk_bounds_bvh` is present and used for selection (debug now; streaming later).
+- [x] Runtime selection uses **chunk AABB intersection**, not quadtree coordinates.
+- [x] Any quadtree node keys are **debug hints only** (never required for correctness).
