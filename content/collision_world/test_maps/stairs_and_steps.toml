@@ -1,0 +1,337 @@
+version = 1
+partition_kind = "quadtree2d"
+space_origin = [0.0, 0.0, 0.0]
+map_to_world_scale = 1.0
+
+[root_bounds]
+min = [-25.0, -1.0, -20.0]
+max = [25.0, 2.0, 20.0]
+
+[[chunks]]
+chunk_id = "floor"
+aabb_min = [-25.0, -1.0, -20.0]
+aabb_max = [25.0, 0.0, 20.0]
+payload_ref = "inline:test_map/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/base/step_01"
+aabb_min = [-13.5, 0.0, -6.350000381469727]
+aabb_max = [-10.5, 0.20000000298023224, -6.0]
+payload_ref = "inline:test_map/stairs_pack/base/step_01"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/base/step_02"
+aabb_min = [-13.5, 0.20000001788139343, -6.700000286102295]
+aabb_max = [-10.5, 0.4000000059604645, -6.349999904632568]
+payload_ref = "inline:test_map/stairs_pack/base/step_02"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/base/step_03"
+aabb_min = [-13.5, 0.4000000059604645, -7.050000190734863]
+aabb_max = [-10.5, 0.6000000238418579, -6.699999809265137]
+payload_ref = "inline:test_map/stairs_pack/base/step_03"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/base/step_04"
+aabb_min = [-13.5, 0.5999999642372131, -7.400000095367432]
+aabb_max = [-10.5, 0.800000011920929, -7.049999713897705]
+payload_ref = "inline:test_map/stairs_pack/base/step_04"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/base/step_05"
+aabb_min = [-13.5, 0.800000011920929, -7.75]
+aabb_max = [-10.5, 1.0, -7.399999618530273]
+payload_ref = "inline:test_map/stairs_pack/base/step_05"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/base/step_06"
+aabb_min = [-13.5, 1.0, -8.100000381469727]
+aabb_max = [-10.5, 1.2000000476837158, -7.75]
+payload_ref = "inline:test_map/stairs_pack/base/step_06"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/base/step_07"
+aabb_min = [-13.5, 1.2000000476837158, -8.449999809265137]
+aabb_max = [-10.5, 1.4000000953674316, -8.09999942779541]
+payload_ref = "inline:test_map/stairs_pack/base/step_07"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/base/step_08"
+aabb_min = [-13.5, 1.399999976158142, -8.800000190734863]
+aabb_max = [-10.5, 1.600000023841858, -8.449999809265137]
+payload_ref = "inline:test_map/stairs_pack/base/step_08"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_01"
+aabb_min = [-9.5, 0.0, -6.350000381469727]
+aabb_max = [-6.5, 0.15000000596046448, -6.0]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_01"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_02"
+aabb_min = [-9.5, 0.15000000596046448, -6.700000286102295]
+aabb_max = [-6.5, 0.30000001192092896, -6.349999904632568]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_02"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_03"
+aabb_min = [-9.5, 0.30000001192092896, -7.050000190734863]
+aabb_max = [-6.5, 0.44999998807907104, -6.699999809265137]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_03"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_04"
+aabb_min = [-9.5, 0.4500000476837158, -7.400000095367432]
+aabb_max = [-6.5, 0.6000000238418579, -7.049999713897705]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_04"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_05"
+aabb_min = [-9.5, 0.6000000238418579, -7.75]
+aabb_max = [-6.5, 0.75, -7.399999618530273]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_05"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_06"
+aabb_min = [-9.5, 0.7500000596046448, -8.100000381469727]
+aabb_max = [-6.5, 0.9000000357627869, -7.75]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_06"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_07"
+aabb_min = [-9.5, 0.9000000357627869, -8.449999809265137]
+aabb_max = [-6.5, 1.0500000715255737, -8.09999942779541]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_07"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_08"
+aabb_min = [-9.5, 1.0499999523162842, -8.800000190734863]
+aabb_max = [-6.5, 1.2000000476837158, -8.449999809265137]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_08"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_09"
+aabb_min = [-9.5, 1.2000000476837158, -9.15000057220459]
+aabb_max = [-6.5, 1.3500001430511475, -8.800000190734863]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_09"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_1/step_10"
+aabb_min = [-9.5, 1.350000023841858, -9.5]
+aabb_max = [-6.5, 1.5000001192092896, -9.149999618530273]
+payload_ref = "inline:test_map/stairs_pack/variant_1/step_10"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_2/step_01"
+aabb_min = [-5.5, 0.0, -6.40000057220459]
+aabb_max = [-2.5, 0.25, -6.0]
+payload_ref = "inline:test_map/stairs_pack/variant_2/step_01"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_2/step_02"
+aabb_min = [-5.5, 0.25, -6.8000006675720215]
+aabb_max = [-2.5, 0.5, -6.400000095367432]
+payload_ref = "inline:test_map/stairs_pack/variant_2/step_02"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_2/step_03"
+aabb_min = [-5.5, 0.5, -7.200000762939453]
+aabb_max = [-2.5, 0.75, -6.800000190734863]
+payload_ref = "inline:test_map/stairs_pack/variant_2/step_03"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_2/step_04"
+aabb_min = [-5.5, 0.75, -7.600000858306885]
+aabb_max = [-2.5, 1.0, -7.200000286102295]
+payload_ref = "inline:test_map/stairs_pack/variant_2/step_04"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_2/step_05"
+aabb_min = [-5.5, 1.0, -8.000000953674316]
+aabb_max = [-2.5, 1.25, -7.600000381469727]
+payload_ref = "inline:test_map/stairs_pack/variant_2/step_05"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_2/step_06"
+aabb_min = [-5.5, 1.25, -8.40000057220459]
+aabb_max = [-2.5, 1.5, -8.000000953674316]
+payload_ref = "inline:test_map/stairs_pack/variant_2/step_06"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_2/step_07"
+aabb_min = [-5.5, 1.5, -8.800000190734863]
+aabb_max = [-2.5, 1.75, -8.40000057220459]
+payload_ref = "inline:test_map/stairs_pack/variant_2/step_07"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "stairs_pack/variant_2/step_08"
+aabb_min = [-5.5, 1.75, -9.199999809265137]
+aabb_max = [-2.5, 2.0, -8.800000190734863]
+payload_ref = "inline:test_map/stairs_pack/variant_2/step_08"
+triangle_count = 12
+
+[chunk_bounds_bvh]
+root = 14
+leaf_indices = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 0]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-13.5, 0.0, -7.050000190734863]
+max = [-10.5, 0.6000000238418579, -6.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 0
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-13.5, 0.5999999642372131, -8.100000381469727]
+max = [-10.5, 1.2000000476837158, -7.049999713897705]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 3
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+left = 0
+right = 1
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-13.5, 0.0, -8.100000381469727]
+max = [-10.5, 1.2000000476837158, -6.0]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-13.5, 0.0, -8.800000190734863]
+max = [-6.5, 1.600000023841858, -6.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 6
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-9.5, 0.15000000596046448, -7.75]
+max = [-6.5, 0.75, -6.349999904632568]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 9
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+left = 3
+right = 4
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-13.5, 0.0, -8.800000190734863]
+max = [-6.5, 1.600000023841858, -6.0]
+
+[[chunk_bounds_bvh.nodes]]
+left = 2
+right = 5
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-13.5, 0.0, -8.800000190734863]
+max = [-6.5, 1.600000023841858, -6.0]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-9.5, 0.7500000596046448, -8.800000190734863]
+max = [-6.5, 1.2000000476837158, -7.75]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 13
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-9.5, 0.0, -9.5]
+max = [-2.5, 1.5000001192092896, -6.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 16
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+left = 7
+right = 8
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-9.5, 0.0, -9.5]
+max = [-2.5, 1.5000001192092896, -6.0]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-5.5, 0.5, -8.000000953674316]
+max = [-2.5, 1.25, -6.800000190734863]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 20
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-25.0, -1.0, -20.0]
+max = [25.0, 2.0, 20.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 23
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+left = 10
+right = 11
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-25.0, -1.0, -20.0]
+max = [25.0, 2.0, 20.0]
+
+[[chunk_bounds_bvh.nodes]]
+left = 9
+right = 12
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-25.0, -1.0, -20.0]
+max = [25.0, 2.0, 20.0]
+
+[[chunk_bounds_bvh.nodes]]
+left = 6
+right = 13
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-25.0, -1.0, -20.0]
+max = [25.0, 2.0, 20.0]

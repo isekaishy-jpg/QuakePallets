@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use collision_world::{CollisionWorld, CollisionWorldValidationConfig};
 use compat_quake::pak::{self, PakFile};
 use engine_core::asset_id::AssetKey;
 use engine_core::asset_manager::{
@@ -26,6 +27,10 @@ use engine_core::mount_manifest::{load_mount_manifest, MountManifestEntry};
 use engine_core::path_policy::{ConfigKind, PathOverrides, PathPolicy};
 use engine_core::quake_index::QuakeIndex;
 use engine_core::vfs::{MountKind, Vfs};
+use map_cook::{
+    build_bsp_collision_world, build_test_map_collision_world, BspCookConfig, BspKind, MapSidecar,
+    Quadtree2dConfig,
+};
 use test_map::TestMap;
 
 const EXIT_SUCCESS: i32 = 0;
@@ -51,6 +56,7 @@ enum Commands {
     Console(ConsoleArgs),
     Content(ContentArgs),
     TestMap(TestMapArgs),
+    CollisionWorld(CollisionWorldArgs),
     Quake(QuakeArgs),
 }
 
@@ -140,6 +146,32 @@ struct TestMapArgs {
     command: TestMapCommand,
 }
 
+#[derive(Parser)]
+struct CollisionWorldArgs {
+    #[command(subcommand)]
+    command: CollisionWorldCommand,
+}
+
+#[derive(Parser)]
+struct CollisionWorldCookBspArgs {
+    #[arg(long, value_name = "MAP_ID")]
+    map_id: String,
+    #[arg(long, value_name = "PATH")]
+    bsp: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    sidecar: Option<PathBuf>,
+    #[arg(long)]
+    map_to_world_scale: Option<f32>,
+    #[arg(long)]
+    max_tris_per_leaf: Option<usize>,
+    #[arg(long)]
+    min_leaf_size_xy: Option<f32>,
+    #[arg(long)]
+    max_depth: Option<u32>,
+}
+
 #[derive(Subcommand)]
 enum QuakeCommand {
     Index {
@@ -177,6 +209,25 @@ enum TestMapCommand {
         #[arg(value_name = "PATH")]
         path: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum CollisionWorldCommand {
+    Validate {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        #[arg(long)]
+        max_tris_per_chunk: Option<u32>,
+        #[arg(long)]
+        max_chunks: Option<usize>,
+    },
+    Cook {
+        #[arg(long, value_name = "PATH")]
+        test_map: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+    CookBsp(CollisionWorldCookBspArgs),
 }
 
 #[derive(Subcommand)]
@@ -328,6 +379,7 @@ fn main() {
         Commands::Console(args) => run_console(args),
         Commands::Content(args) => run_content(args),
         Commands::TestMap(args) => run_test_map(args),
+        Commands::CollisionWorld(args) => run_collision_world(args),
         Commands::Quake(args) => run_quake(args),
     };
     std::process::exit(exit_code);
@@ -583,6 +635,18 @@ fn run_test_map(args: TestMapArgs) -> i32 {
     }
 }
 
+fn run_collision_world(args: CollisionWorldArgs) -> i32 {
+    match args.command {
+        CollisionWorldCommand::Validate {
+            path,
+            max_tris_per_chunk,
+            max_chunks,
+        } => collision_world_validate(&path, max_tris_per_chunk, max_chunks),
+        CollisionWorldCommand::Cook { test_map, out } => collision_world_cook(&test_map, &out),
+        CollisionWorldCommand::CookBsp(args) => collision_world_cook_bsp(&args),
+    }
+}
+
 fn test_map_validate(path: &Path) -> i32 {
     if !path.is_file() {
         eprintln!("test map not found: {}", path.display());
@@ -627,6 +691,276 @@ fn test_map_validate(path: &Path) -> i32 {
         expanded.len()
     );
     EXIT_SUCCESS
+}
+
+fn collision_world_validate(
+    path: &Path,
+    max_tris_per_chunk: Option<u32>,
+    max_chunks: Option<usize>,
+) -> i32 {
+    if !path.is_file() {
+        eprintln!("collision world not found: {}", path.display());
+        return EXIT_USAGE;
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("collision world read failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    let world = match CollisionWorld::parse_toml(&text) {
+        Ok(world) => world,
+        Err(err) => {
+            eprintln!("collision world parse failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    let mut config = CollisionWorldValidationConfig::default();
+    if let Some(value) = max_tris_per_chunk {
+        config.max_triangles_per_chunk = value;
+    }
+    if let Some(value) = max_chunks {
+        config.max_chunks = value;
+    }
+    let validation = world.validate(config);
+    for warning in &validation.warnings {
+        eprintln!("warning: {}", warning);
+    }
+    if !validation.errors.is_empty() {
+        for error in &validation.errors {
+            eprintln!("error: {}", error);
+        }
+        return EXIT_USAGE;
+    }
+    println!(
+        "collision world ok: chunks={} partition={:?}",
+        world.chunks.len(),
+        world.partition_kind
+    );
+    EXIT_SUCCESS
+}
+
+fn collision_world_cook(test_map_path: &Path, out_path: &Path) -> i32 {
+    if !test_map_path.is_file() {
+        eprintln!("test map not found: {}", test_map_path.display());
+        return EXIT_USAGE;
+    }
+    let text = match std::fs::read_to_string(test_map_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("test map read failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    let map = match TestMap::parse_toml(&text) {
+        Ok(map) => map,
+        Err(err) => {
+            eprintln!("test map parse failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    let world = match build_test_map_collision_world(&map) {
+        Ok(world) => world,
+        Err(err) => {
+            eprintln!("collision world build failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    let serialized = match world.to_toml() {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("collision world serialize failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    if let Some(parent) = out_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!("collision world output dir failed: {}", err);
+            return EXIT_USAGE;
+        }
+    }
+    if let Err(err) = std::fs::write(out_path, serialized) {
+        eprintln!("collision world write failed: {}", err);
+        return EXIT_USAGE;
+    }
+    println!("collision world wrote: {}", out_path.display());
+    EXIT_SUCCESS
+}
+
+fn collision_world_cook_bsp(args: &CollisionWorldCookBspArgs) -> i32 {
+    if args.map_id.trim().is_empty() {
+        eprintln!("--map-id is required");
+        return EXIT_USAGE;
+    }
+    let kind = match bsp_kind_from_map_id(&args.map_id) {
+        Ok(kind) => kind,
+        Err(err) => {
+            eprintln!("invalid map-id: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    if !args.bsp.is_file() {
+        eprintln!("bsp not found: {}", args.bsp.display());
+        return EXIT_USAGE;
+    }
+    let bsp_bytes = match std::fs::read(&args.bsp) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("bsp read failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+
+    let resolved_sidecar = match args.sidecar.as_ref() {
+        Some(path) => Some(path.to_path_buf()),
+        None => match default_sidecar_path(&args.map_id) {
+            Ok(path) if path.is_file() => Some(path),
+            Ok(_) => None,
+            Err(err) => {
+                eprintln!("sidecar lookup failed: {}", err);
+                return EXIT_USAGE;
+            }
+        },
+    };
+    let sidecar = match resolved_sidecar.as_ref() {
+        Some(path) => match load_map_sidecar(path, &args.map_id) {
+            Ok(sidecar) => Some(sidecar),
+            Err(err) => {
+                eprintln!("sidecar read failed: {}", err);
+                return EXIT_USAGE;
+            }
+        },
+        None => None,
+    };
+
+    let scale = match args
+        .map_to_world_scale
+        .or_else(|| sidecar.as_ref().map(|sc| sc.map_to_world_scale))
+    {
+        Some(value) => value,
+        None => {
+            eprintln!("map_to_world_scale required (set in sidecar or via --map-to-world-scale)");
+            return EXIT_USAGE;
+        }
+    };
+    let space_origin = sidecar
+        .as_ref()
+        .and_then(|sc| sc.space_origin)
+        .unwrap_or([0.0, 0.0, 0.0]);
+
+    let mut quadtree = Quadtree2dConfig::default();
+    if let Some(value) = args.max_tris_per_leaf {
+        quadtree.max_tris_per_leaf = value;
+    }
+    if let Some(value) = args.min_leaf_size_xy {
+        quadtree.min_leaf_size_xy = value;
+    }
+    if let Some(value) = args.max_depth {
+        quadtree.max_depth = value;
+    }
+
+    let config = BspCookConfig {
+        map_id: args.map_id.clone(),
+        map_to_world_scale: scale,
+        space_origin,
+        quadtree,
+    };
+    let world = match build_bsp_collision_world(kind, &bsp_bytes, &config) {
+        Ok(world) => world,
+        Err(err) => {
+            eprintln!("collision world cook failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    let text = match world.to_toml() {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("collision world serialize failed: {}", err);
+            return EXIT_USAGE;
+        }
+    };
+    if let Some(parent) = args.out.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!("collision world mkdir failed: {}", err);
+            return EXIT_USAGE;
+        }
+    }
+    if let Err(err) = std::fs::write(&args.out, text) {
+        eprintln!("collision world write failed: {}", err);
+        return EXIT_USAGE;
+    }
+    println!(
+        "collision world wrote: {} (chunks={}, map_id={})",
+        args.out.display(),
+        world.chunks.len(),
+        args.map_id
+    );
+    EXIT_SUCCESS
+}
+
+fn bsp_kind_from_map_id(map_id: &str) -> Result<BspKind, String> {
+    let (namespace, _path) = map_id
+        .split_once(':')
+        .ok_or_else(|| "expected map-id like quake1:bsp/e1m1".to_string())?;
+    match namespace {
+        "quake1" => Ok(BspKind::Quake1),
+        "quakelive" => Ok(BspKind::Quake3),
+        _ => Err(format!(
+            "unsupported namespace '{}', expected quake1 or quakelive",
+            namespace
+        )),
+    }
+}
+
+fn default_sidecar_path(map_id: &str) -> Result<PathBuf, String> {
+    let (namespace, path) = map_id
+        .split_once(':')
+        .ok_or_else(|| "expected map-id like quake1:bsp/e1m1".to_string())?;
+    let path = sanitize_rel_path(path)?;
+    Ok(PathBuf::from("content")
+        .join("map_sidecars")
+        .join(namespace)
+        .join(path)
+        .with_extension("toml"))
+}
+
+fn sanitize_rel_path(value: &str) -> Result<PathBuf, String> {
+    let normalized = value.replace('\\', "/");
+    let trimmed = normalized.trim_start_matches('/');
+    let mut path = PathBuf::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return Err("map-id path must not contain '..'".to_string());
+        }
+        path.push(segment);
+    }
+    if path.as_os_str().is_empty() {
+        return Err("map-id path missing".to_string());
+    }
+    Ok(path)
+}
+
+fn load_map_sidecar(path: &Path, expected_map_id: &str) -> Result<MapSidecar, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let sidecar = MapSidecar::parse_toml(&text)?;
+    let validation = sidecar.validate();
+    for warning in &validation.warnings {
+        eprintln!("warning: {}", warning);
+    }
+    if !validation.errors.is_empty() {
+        return Err(validation.errors.join("; "));
+    }
+    if sidecar.map_id != expected_map_id {
+        return Err(format!(
+            "sidecar map_id '{}' does not match expected '{}'",
+            sidecar.map_id, expected_map_id
+        ));
+    }
+    Ok(sidecar)
 }
 
 fn content_lint_ids(args: &ContentLintIdsArgs) -> i32 {

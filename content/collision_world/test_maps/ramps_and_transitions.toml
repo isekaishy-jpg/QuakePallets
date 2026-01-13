@@ -1,0 +1,89 @@
+version = 1
+partition_kind = "quadtree2d"
+space_origin = [0.0, 0.0, 0.0]
+map_to_world_scale = 1.0
+
+[root_bounds]
+min = [-30.0, -1.0, -20.0]
+max = [49.0, 13.856407165527344, 20.0]
+
+[[chunks]]
+chunk_id = "floor"
+aabb_min = [-30.0, -1.0, -20.0]
+aabb_max = [30.0, 0.0, 20.0]
+payload_ref = "inline:test_map/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "ramp_pack/ramp_01"
+aabb_min = [-19.0, 0.0, -10.0]
+aabb_max = [-11.0, 1.4106158018112183, -6.0]
+payload_ref = "inline:test_map/ramp_pack/ramp_01"
+triangle_count = 8
+
+[[chunks]]
+chunk_id = "ramp_pack/ramp_02"
+aabb_min = [-7.0, 0.0, -10.0]
+aabb_max = [1.0, 2.91176176071167, -6.0]
+payload_ref = "inline:test_map/ramp_pack/ramp_02"
+triangle_count = 8
+
+[[chunks]]
+chunk_id = "ramp_pack/ramp_03"
+aabb_min = [5.0, 0.0, -10.0]
+aabb_max = [13.0, 4.618802070617676, -6.0]
+payload_ref = "inline:test_map/ramp_pack/ramp_03"
+triangle_count = 8
+
+[[chunks]]
+chunk_id = "ramp_pack/ramp_04"
+aabb_min = [17.0, 0.0, -10.0]
+aabb_max = [25.0, 6.712796688079834, -6.0]
+payload_ref = "inline:test_map/ramp_pack/ramp_04"
+triangle_count = 8
+
+[[chunks]]
+chunk_id = "ramp_pack/ramp_05"
+aabb_min = [29.0, 0.0, -10.0]
+aabb_max = [37.0, 9.534029006958008, -6.0]
+payload_ref = "inline:test_map/ramp_pack/ramp_05"
+triangle_count = 8
+
+[[chunks]]
+chunk_id = "ramp_pack/ramp_06"
+aabb_min = [41.0, 0.0, -10.0]
+aabb_max = [49.0, 13.856407165527344, -6.0]
+payload_ref = "inline:test_map/ramp_pack/ramp_06"
+triangle_count = 8
+
+[chunk_bounds_bvh]
+root = 2
+leaf_indices = [1, 2, 0, 3, 4, 5, 6]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -20.0]
+max = [30.0, 2.91176176071167, 20.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 0
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [5.0, 0.0, -10.0]
+max = [49.0, 13.856407165527344, -6.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 3
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+left = 0
+right = 1
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -20.0]
+max = [49.0, 13.856407165527344, 20.0]

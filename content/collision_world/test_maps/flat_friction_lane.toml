@@ -1,0 +1,50 @@
+version = 1
+partition_kind = "quadtree2d"
+space_origin = [0.0, 0.0, 0.0]
+map_to_world_scale = 1.0
+
+[root_bounds]
+min = [-30.0, -1.0, -3.4000000953674316]
+max = [30.600000381469727, 3.0, 3.4000000953674316]
+
+[[chunks]]
+chunk_id = "floor"
+aabb_min = [-30.0, -1.0, -3.0]
+aabb_max = [30.0, 0.0, 3.0]
+payload_ref = "inline:test_map/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "lane_wall_left"
+aabb_min = [-30.0, 0.0, -3.4000000953674316]
+aabb_max = [30.0, 3.0, -3.0]
+payload_ref = "inline:test_map/lane_wall_left"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "lane_wall_right"
+aabb_min = [-30.0, 0.0, 3.0]
+aabb_max = [30.0, 3.0, 3.4000000953674316]
+payload_ref = "inline:test_map/lane_wall_right"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "lane_wall_end"
+aabb_min = [30.19999885559082, 0.0, -3.200000047683716]
+aabb_max = [30.600000381469727, 3.0, 3.200000047683716]
+payload_ref = "inline:test_map/lane_wall_end"
+triangle_count = 12
+
+[chunk_bounds_bvh]
+root = 0
+leaf_indices = [0, 1, 2, 3]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -3.4000000953674316]
+max = [30.600000381469727, 3.0, 3.4000000953674316]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 0
+count = 4

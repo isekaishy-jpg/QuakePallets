@@ -12,6 +12,7 @@ use crate::jobs::{JobError, JobHandle, JobQueue, Jobs, JobsConfig};
 use crate::logging;
 use crate::path_policy::PathPolicy;
 use crate::vfs::Vfs;
+use collision_world::CollisionWorld;
 use test_map::{ResolvedSolid, TestMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +72,7 @@ impl Default for RequestOpts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssetKind {
+    EngineCollisionWorld,
     EngineConfig,
     EngineScript,
     EngineText,
@@ -83,6 +85,7 @@ pub enum AssetKind {
 impl AssetKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            AssetKind::EngineCollisionWorld => "engine:collision_world",
             AssetKind::EngineConfig => "engine:config",
             AssetKind::EngineScript => "engine:script",
             AssetKind::EngineText => "engine:text",
@@ -137,6 +140,11 @@ pub struct ScriptAsset {
 pub struct TestMapAsset {
     pub map: TestMap,
     pub solids: Vec<ResolvedSolid>,
+    source_len: usize,
+}
+
+pub struct CollisionWorldAsset {
+    pub world: CollisionWorld,
     source_len: usize,
 }
 
@@ -226,6 +234,27 @@ impl AssetPayload for TestMapAsset {
         Ok(Self {
             map,
             solids,
+            source_len: text.len(),
+        })
+    }
+
+    fn decoded_size(&self) -> usize {
+        self.source_len
+    }
+}
+
+impl AssetPayload for CollisionWorldAsset {
+    const KIND: AssetKind = AssetKind::EngineCollisionWorld;
+
+    fn accepts(key: &AssetKey) -> bool {
+        key.namespace() == "engine" && key.kind() == "collision_world"
+    }
+
+    fn decode(_key: &AssetKey, bytes: Vec<u8>) -> Result<Self, String> {
+        let text = String::from_utf8(bytes).map_err(|err| err.to_string())?;
+        let world = CollisionWorld::parse_toml(&text)?;
+        Ok(Self {
+            world,
             source_len: text.len(),
         })
     }
@@ -1065,6 +1094,15 @@ fn decode_for_kind(
         }
         AssetKind::EngineTestMap => {
             let asset = TestMapAsset::decode(key, bytes)?;
+            let bytes = asset.decoded_size();
+            Ok(DecodedPayload {
+                value: Arc::new(asset),
+                decoded_bytes: bytes,
+                content_hash,
+            })
+        }
+        AssetKind::EngineCollisionWorld => {
+            let asset = CollisionWorldAsset::decode(key, bytes)?;
             let bytes = asset.decoded_size();
             Ok(DecodedPayload {
                 value: Arc::new(asset),

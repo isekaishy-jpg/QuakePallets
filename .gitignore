@@ -4,3 +4,4 @@ dist/
 .pallet/
 content/build/
 captures/
+content/compat_samples/

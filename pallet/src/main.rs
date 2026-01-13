@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::f32::consts::TAU;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -19,12 +19,14 @@ use character_motor_rpg::{
     RpgMotorState,
 };
 use client::{Client, ClientInput};
+use collision_world::{Aabb as CollisionAabb, CollisionWorld};
 use compat_quake::bsp::{self, Bsp, SpawnPoint};
 use compat_quake::lmp;
 use engine_core::asset_id::AssetKey;
 use engine_core::asset_manager::{
     AssetBudgetTag, AssetEntrySnapshot, AssetManager, AssetPriority, AssetStatus, BlobAsset,
-    ConfigAsset, QuakeRawAsset, RequestOpts, ScriptAsset, TestMapAsset, TextAsset, TextureAsset,
+    CollisionWorldAsset, ConfigAsset, QuakeRawAsset, RequestOpts, ScriptAsset, TestMapAsset,
+    TextAsset, TextureAsset,
 };
 use engine_core::asset_resolver::{
     AssetLayer, AssetResolver, AssetSource, ResolveReport, ResolvedLocation, ResolvedPath,
@@ -54,7 +56,7 @@ use platform_winit::{
     PhysicalSize, Window, WindowEvent,
 };
 use rapier3d::math::{Isometry, Vector};
-use rapier3d::prelude::Real;
+use rapier3d::prelude::{ColliderHandle, Real};
 use render_wgpu::{
     FrameCapture, ImageData, MeshData, MeshVertex, RenderCaptureError, RenderError, TextBounds,
     TextFontSystem, TextLayer, TextOverlay, TextOverlayTimings, TextPosition, TextSpan, TextStyle,
@@ -149,6 +151,8 @@ const TEST_MAP_BHOP_GRACE: f32 = 0.1;
 const TEST_MAP_BHOP_FRICTION_SCALE: f32 = 0.25;
 const TEST_MAP_BHOP_FRICTION_SCALE_BEST_ANGLE: f32 = 0.0;
 const TEST_MAP_EYE_HEIGHT: f32 = 1.6;
+const COLLISION_INTEREST_RADIUS: f32 = 12.0;
+const KCC_QUERY_SMOOTHING: f32 = 0.1;
 const UI_REGRESSION_MIN_FONT_PX: f32 = 9.0;
 const UI_REGRESSION_LOG_LINE_COUNT: usize = 24;
 const UI_REGRESSION_FPS: f32 = 144.0;
@@ -485,12 +489,22 @@ struct LoadedScene {
 struct TestMapSceneData {
     key: AssetKey,
     map: TestMap,
+    collision_world_key: AssetKey,
+    collision_world: CollisionWorld,
+}
+
+struct CollisionWorldRuntime {
+    world: CollisionWorld,
+    loaded_chunks: Vec<u32>,
+    collider_handles: Vec<ColliderHandle>,
+    triangle_count: u64,
 }
 
 struct TestMapRuntime {
     key: AssetKey,
     world: PhysicsWorld,
     collision: CharacterCollision,
+    collision_world: CollisionWorldRuntime,
     position: Isometry<Real>,
     prev_position: Isometry<Real>,
     velocity: Vec3,
@@ -501,6 +515,7 @@ struct TestMapRuntime {
     motor_kind: MotorKind,
     motor_arena: ArenaMotor,
     motor_rpg: RpgMotor,
+    kcc_query_ms: f32,
 }
 
 enum MapRequest {
@@ -5475,6 +5490,29 @@ fn main() {
                                         if loopback.is_some() { "loopback" } else { "offline" }
                                     ));
                                 }
+                                if let Some(runtime) = test_map_runtime.as_ref() {
+                                    let collision_world = &runtime.collision_world;
+                                    let interest = collision_interest_bounds(
+                                        runtime.position.translation.vector,
+                                        COLLISION_INTEREST_RADIUS,
+                                    );
+                                    let nearby_chunks = select_collision_chunks(
+                                        &collision_world.world,
+                                        CollisionChunkSelection::Bounds(interest),
+                                    )
+                                    .len();
+                                    lines.push(format!(
+                                        "collision: chunks={} loaded={} colliders={} tris={}",
+                                        collision_world.world.chunks.len(),
+                                        collision_world.loaded_chunks.len(),
+                                        collision_world.collider_handles.len(),
+                                        collision_world.triangle_count
+                                    ));
+                                    lines.push(format!(
+                                        "collision_near={} kcc_ms={:.3}",
+                                        nearby_chunks, runtime.kcc_query_ms
+                                    ));
+                                }
                                 if show_movement {
                                     if let Some(runtime) = test_map_runtime.as_ref() {
                                         let move_axis = [
@@ -9493,12 +9531,35 @@ fn load_test_map_scene(
     let map = asset.map.clone();
     let solids = asset.solids.clone();
     let (mesh, bounds) = build_test_map_mesh(&map, &solids)?;
+    let collision_world_key = collision_world_key_for_test_map(key)?;
+    let collision_world_asset =
+        fetch_collision_world_asset(asset_manager, &collision_world_key, reload)?;
+    let collision_world = collision_world_asset.world.clone();
+    let map_scale = map.map_to_world_scale.unwrap_or(1.0);
+    if (collision_world.map_to_world_scale - map_scale).abs() > 1.0e-3 {
+        return Err(ExitError::new(
+            EXIT_SCENE,
+            format!(
+                "collision world scale mismatch (map {:.3} vs {} {:.3})",
+                map_scale,
+                collision_world_key.canonical(),
+                collision_world.map_to_world_scale
+            ),
+        ));
+    }
+    println!(
+        "loaded {} via asset manager ({} chunks)",
+        collision_world_key.canonical(),
+        collision_world.chunks.len()
+    );
     Ok((
         mesh,
         bounds,
         TestMapSceneData {
             key: key.clone(),
             map,
+            collision_world_key,
+            collision_world,
         },
     ))
 }
@@ -9530,6 +9591,61 @@ fn fetch_test_map_asset(
             ExitError::new(
                 EXIT_SCENE,
                 format!("test map load failed ({}): {}", key.canonical(), err),
+            )
+        })
+}
+
+fn collision_world_key_for_test_map(key: &AssetKey) -> Result<AssetKey, ExitError> {
+    if key.namespace() != "engine" || key.kind() != "test_map" {
+        return Err(ExitError::new(
+            EXIT_SCENE,
+            format!("expected engine:test_map key, got {}", key.canonical()),
+        ));
+    }
+    let path = if key.path().starts_with("test_maps/") {
+        key.path().to_string()
+    } else {
+        format!("test_maps/{}", key.path())
+    };
+    AssetKey::from_parts("engine", "collision_world", &path).map_err(|err| {
+        ExitError::new(
+            EXIT_SCENE,
+            format!("collision world key invalid ({}): {}", path, err),
+        )
+    })
+}
+
+fn fetch_collision_world_asset(
+    asset_manager: &AssetManager,
+    key: &AssetKey,
+    reload: bool,
+) -> Result<Arc<CollisionWorldAsset>, ExitError> {
+    let opts = RequestOpts {
+        priority: AssetPriority::High,
+        budget_tag: AssetBudgetTag::Boot,
+    };
+    let handle = if reload {
+        asset_manager
+            .reload::<CollisionWorldAsset>(key.clone(), opts)
+            .map_err(|err| {
+                ExitError::new(
+                    EXIT_SCENE,
+                    format!(
+                        "collision world reload failed ({}): {}",
+                        key.canonical(),
+                        err
+                    ),
+                )
+            })?
+    } else {
+        asset_manager.request::<CollisionWorldAsset>(key.clone(), opts)
+    };
+    asset_manager
+        .await_ready(&handle, Duration::from_secs(2))
+        .map_err(|err| {
+            ExitError::new(
+                EXIT_SCENE,
+                format!("collision world load failed ({}): {}", key.canonical(), err),
             )
         })
 }
@@ -9712,6 +9828,101 @@ fn snap_test_map_runtime_to_ground(runtime: &mut TestMapRuntime, bounds: &Bounds
     runtime.prev_velocity = runtime.velocity;
 }
 
+enum CollisionChunkSelection {
+    Bounds(CollisionAabb),
+}
+
+fn select_collision_chunks(world: &CollisionWorld, selection: CollisionChunkSelection) -> Vec<u32> {
+    match selection {
+        CollisionChunkSelection::Bounds(bounds) => world
+            .chunk_bounds_bvh
+            .select_intersecting(&world.chunks, &bounds),
+    }
+}
+
+fn collision_interest_bounds(position: Vector<Real>, radius: f32) -> CollisionAabb {
+    CollisionAabb {
+        min: [
+            position.x - radius,
+            position.y - radius,
+            position.z - radius,
+        ],
+        max: [
+            position.x + radius,
+            position.y + radius,
+            position.z + radius,
+        ],
+    }
+}
+
+fn build_test_map_collision_runtime(
+    world: &mut PhysicsWorld,
+    data: &TestMapSceneData,
+) -> Result<CollisionWorldRuntime, ExitError> {
+    let colliders = build_test_map_colliders(&data.map).map_err(|err| {
+        ExitError::new(
+            EXIT_SCENE,
+            format!("test map collider build failed: {}", err),
+        )
+    })?;
+    let mut collider_by_id = HashMap::new();
+    for collider in colliders.colliders {
+        collider_by_id.insert(collider.id.clone(), collider.collider);
+    }
+
+    let selection = CollisionChunkSelection::Bounds(data.collision_world.root_bounds);
+    let selected_chunks = select_collision_chunks(&data.collision_world, selection);
+    if selected_chunks.is_empty() {
+        return Err(ExitError::new(
+            EXIT_SCENE,
+            format!(
+                "collision world has no selectable chunks ({})",
+                data.collision_world_key.canonical()
+            ),
+        ));
+    }
+    let mut collider_handles = Vec::new();
+    let mut triangle_count = 0u64;
+    for chunk_index in &selected_chunks {
+        let chunk = match data.collision_world.chunks.get(*chunk_index as usize) {
+            Some(chunk) => chunk,
+            None => continue,
+        };
+        let payload_id = chunk
+            .payload_ref
+            .strip_prefix("inline:test_map/")
+            .unwrap_or(&chunk.chunk_id);
+        let collider = match collider_by_id.remove(payload_id) {
+            Some(collider) => collider,
+            None => {
+                eprintln!(
+                    "collision world chunk missing collider: {} (payload {})",
+                    chunk.chunk_id, chunk.payload_ref
+                );
+                continue;
+            }
+        };
+        collider_handles.push(world.insert_static_collider(collider));
+        triangle_count = triangle_count.saturating_add(chunk.triangle_count as u64);
+    }
+    if collider_handles.is_empty() {
+        return Err(ExitError::new(
+            EXIT_SCENE,
+            format!(
+                "collision world produced zero colliders ({})",
+                data.collision_world_key.canonical()
+            ),
+        ));
+    }
+
+    Ok(CollisionWorldRuntime {
+        world: data.collision_world.clone(),
+        loaded_chunks: selected_chunks,
+        collider_handles,
+        triangle_count,
+    })
+}
+
 // NOTE: Test map runtime uses a minimal Rapier KCC loop so we can walk
 // graybox collision today. Keep this code contained and well-commented so it
 // can be replaced by the full controller pipeline later without surprises.
@@ -9722,15 +9933,7 @@ fn build_test_map_runtime(
     let arena_config = test_map_motor_config();
     let rpg_config = test_map_rpg_motor_config();
     let mut world = PhysicsWorld::new(Vector::new(0.0, -arena_config.gravity, 0.0));
-    let colliders = build_test_map_colliders(&data.map).map_err(|err| {
-        ExitError::new(
-            EXIT_SCENE,
-            format!("test map collider build failed: {}", err),
-        )
-    })?;
-    for collider in colliders.colliders {
-        world.insert_static_collider(collider.collider);
-    }
+    let collision_world = build_test_map_collision_runtime(&mut world, data)?;
     world.step(1.0 / 60.0);
 
     let profile = CollisionProfile::arena_default();
@@ -9741,6 +9944,7 @@ fn build_test_map_runtime(
         key: data.key.clone(),
         world,
         collision: CharacterCollision::new(profile),
+        collision_world,
         position,
         prev_position: position,
         velocity: Vec3::zero(),
@@ -9751,6 +9955,7 @@ fn build_test_map_runtime(
         motor_kind: MotorKind::Arena,
         motor_arena: ArenaMotor::new(arena_config),
         motor_rpg: RpgMotor::new(rpg_config),
+        kcc_query_ms: 0.0,
     };
     Ok(runtime)
 }
@@ -9817,6 +10022,7 @@ fn sync_test_map_runtime_to_camera(runtime: &mut TestMapRuntime, camera: &Camera
     runtime.ground_normal = None;
     runtime.motor_arena.reset_state();
     runtime.motor_rpg.reset_state();
+    runtime.kcc_query_ms = 0.0;
 }
 
 fn update_test_map_runtime(
@@ -9867,10 +10073,12 @@ fn update_test_map_runtime(
         }
     };
     let allow_step = runtime.grounded && !input.jump_active();
+    let kcc_start = Instant::now();
     let result =
         runtime
             .collision
             .move_character(&runtime.world, runtime.position, desired, allow_step, dt);
+    runtime.kcc_query_ms = update_kcc_query_ms(runtime.kcc_query_ms, kcc_start.elapsed());
     let mut next_velocity = next_velocity;
     runtime.position = result.position;
     runtime.grounded = result.grounded;
@@ -9908,6 +10116,15 @@ fn update_test_map_runtime(
     camera.velocity = Vec3::new(runtime.velocity.x, runtime.velocity.y, runtime.velocity.z);
     camera.vertical_velocity = runtime.velocity.y;
     camera.on_ground = runtime.grounded;
+}
+
+fn update_kcc_query_ms(previous: f32, elapsed: Duration) -> f32 {
+    let ms = elapsed.as_secs_f32() * 1000.0;
+    if previous <= 0.0 {
+        ms
+    } else {
+        previous + (ms - previous) * KCC_QUERY_SMOOTHING
+    }
 }
 
 fn apply_test_map_interpolation(runtime: &TestMapRuntime, camera: &mut CameraState, alpha: f32) {

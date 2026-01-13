@@ -658,6 +658,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "collision_world"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1014,6 +1022,7 @@ dependencies = [
 name = "engine_core"
 version = "0.1.0"
 dependencies = [
+ "collision_world",
  "compat_quake",
  "png",
  "test_map",
@@ -1796,8 +1805,12 @@ dependencies = [
 name = "map_cook"
 version = "0.1.0"
 dependencies = [
+ "collision_world",
+ "compat_quake",
  "rapier3d",
+ "serde",
  "test_map",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -2244,6 +2257,7 @@ dependencies = [
  "character_motor_arena",
  "character_motor_rpg",
  "client",
+ "collision_world",
  "compat_quake",
  "egui",
  "egui-wgpu",
@@ -3245,8 +3259,10 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "collision_world",
  "compat_quake",
  "engine_core",
+ "map_cook",
  "test_map",
 ]
 

@@ -10,6 +10,7 @@ character_collision = { path = "../character_collision", version = "0.1.0" }
 character_motor_arena = { path = "../character_motor_arena", version = "0.1.0" }
 character_motor_rpg = { path = "../character_motor_rpg", version = "0.1.0" }
 compat_quake = { path = "../compat_quake", version = "0.1.0" }
+collision_world = { path = "../collision_world", version = "0.1.0" }
 engine_core = { path = "../engine_core", version = "0.1.0" }
 map_cook = { path = "../map_cook", version = "0.1.0" }
 miniaudio = { path = "../third_party/miniaudio-rs/miniaudio", version = "0.10.0", default-features = false, features = ["bindgen", "ma-enable-vorbis", "ma-log-level-error"] }

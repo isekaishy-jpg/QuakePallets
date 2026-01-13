@@ -1,0 +1,82 @@
+version = 1
+partition_kind = "quadtree2d"
+space_origin = [0.0, 0.0, 0.0]
+map_to_world_scale = 1.0
+
+[root_bounds]
+min = [-30.0, -1.0, -20.0]
+max = [30.0, 3.0, 20.0]
+
+[[chunks]]
+chunk_id = "floor"
+aabb_min = [-30.0, -1.0, -20.0]
+aabb_max = [30.0, 0.0, 20.0]
+payload_ref = "inline:test_map/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pillar_01"
+aabb_min = [-12.600000381469727, 0.0, -6.599999904632568]
+aabb_max = [-11.399999618530273, 3.0, -5.400000095367432]
+payload_ref = "inline:test_map/pillar_01"
+triangle_count = 64
+
+[[chunks]]
+chunk_id = "pillar_02"
+aabb_min = [-6.599999904632568, 0.0, 5.400000095367432]
+aabb_max = [-5.400000095367432, 3.0, 6.599999904632568]
+payload_ref = "inline:test_map/pillar_02"
+triangle_count = 64
+
+[[chunks]]
+chunk_id = "pillar_03"
+aabb_min = [-0.6000000238418579, 0.0, -4.599999904632568]
+aabb_max = [0.6000000238418579, 3.0, -3.4000000953674316]
+payload_ref = "inline:test_map/pillar_03"
+triangle_count = 64
+
+[[chunks]]
+chunk_id = "pillar_04"
+aabb_min = [5.400000095367432, 0.0, 3.4000000953674316]
+aabb_max = [6.599999904632568, 3.0, 4.599999904632568]
+payload_ref = "inline:test_map/pillar_04"
+triangle_count = 64
+
+[[chunks]]
+chunk_id = "pillar_05"
+aabb_min = [11.399999618530273, 0.0, -2.5999999046325684]
+aabb_max = [12.600000381469727, 3.0, -1.399999976158142]
+payload_ref = "inline:test_map/pillar_05"
+triangle_count = 64
+
+[chunk_bounds_bvh]
+root = 2
+leaf_indices = [1, 2, 0, 3, 4, 5]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -20.0]
+max = [30.0, 3.0, 20.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 0
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-0.6000000238418579, 0.0, -4.599999904632568]
+max = [12.600000381469727, 3.0, 4.599999904632568]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 3
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+left = 0
+right = 1
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -20.0]
+max = [30.0, 3.0, 20.0]

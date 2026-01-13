@@ -7,5 +7,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 clap = { version = "4.5.8", features = ["derive"] }
 compat_quake = { path = "../compat_quake", version = "0.1.0" }
+collision_world = { path = "../collision_world", version = "0.1.0" }
 engine_core = { path = "../engine_core", version = "0.1.0" }
+map_cook = { path = "../map_cook", version = "0.1.0" }
 test_map = { path = "../test_map", version = "0.1.0" }

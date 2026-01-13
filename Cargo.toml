@@ -18,6 +18,7 @@ members = [
   "player_camera",
   "player_controller",
   "map_cook",
+  "collision_world",
   "test_map",
   "net/net_transport",
   "net/net_protocol",

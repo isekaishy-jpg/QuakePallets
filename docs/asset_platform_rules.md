@@ -17,6 +17,7 @@
 - `engine:script/<path>` -> `content/script/<path>` (dev override: `.pallet/content/script`).
 - `engine:texture/<path>` -> `content/texture/<path>`.
 - `engine:blob/<path>` -> `content/blob/<path>`.
+- `engine:collision_world/<path>` -> `content/collision_world/<path>`.
 - `quake1:raw/<path>` -> `raw/quake/<path>` via VFS.
 
 ## Adding a new asset kind

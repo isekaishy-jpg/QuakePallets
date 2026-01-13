@@ -9,4 +9,8 @@ path = "src/lib.rs"
 
 [dependencies]
 rapier3d = { version = "0.22.0" }
+collision_world = { path = "../collision_world", version = "0.1.0" }
 test_map = { path = "../test_map", version = "0.1.0" }
+compat_quake = { path = "../compat_quake", version = "0.1.0" }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.8.23"

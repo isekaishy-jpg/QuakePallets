@@ -1,0 +1,75 @@
+version = 1
+partition_kind = "quadtree2d"
+space_origin = [0.0, 0.0, 0.0]
+map_to_world_scale = 1.0
+
+[root_bounds]
+min = [-30.0, -1.0, -20.0]
+max = [30.0, 5.0, 20.0]
+
+[[chunks]]
+chunk_id = "floor"
+aabb_min = [-30.0, -1.0, -20.0]
+aabb_max = [30.0, 0.0, 20.0]
+payload_ref = "inline:test_map/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "ledge_low"
+aabb_min = [-13.0, 0.0, -3.0]
+aabb_max = [-7.0, 1.0, 3.0]
+payload_ref = "inline:test_map/ledge_low"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "ledge_mid"
+aabb_min = [-3.0, 0.0, -3.0]
+aabb_max = [3.0, 3.0, 3.0]
+payload_ref = "inline:test_map/ledge_mid"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "ledge_high"
+aabb_min = [7.0, 0.0, -3.0]
+aabb_max = [13.0, 5.0, 3.0]
+payload_ref = "inline:test_map/ledge_high"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "landing_bridge"
+aabb_min = [-9.0, 3.0, -10.0]
+aabb_max = [9.0, 3.5, -6.0]
+payload_ref = "inline:test_map/landing_bridge"
+triangle_count = 12
+
+[chunk_bounds_bvh]
+root = 2
+leaf_indices = [1, 0, 2, 4, 3]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -20.0]
+max = [30.0, 1.0, 20.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 0
+count = 2
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-9.0, 0.0, -10.0]
+max = [13.0, 5.0, 3.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 2
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+left = 0
+right = 1
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -1.0, -20.0]
+max = [30.0, 5.0, 20.0]

@@ -11,4 +11,5 @@ path = "src/lib.rs"
 compat_quake = { path = "../compat_quake", version = "0.1.0" }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 png = "0.17"
+collision_world = { path = "../collision_world", version = "0.1.0" }
 test_map = { path = "../test_map", version = "0.1.0" }

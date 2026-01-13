@@ -1,0 +1,213 @@
+version = 1
+partition_kind = "quadtree2d"
+space_origin = [0.0, 0.0, 0.0]
+map_to_world_scale = 1.0
+
+[root_bounds]
+min = [-40.0, -1.0, -30.0]
+max = [62.0, 3.1999998092651367, 30.0]
+
+[[chunks]]
+chunk_id = "floor"
+aabb_min = [-40.0, -1.0, -30.0]
+aabb_max = [40.0, 0.0, 30.0]
+payload_ref = "inline:test_map/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_01/floor"
+aabb_min = [-30.0, -0.10000000149011612, 9.350000381469727]
+aabb_max = [-10.0, 0.10000000149011612, 10.649999618530273]
+payload_ref = "inline:test_map/corridor_pack/corridor_01/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_01/ceiling"
+aabb_min = [-30.0, 3.0, 9.350000381469727]
+aabb_max = [-10.0, 3.1999998092651367, 10.649999618530273]
+payload_ref = "inline:test_map/corridor_pack/corridor_01/ceiling"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_01/wall_left"
+aabb_min = [-30.0, 0.0, 9.34999942779541]
+aabb_max = [-10.0, 3.0, 9.550000190734863]
+payload_ref = "inline:test_map/corridor_pack/corridor_01/wall_left"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_01/wall_right"
+aabb_min = [-30.0, 0.0, 10.449999809265137]
+aabb_max = [-10.0, 3.0, 10.65000057220459]
+payload_ref = "inline:test_map/corridor_pack/corridor_01/wall_right"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_02/floor"
+aabb_min = [-6.0, -0.10000000149011612, 9.25]
+aabb_max = [14.0, 0.10000000149011612, 10.75]
+payload_ref = "inline:test_map/corridor_pack/corridor_02/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_02/ceiling"
+aabb_min = [-6.0, 3.0, 9.25]
+aabb_max = [14.0, 3.1999998092651367, 10.75]
+payload_ref = "inline:test_map/corridor_pack/corridor_02/ceiling"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_02/wall_left"
+aabb_min = [-6.0, 0.0, 9.25]
+aabb_max = [14.0, 3.0, 9.450000762939453]
+payload_ref = "inline:test_map/corridor_pack/corridor_02/wall_left"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_02/wall_right"
+aabb_min = [-6.0, 0.0, 10.549999237060547]
+aabb_max = [14.0, 3.0, 10.75]
+payload_ref = "inline:test_map/corridor_pack/corridor_02/wall_right"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_03/floor"
+aabb_min = [18.0, -0.10000000149011612, 9.100000381469727]
+aabb_max = [38.0, 0.10000000149011612, 10.899999618530273]
+payload_ref = "inline:test_map/corridor_pack/corridor_03/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_03/ceiling"
+aabb_min = [18.0, 3.0, 9.100000381469727]
+aabb_max = [38.0, 3.1999998092651367, 10.899999618530273]
+payload_ref = "inline:test_map/corridor_pack/corridor_03/ceiling"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_03/wall_left"
+aabb_min = [18.0, 0.0, 9.09999942779541]
+aabb_max = [38.0, 3.0, 9.300000190734863]
+payload_ref = "inline:test_map/corridor_pack/corridor_03/wall_left"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_03/wall_right"
+aabb_min = [18.0, 0.0, 10.699999809265137]
+aabb_max = [38.0, 3.0, 10.90000057220459]
+payload_ref = "inline:test_map/corridor_pack/corridor_03/wall_right"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_04/floor"
+aabb_min = [42.0, -0.10000000149011612, 8.899999618530273]
+aabb_max = [62.0, 0.10000000149011612, 11.100000381469727]
+payload_ref = "inline:test_map/corridor_pack/corridor_04/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_04/ceiling"
+aabb_min = [42.0, 3.0, 8.899999618530273]
+aabb_max = [62.0, 3.1999998092651367, 11.100000381469727]
+payload_ref = "inline:test_map/corridor_pack/corridor_04/ceiling"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_04/wall_left"
+aabb_min = [42.0, 0.0, 8.899999618530273]
+aabb_max = [62.0, 3.0, 9.100000381469727]
+payload_ref = "inline:test_map/corridor_pack/corridor_04/wall_left"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "corridor_pack/corridor_04/wall_right"
+aabb_min = [42.0, 0.0, 10.899999618530273]
+aabb_max = [62.0, 3.0, 11.100000381469727]
+payload_ref = "inline:test_map/corridor_pack/corridor_04/wall_right"
+triangle_count = 12
+
+[chunk_bounds_bvh]
+root = 8
+leaf_indices = [1, 2, 3, 4, 0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-30.0, -0.10000000149011612, 9.34999942779541]
+max = [-10.0, 3.1999998092651367, 10.65000057220459]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 0
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-40.0, -1.0, -30.0]
+max = [40.0, 3.1999998092651367, 30.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 4
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+left = 0
+right = 1
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-40.0, -1.0, -30.0]
+max = [40.0, 3.1999998092651367, 30.0]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-6.0, -0.10000000149011612, 9.09999942779541]
+max = [38.0, 3.1999998092651367, 10.899999618530273]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 8
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [18.0, -0.10000000149011612, 8.899999618530273]
+max = [62.0, 3.0, 11.100000381469727]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 12
+count = 2
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [42.0, 0.0, 8.899999618530273]
+max = [62.0, 3.1999998092651367, 11.100000381469727]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 14
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+left = 4
+right = 5
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [18.0, -0.10000000149011612, 8.899999618530273]
+max = [62.0, 3.1999998092651367, 11.100000381469727]
+
+[[chunk_bounds_bvh.nodes]]
+left = 3
+right = 6
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-6.0, -0.10000000149011612, 8.899999618530273]
+max = [62.0, 3.1999998092651367, 11.100000381469727]
+
+[[chunk_bounds_bvh.nodes]]
+left = 2
+right = 7
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-40.0, -1.0, -30.0]
+max = [62.0, 3.1999998092651367, 30.0]

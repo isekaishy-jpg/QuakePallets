@@ -148,6 +148,7 @@ pub struct EngineTextureId(AssetKey);
 pub struct EngineConfigId(AssetKey);
 pub struct EngineScriptId(AssetKey);
 pub struct EngineLevelId(AssetKey);
+pub struct EngineCollisionWorldId(AssetKey);
 pub struct EngineTestMapId(AssetKey);
 pub struct Quake1RawId(AssetKey);
 
@@ -191,6 +192,16 @@ impl EngineLevelId {
     }
 }
 
+impl EngineCollisionWorldId {
+    pub fn new(path: &str) -> Result<Self, AssetKeyError> {
+        AssetKey::from_parts("engine", "collision_world", path).map(Self)
+    }
+
+    pub fn key(&self) -> &AssetKey {
+        &self.0
+    }
+}
+
 impl EngineTestMapId {
     pub fn new(path: &str) -> Result<Self, AssetKeyError> {
         AssetKey::from_parts("engine", "test_map", path).map(Self)
@@ -211,8 +222,15 @@ impl Quake1RawId {
     }
 }
 
-const ENGINE_KINDS: [&str; 7] = [
-    "blob", "config", "level", "script", "test_map", "text", "texture",
+const ENGINE_KINDS: [&str; 8] = [
+    "blob",
+    "collision_world",
+    "config",
+    "level",
+    "script",
+    "test_map",
+    "text",
+    "texture",
 ];
 const QUAKE1_KINDS: [&str; 8] = [
     "bsp",
@@ -349,6 +367,15 @@ mod tests {
     fn engine_texture_id_builds_key() {
         let id = EngineTextureId::new("ui/console_bg").unwrap();
         assert_eq!(id.key().canonical(), "engine:texture/ui/console_bg");
+    }
+
+    #[test]
+    fn engine_collision_world_id_builds_key() {
+        let id = EngineCollisionWorldId::new("fixtures/arena.toml").unwrap();
+        assert_eq!(
+            id.key().canonical(),
+            "engine:collision_world/fixtures/arena.toml"
+        );
     }
 
     #[test]

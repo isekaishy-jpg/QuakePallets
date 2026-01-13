@@ -147,47 +147,47 @@ These become your harness “must pass” gates:
   - more conservative air control (or none by default)
   - stronger preference for ground stability (snap tuned via collision_profile)
 - [x] Add distinct default capsule size + step/slope parameters for RPG.
-- [ ] Gate M5 with the RPG acceptance suite.
+- [x] Gate M5 with the RPG acceptance suite.
 - Note: tiny stair stutter remains; revisit step tuning later if it persists.
 - Note: downhill snap-to-ground pass improved ramps but was reverted; consider re-adding if needed.
 
 ### M6 — Collision asset format v1 (stores partition_kind, space_origin, root_bounds, chunk_bounds_bvh)
-- [ ] Define `collision_world` asset schema (versioned):
+- [x] Define `collision_world` asset schema (versioned):
   - `partition_kind`, `space_origin`, `root_bounds`, `map_to_world_scale`
   - `chunks[]` (id, bounds, payload refs)
   - **required** `chunk_bounds_bvh` (AABB BVH over chunk bounds)
-- [ ] Implement minimal `chunk_bounds_bvh` builder at cook-time:
+- [x] Implement minimal `chunk_bounds_bvh` builder at cook-time:
   - split by longest axis of the set bounds
   - split by median of chunk centers
   - emit flat node array + root index + leaf chunk index ranges
-- [ ] Register in your Asset Platform v1 “compat registry” for versioning/migrations.
-- [ ] Provide a validation tool:
+- [x] Register in your Asset Platform v1 “compat registry” for versioning/migrations.
+- [x] Provide a validation tool:
   - checks bounds correctness
   - checks triangle counts and chunk budgets
   - checks `map_to_world_scale` presence and consistency
   - checks determinism of `space_origin/root_bounds` rules
 
 ### M7 — Quadtree2D cooker for Q1 + Q3 maps (collision-only, no entities)
-- [ ] Implement geometry extraction to a common triangle soup:
+- [x] Implement geometry extraction to a common triangle soup:
   - Q1 BSP → collision triangles
   - Q3 BSP → collision triangles
-- [ ] Build **quadtree2d** partitioner (columns):
+- [x] Build **quadtree2d** partitioner (columns):
   - stop conditions: `max_tris_per_leaf`, `min_leaf_size_xy`, `max_depth`
   - triangle assignment policy (centroid-in-XY recommended for v1)
-- [ ] Emit `collision_world` asset with required stored fields (M6).
-- [ ] Explicitly skip entity lumps; instead:
+- [x] Emit `collision_world` asset with required stored fields (M6).
+- [x] Explicitly skip entity lumps; instead:
   - define/consume an engine-owned sidecar format for spawns/markers (map_id keyed).
 
 ### M8 — Runtime loader: instantiate chunk colliders in Rapier + selection via chunk_bounds_bvh
-- [ ] Load `collision_world` asset and instantiate static colliders per chunk.
-- [ ] Add a map switch path that:
+- [x] Load `collision_world` asset and instantiate static colliders per chunk.
+- [x] Add a map switch path that:
   - unloads prior colliders cleanly
   - loads new chunk set
   - respawns controller with appropriate profile defaults
-- [ ] Implement `select_chunks(interest_volume)` abstraction:
+- [x] Implement `select_chunks(interest_volume)` abstraction:
   - in v1: may return all chunks for “always loaded” mode
   - **required:** implement BVH-backed selection path used by dev/debug tooling immediately
-- [ ] Add performance counters (collider count, triangle count loaded, KCC query cost).
+- [x] Add performance counters (collider count, triangle count loaded, KCC query cost).
 
 ### M9 — Console + debug surface + test harness
 - [ ] Add commands (examples; adapt to your naming rules):

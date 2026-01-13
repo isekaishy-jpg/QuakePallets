@@ -1,0 +1,121 @@
+version = 1
+partition_kind = "quadtree2d"
+space_origin = [0.0, 0.0, 0.0]
+map_to_world_scale = 1.0
+
+[root_bounds]
+min = [-40.0, -1.0, -8.0]
+max = [40.0, 0.4000000059604645, 8.0]
+
+[[chunks]]
+chunk_id = "floor"
+aabb_min = [-40.0, -1.0, -8.0]
+aabb_max = [40.0, 0.0, 8.0]
+payload_ref = "inline:test_map/floor"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pad_01"
+aabb_min = [-21.25, 0.0, -4.0]
+aabb_max = [-18.75, 0.4000000059604645, 4.0]
+payload_ref = "inline:test_map/pad_01"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pad_02"
+aabb_min = [-16.25, 0.0, -4.0]
+aabb_max = [-13.75, 0.4000000059604645, 4.0]
+payload_ref = "inline:test_map/pad_02"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pad_03"
+aabb_min = [-11.25, 0.0, -4.0]
+aabb_max = [-8.75, 0.4000000059604645, 4.0]
+payload_ref = "inline:test_map/pad_03"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pad_04"
+aabb_min = [-6.25, 0.0, -4.0]
+aabb_max = [-3.75, 0.4000000059604645, 4.0]
+payload_ref = "inline:test_map/pad_04"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pad_05"
+aabb_min = [-1.25, 0.0, -4.0]
+aabb_max = [1.25, 0.4000000059604645, 4.0]
+payload_ref = "inline:test_map/pad_05"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pad_06"
+aabb_min = [3.75, 0.0, -4.0]
+aabb_max = [6.25, 0.4000000059604645, 4.0]
+payload_ref = "inline:test_map/pad_06"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pad_07"
+aabb_min = [8.75, 0.0, -4.0]
+aabb_max = [11.25, 0.4000000059604645, 4.0]
+payload_ref = "inline:test_map/pad_07"
+triangle_count = 12
+
+[[chunks]]
+chunk_id = "pad_08"
+aabb_min = [13.75, 0.0, -4.0]
+aabb_max = [16.25, 0.4000000059604645, 4.0]
+payload_ref = "inline:test_map/pad_08"
+triangle_count = 12
+
+[chunk_bounds_bvh]
+root = 4
+leaf_indices = [1, 2, 3, 4, 0, 5, 6, 7, 8]
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-21.25, 0.0, -4.0]
+max = [-3.75, 0.4000000059604645, 4.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 0
+count = 4
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-40.0, -1.0, -8.0]
+max = [40.0, 0.4000000059604645, 8.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 4
+count = 2
+
+[[chunk_bounds_bvh.nodes]]
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [3.75, 0.0, -4.0]
+max = [16.25, 0.4000000059604645, 4.0]
+
+[chunk_bounds_bvh.nodes.leaf]
+first = 6
+count = 3
+
+[[chunk_bounds_bvh.nodes]]
+left = 1
+right = 2
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-40.0, -1.0, -8.0]
+max = [40.0, 0.4000000059604645, 8.0]
+
+[[chunk_bounds_bvh.nodes]]
+left = 0
+right = 3
+
+[chunk_bounds_bvh.nodes.bounds]
+min = [-40.0, -1.0, -8.0]
+max = [40.0, 0.4000000059604645, 8.0]
